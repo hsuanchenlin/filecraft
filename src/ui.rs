@@ -515,7 +515,10 @@ mod tests {
     fn sanitize_neutralizes_control_characters() {
         assert_eq!(sanitize("plain näme 檔"), "plain näme 檔");
         assert_eq!(sanitize("a\u{1b}[31mb"), "a\u{FFFD}[31mb");
-        assert_eq!(sanitize("bell\u{7}tab\tnl\n"), "bell\u{FFFD}tab\u{FFFD}nl\u{FFFD}");
+        assert_eq!(
+            sanitize("bell\u{7}tab\tnl\n"),
+            "bell\u{FFFD}tab\u{FFFD}nl\u{FFFD}"
+        );
     }
 
     #[test]
