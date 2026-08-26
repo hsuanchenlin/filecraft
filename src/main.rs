@@ -77,6 +77,12 @@ fn run_tui(directory: PathBuf) -> io::Result<()> {
     let no_color = std::env::var("NO_COLOR").ok();
     let theme = Theme::from_no_color_env(no_color.as_deref());
 
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        previous_hook(info);
+    }));
+
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, &theme);
     ratatui::restore();

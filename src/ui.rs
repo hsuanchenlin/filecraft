@@ -121,7 +121,7 @@ pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
         out,
         "filecraft {}  {}",
         env!("CARGO_PKG_VERSION"),
-        nav.cwd.display()
+        sanitize(&nav.cwd.display().to_string())
     );
     let _ = writeln!(
         out,
@@ -141,7 +141,7 @@ pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
                 format_size(entry.size)
             };
             let date = entry.modified.map(format_timestamp).unwrap_or_default();
-            let name = pad_to_width(&entry.display_name(), 40);
+            let name = pad_to_width(&sanitize(&entry.display_name()), 40);
             let _ = writeln!(out, "  {name} {size:>8}  {date}");
         }
     }
@@ -191,7 +191,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
 fn draw_path(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
     let path = Paragraph::new(Line::from(vec![
         Span::styled(" dir ", theme.prompt()),
-        Span::raw(app.nav.cwd.display().to_string()),
+        Span::raw(sanitize(&app.nav.cwd.display().to_string())),
     ]));
     frame.render_widget(path, area);
 }
@@ -221,7 +221,7 @@ fn draw_listing(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         let date = entry.modified.map(format_timestamp).unwrap_or_default();
 
         let name_width = (area.width as usize).saturating_sub(2 + 8 + 22);
-        let name = pad_to_width(&entry.display_name(), name_width);
+        let name = pad_to_width(&sanitize(&entry.display_name()), name_width);
 
         let base_style = match entry.kind {
             _ if selected => theme.selected(),
@@ -246,7 +246,10 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &crate::a
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(theme.banner())
-        .title(Span::styled(format!(" {} ", pager.title), theme.prompt()));
+        .title(Span::styled(
+            format!(" {} ", sanitize(&pager.title)),
+            theme.prompt(),
+        ));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -297,7 +300,7 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             };
             Line::from(vec![
                 Span::styled(prefix.to_string(), style),
-                Span::styled(format!(" {}", message.text), style),
+                Span::styled(format!(" {}", sanitize(&message.text)), style),
             ])
         })
         .collect();
@@ -325,7 +328,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             Line::from(vec![
                 Span::styled(" confirm ", theme.confirm()),
                 Span::styled("[y]es / [n]o  ", theme.prompt()),
-                Span::raw(description),
+                Span::raw(sanitize(&description)),
             ])
         }
         Mode::Pager(_) => Line::from(vec![
@@ -351,6 +354,16 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Mode::Pager(_) => " j/k scroll · PgUp/PgDn page · q/Esc back to files",
     };
     frame.render_widget(Paragraph::new(Line::from(Span::raw(hints))), area);
+}
+
+/// Replace control characters with `U+FFFD` so filesystem-derived names,
+/// paths, and messages can never inject terminal escape sequences into
+/// the screen. Display-only: stored names keep their real bytes so
+/// move/rename/edit still operate on the actual file.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Pad or truncate `text` to exactly `width` display columns, appending
@@ -496,6 +509,52 @@ mod tests {
 
         assert!(Theme::from_no_color_env(None).use_color);
         assert!(Theme::from_no_color_env(Some("")).use_color);
+    }
+
+    #[test]
+    fn sanitize_neutralizes_control_characters() {
+        assert_eq!(sanitize("plain näme 檔"), "plain näme 檔");
+        assert_eq!(sanitize("a\u{1b}[31mb"), "a\u{FFFD}[31mb");
+        assert_eq!(sanitize("bell\u{7}tab\tnl\n"), "bell\u{FFFD}tab\u{FFFD}nl\u{FFFD}");
+    }
+
+    #[test]
+    fn control_characters_in_names_never_reach_the_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("evil\u{1b}[31m.txt"), "x").unwrap();
+
+        let nav = NavState::new(tmp.path()).unwrap();
+        let app = App::new(nav, None, false, None);
+        let screen = render(&app);
+        assert!(!screen.contains('\u{1b}'));
+        assert!(screen.contains("evil\u{FFFD}[31m.txt"));
+
+        let listing = render_static_listing(tmp.path()).unwrap();
+        assert!(!listing.contains('\u{1b}'));
+        assert!(listing.contains("evil\u{FFFD}[31m.txt"));
+    }
+
+    #[test]
+    fn control_characters_in_confirm_and_messages_never_reach_the_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("evil\u{1b}]0;pwned\u{7}.txt"), "x").unwrap();
+        let nav = NavState::new(tmp.path()).unwrap();
+        let mut app = App::new(nav, None, false, None);
+
+        let visible = app.nav.visible();
+        let pos = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name.starts_with("evil"))
+            .unwrap();
+        app.nav.cursor = pos;
+        app.execute_line("move archive");
+
+        let screen = render_size(&app, 160, 30);
+        assert!(screen.contains("confirm"));
+        assert!(!screen.contains('\u{1b}'));
+        assert!(!screen.contains('\u{7}'));
+        drop(tmp);
     }
 
     #[test]
