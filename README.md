@@ -83,8 +83,9 @@ In browse mode:
 Files are never opened automatically. Enter on a file, or the `edit`
 command, is the only way into an editor.
 
-Every browse key is read-only. Nothing on the keyboard mutates the
-filesystem: every change goes through select -> `:` command -> `y`.
+Every navigation and orientation key is read-only. Filesystem commands
+still go through select -> `:` command -> `y`; opening a file in the
+configured editor remains the explicit path for editing file contents.
 
 **Changed in this slice:** `l` now **enters** the selected directory instead of
 going to the parent, matching vim, ranger, lf, and nnn. Esc now **backs
