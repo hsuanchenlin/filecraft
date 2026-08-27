@@ -103,7 +103,7 @@ instead of quitting. Quitting is `q` or Ctrl-C.
 ## Folder picker
 
 `:move` with no path opens a BBS-styled folder picker over the listing.
-It lists `./`, `../`, and the child folders of the directory it is
+It lists `../`, `./`, and the child folders of the directory it is
 showing - siblings only come into view after going up with `h`.
 The header names the destination currently under the cursor. Choosing a
 folder (`Enter` or `m`) hands that canonical path to the same `y/n`

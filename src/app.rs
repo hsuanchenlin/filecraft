@@ -1382,6 +1382,73 @@ mod tests {
         }
     }
 
+    /// Every picker key the help and the README advertise besides the
+    /// letters: the arrows, Backspace, and paging. They are the same
+    /// motions as `j`/`k`/`l`/`h`/`g`/`G`, and none of them can move a
+    /// file - only Enter/`m` reaches the confirmation.
+    #[test]
+    fn picker_arrow_backspace_and_paging_keys_match_the_letter_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        for i in 0..12 {
+            fs::create_dir(tmp.path().join(format!("dir_{i:02}"))).unwrap();
+        }
+        fs::create_dir(tmp.path().join("dir_00/nested")).unwrap();
+        let before = snapshot(tmp.path());
+        let mut app = app_in(&tmp);
+        app.set_viewport(8, 80);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+
+        // Down / Up are j / k.
+        let start = picker(&app).cursor;
+        app.handle_key(KeyInput::Down);
+        assert_eq!(picker(&app).cursor, start + 1);
+        app.handle_key(KeyInput::Up);
+        assert_eq!(picker(&app).cursor, start);
+
+        // PgDn / PgUp move by exactly the rows the popup draws.
+        let rows = app.picker_rows();
+        app.handle_key(KeyInput::PageDown);
+        assert_eq!(picker(&app).cursor, start + rows);
+        app.handle_key(KeyInput::PageUp);
+        assert_eq!(picker(&app).cursor, start);
+
+        // Right descends where `l` does; Left and Backspace both come back.
+        let listing_cwd = app.nav.cwd.clone();
+        let dir_00 = picker(&app)
+            .entries
+            .iter()
+            .position(|e| e.name == "dir_00")
+            .unwrap();
+        for back in [KeyInput::Left, KeyInput::Backspace] {
+            let Mode::FolderPicker(p) = &mut app.mode else {
+                panic!("expected folder picker");
+            };
+            p.cursor = dir_00;
+            app.handle_key(KeyInput::Right);
+            assert!(picker(&app).cwd.ends_with("dir_00"), "{back:?}");
+            assert!(
+                picker(&app).entries.iter().any(|e| e.name == "nested"),
+                "{back:?}"
+            );
+            assert_eq!(app.nav.cwd, listing_cwd, "{back:?}");
+            app.handle_key(back);
+            assert_eq!(picker(&app).cwd, listing_cwd, "{back:?}");
+            assert_eq!(picker(&app).focused().unwrap().name, "dir_00", "{back:?}");
+        }
+
+        // End / Home are G / g.
+        app.handle_key(KeyInput::End);
+        assert_eq!(picker(&app).cursor, picker(&app).entries.len() - 1);
+        app.handle_key(KeyInput::Home);
+        assert_eq!(picker(&app).cursor, 0);
+
+        assert!(matches!(app.mode, Mode::FolderPicker(_)));
+        assert!(app.pending.is_none());
+        assert_eq!(snapshot(tmp.path()), before, "a picker motion key mutated");
+    }
+
     #[test]
     fn picker_selecting_current_dir_is_the_same_path_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1843,7 +1910,10 @@ mod tests {
             "Enter, m",
             "q, Esc",
         ] {
-            assert!(block.contains(key), "picker help never names {key}:\n{block}");
+            assert!(
+                block.contains(key),
+                "picker help never names {key}:\n{block}"
+            );
         }
     }
 

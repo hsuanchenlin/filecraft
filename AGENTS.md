@@ -54,7 +54,7 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - Every browse key must stay read-only; `no_browse_key_ever_mutates_the_filesystem`
   in `src/app.rs` enforces it mechanically. `?` help, the README keyboard
   table, and `help_lines()` ship in the same change as any key change -
-  the reader's keys included.
+  the reader's and folder picker's keys included.
 - `agent` is a disabled seam (`src/agent.rs`, contract in `docs/agent-seam.md`). Do not invoke an LLM, scan a tree for an agent, or enable autonomous changes.
 
 ## Maintaining this file
