@@ -39,6 +39,7 @@ OPTIONS:
 Interactive mode needs a real TTY. Without one, filecraft prints a
 static listing of DIRECTORY (default: the current directory) instead.
 Set NO_COLOR to disable colors; selection and markers stay visible.
+Set FILECRAFT_ASCII to draw the screen in printable ASCII only.
 ";
 
 /// Parse argv *after* the program name.

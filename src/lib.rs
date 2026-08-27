@@ -3,6 +3,8 @@
 //! The crate is split into a pure, deterministic core and a thin terminal
 //! shell:
 //!
+//! - [`bearings`] computes the read-only orientation chrome (ladder, rail,
+//!   speakable status, relative time) from state already in memory.
 //! - [`command`] parses BBS command lines (never shell-evaluated).
 //! - [`fsops`] canonicalizes/validates paths and performs safe move/rename.
 //! - [`nav`] models directory listings and cursor/filter state.
@@ -18,6 +20,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod bearings;
 pub mod cli;
 pub mod command;
 pub mod editor;

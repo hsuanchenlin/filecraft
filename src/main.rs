@@ -75,7 +75,11 @@ fn run_tui(directory: PathBuf) -> io::Result<()> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut app = App::new(nav, editor_env, nvim_on_path, home);
     let no_color = std::env::var("NO_COLOR").ok();
-    let theme = Theme::from_no_color_env(no_color.as_deref());
+    let ascii = std::env::var("FILECRAFT_ASCII").ok();
+    let theme = Theme::from_env(no_color.as_deref(), ascii.as_deref());
+    // Key handling fits the ladder to the same width and characters the
+    // renderer uses, so every digit on screen is a key that works.
+    app.glyphs = theme.glyphs();
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -97,6 +101,7 @@ fn event_loop(
     loop {
         let size = terminal.size()?;
         app.viewport_rows = size.height.saturating_sub(ui::CHROME_ROWS).max(1) as usize;
+        app.viewport_cols = size.width.saturating_sub(ui::BORDER_COLS) as usize;
         terminal.draw(|frame| ui::draw(frame, app, theme))?;
 
         match event::read()? {

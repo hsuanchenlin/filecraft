@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use crate::agent::{self, Agent, AgentRequest};
+use crate::bearings::{self, Glyphs, Ladder};
 use crate::command::{self, Command};
 use crate::editor;
 use crate::fsops::{self, FsError};
@@ -102,6 +103,20 @@ pub enum Level {
     Error,
 }
 
+impl Level {
+    /// The level's textual dual, in the character set the screen is
+    /// drawing with. All three are exactly five columns wide, so the log
+    /// body stays flush whatever levels are in the ring - the message
+    /// strip and the `M` pager share this one table.
+    pub fn prefix(self, glyphs: &Glyphs) -> String {
+        match self {
+            Level::Info => format!("  {}  ", glyphs.dot),
+            Level::Ok => " ok: ".to_string(),
+            Level::Error => " err:".to_string(),
+        }
+    }
+}
+
 /// One line in the BBS message log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -126,6 +141,12 @@ pub struct App {
     /// Rows available to the file list; the UI updates this every frame so
     /// PageUp/PageDown match what is on screen.
     pub viewport_rows: usize,
+    /// Columns available inside the border; the UI updates this every
+    /// frame so the ladder's digit keys address exactly the rungs drawn.
+    pub viewport_cols: usize,
+    /// Drawing characters in force, so key handling and rendering fit the
+    /// ladder to identical widths.
+    pub glyphs: Glyphs,
 }
 
 impl App {
@@ -144,6 +165,8 @@ impl App {
             nvim_on_path,
             home,
             viewport_rows: 20,
+            viewport_cols: 80,
+            glyphs: Glyphs::UNICODE,
         };
         app.push_msg(
             Level::Info,
@@ -206,10 +229,11 @@ impl App {
                 Effect::None
             }
             KeyInput::Enter => self.activate_selection(),
-            KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') | KeyInput::Char('l') => {
-                self.go_up()
-            }
-            KeyInput::Right => self.enter_selected_dir(),
+            KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => self.go_up(),
+            KeyInput::Right | KeyInput::Char('l') => self.enter_selected_dir(),
+            // Digits address the ancestor ladder; `0` is always the anchor.
+            KeyInput::Char(c) if c.is_ascii_digit() => self.jump_to_rung(c as u8 - b'0'),
+            KeyInput::Char('M') => self.show_messages(),
             KeyInput::Char('/') => {
                 self.mode = Mode::Filter {
                     input: self.nav.filter.clone(),
@@ -242,9 +266,23 @@ impl App {
                 self.push_msg(Level::Info, "refreshed".to_string());
                 Effect::None
             }
-            KeyInput::Char('q') | KeyInput::Esc => Effect::Quit,
+            KeyInput::Char('q') => Effect::Quit,
+            // Esc backs out exactly one level; quitting is `q` or Ctrl-C.
+            KeyInput::Esc => self.back_out(),
             _ => Effect::None,
         }
+    }
+
+    /// One step out of whatever the user is inside. In browse mode the
+    /// only thing to leave is an active filter; with none, Esc does
+    /// nothing at all - it never quits.
+    fn back_out(&mut self) -> Effect {
+        if self.nav.filter.is_empty() {
+            return Effect::None;
+        }
+        self.nav.set_filter(String::new());
+        self.push_msg(Level::Info, "filter cleared".to_string());
+        Effect::None
     }
 
     fn handle_command_key(&mut self, key: KeyInput) -> Effect {
@@ -395,6 +433,93 @@ impl App {
             Ok(()) => Effect::None,
             Err(e) => self.err(e.to_string()),
         }
+    }
+
+    /// The ancestor ladder as it is drawn right now.
+    ///
+    /// Rendering and the digit keys share this one computation, so every
+    /// digit on screen is a key that works and no key addresses a rung
+    /// the elision hid.
+    pub fn ladder(&self) -> Ladder {
+        self.ladder_in(self.viewport_cols, &self.glyphs)
+    }
+
+    /// The ladder as it is drawn in `cols` columns. The renderer passes
+    /// the real width of the row; [`App::ladder`] passes the width the
+    /// event loop last reported, and they are the same number.
+    pub fn ladder_in(&self, cols: usize, glyphs: &Glyphs) -> Ladder {
+        let summary = self.ladder_summary_with(glyphs);
+        let layout = bearings::ladder_row(cols, bearings::display_width(&summary));
+        bearings::ladder(
+            &self.nav.cwd,
+            self.home.as_deref(),
+            layout.chain_budget,
+            glyphs,
+        )
+    }
+
+    /// The ladder's textual dual: depth and size in words, never implied
+    /// by the shape of the chain alone.
+    pub fn ladder_summary(&self) -> String {
+        self.ladder_summary_with(&self.glyphs)
+    }
+
+    /// [`App::ladder_summary`] in a given character set.
+    pub fn ladder_summary_with(&self, glyphs: &Glyphs) -> String {
+        let depth = bearings::depth_of(&self.nav.cwd, self.home.as_deref());
+        let items = self.nav.entries.iter().filter(|e| !e.is_parent).count();
+        let unit = if items == 1 { "item" } else { "items" };
+        format!("depth {depth} {} {items} {unit}", glyphs.dot)
+    }
+
+    /// Jump to a visible ancestor. Pure navigation: it goes through
+    /// `NavState::change_dir` exactly as `cd` does, and selects the child
+    /// it came through the way going up does.
+    fn jump_to_rung(&mut self, digit: u8) -> Effect {
+        let ladder = self.ladder();
+        let Some(rung) = ladder.rung(digit) else {
+            return self.err(format!("no ancestor '{digit}' on the ladder"));
+        };
+        let (target, label) = (rung.path.clone(), rung.label.clone());
+        if target == self.nav.cwd {
+            self.push_msg(Level::Info, format!("already at {label}"));
+            return Effect::None;
+        }
+        let select = self
+            .nav
+            .cwd
+            .strip_prefix(&target)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        match self.nav.change_dir(target, select.as_deref()) {
+            Ok(()) => {
+                let cwd = self.nav.cwd.display().to_string();
+                self.push_msg(Level::Ok, format!("cwd: {cwd}"));
+                Effect::None
+            }
+            Err(e) => self.err(e.to_string()),
+        }
+    }
+
+    /// Open the message ring in the existing pager. The log keeps a
+    /// hundred lines but the strip shows three; this is how the other
+    /// ninety-seven are reachable.
+    fn show_messages(&mut self) -> Effect {
+        let lines: Vec<String> = if self.messages.is_empty() {
+            vec!["(no messages yet)".to_string()]
+        } else {
+            self.messages
+                .iter()
+                .map(|message| format!("{} {}", message.level.prefix(&self.glyphs), message.text))
+                .collect()
+        };
+        self.mode = Mode::Pager(Pager {
+            title: format!("messages ({} of {MAX_MESSAGES})", self.messages.len()),
+            lines,
+            scroll: 0,
+        });
+        Effect::None
     }
 
     fn go_up(&mut self) -> Effect {
@@ -672,15 +797,17 @@ pub fn help_lines() -> Vec<String> {
         "  PgUp / PgDn          move focus a page",
         "  g / G                first / last entry",
         "  Enter                enter directory, or edit selected file",
-        "  Backspace, h, l      go to parent directory",
-        "  Left                 go to parent directory",
-        "  Right                enter selected directory",
+        "  l, Right             enter selected directory",
+        "  h, Left, Backspace   go to parent directory",
+        "  0-9                  jump to that ancestor on the ladder",
         "  /                    filter the listing (Esc clears)",
         "  :                    command prompt",
         "  .                    show/hide dotfiles",
         "  r                    refresh listing",
+        "  M                    message history",
         "  ?                    this help",
-        "  q, Esc, Ctrl-C       quit",
+        "  Esc                  back out one level (clears a filter)",
+        "  q, Ctrl-C            quit",
         "",
         "COMMANDS (at the : prompt)",
         "  cd [path]            change directory (~ ok; quote spaces)",
@@ -700,6 +827,11 @@ pub fn help_lines() -> Vec<String> {
         "  - everything stays on this machine: no network, no telemetry",
         "",
         "MARKERS   name/ directory   name@ symlink   name@! broken symlink",
+        "",
+        "BEARINGS",
+        "  - the ladder row is read-only: digits jump, nothing else acts there",
+        "  - the rail column shows where the viewport sits in the listing",
+        "  - the status row says the same thing in words, for speech",
         "",
         "press q or Esc to close this help",
     ]
@@ -727,6 +859,32 @@ mod tests {
         app.nav.cursor = pos;
     }
 
+    /// Every path under `dir` with its size and mtime - the evidence that
+    /// a key changed nothing.
+    fn snapshot(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            let Ok(read) = fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                }
+                out.push(format!(
+                    "{} {} {:?}",
+                    entry.path().display(),
+                    meta.len(),
+                    meta.modified().ok()
+                ));
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn last_msg(app: &App) -> &Message {
         app.messages.last().expect("expected a message")
     }
@@ -736,9 +894,34 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_in(&tmp);
         assert_eq!(app.handle_key(KeyInput::Char('q')), Effect::Quit);
-        assert_eq!(app.handle_key(KeyInput::Esc), Effect::Quit);
         assert_eq!(app.handle_key(KeyInput::CtrlC), Effect::Quit);
         assert_eq!(app.execute_line("quit"), Effect::Quit);
+    }
+
+    #[test]
+    fn esc_backs_out_one_level_and_never_quits() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("apple.md"), "a").unwrap();
+        fs::write(tmp.path().join("banana.md"), "b").unwrap();
+        let mut app = app_in(&tmp);
+
+        // With nothing to back out of, Esc does nothing at all.
+        assert_eq!(app.handle_key(KeyInput::Esc), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+
+        // With a filter kept from filter mode, Esc clears exactly that.
+        app.handle_key(KeyInput::Char('/'));
+        for c in "app".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(app.nav.filter, "app");
+        assert_eq!(app.handle_key(KeyInput::Esc), Effect::None);
+        assert!(app.nav.filter.is_empty());
+        assert!(last_msg(&app).text.contains("filter cleared"));
+
+        // And it is still not a quit key.
+        assert_eq!(app.handle_key(KeyInput::Esc), Effect::None);
     }
 
     #[test]
@@ -953,12 +1136,7 @@ mod tests {
     fn up_keys_go_to_parent() {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
-        for key in [
-            KeyInput::Backspace,
-            KeyInput::Char('h'),
-            KeyInput::Char('l'),
-            KeyInput::Left,
-        ] {
+        for key in [KeyInput::Backspace, KeyInput::Char('h'), KeyInput::Left] {
             let mut app = app_in(&tmp);
             let sub = app.nav.cwd.join("sub");
             app.nav.change_dir(sub, None).unwrap();
@@ -968,6 +1146,221 @@ mod tests {
                 tmp.path().canonicalize().unwrap(),
                 "{key:?} should go up"
             );
+        }
+    }
+
+    #[test]
+    fn l_and_right_descend_into_the_selected_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        for key in [KeyInput::Char('l'), KeyInput::Right] {
+            let mut app = app_in(&tmp);
+            select(&mut app, "sub");
+            assert_eq!(app.handle_key(key), Effect::None);
+            assert!(app.nav.cwd.ends_with("sub"), "{key:?} should descend");
+
+            // On a file it is a plain refusal, never an edit or a move.
+            let mut app = app_in(&tmp);
+            select(&mut app, "note.txt");
+            assert_eq!(app.handle_key(key), Effect::None);
+            assert_eq!(app.nav.cwd, tmp.path().canonicalize().unwrap());
+            assert_eq!(last_msg(&app).level, Level::Error);
+            assert!(tmp.path().join("note.txt").exists());
+        }
+    }
+
+    #[test]
+    fn l_on_the_parent_row_still_goes_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let mut app = app_in(&tmp);
+        let sub = app.nav.cwd.join("sub");
+        app.nav.change_dir(sub, None).unwrap();
+        select(&mut app, "..");
+        app.handle_key(KeyInput::Char('l'));
+        assert_eq!(app.nav.cwd, tmp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn digits_jump_to_visible_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut app = App::new(
+            NavState::new(&deep).unwrap(),
+            None,
+            false,
+            Some(root.clone()),
+        );
+
+        let ladder = app.ladder();
+        assert_eq!(ladder.depth, 3);
+        assert_eq!(ladder.rung(2).unwrap().path, root.join("a").join("b"));
+
+        // Jumping lands on the ancestor and selects the child it came
+        // through, exactly as going up does.
+        app.handle_key(KeyInput::Char('2'));
+        assert_eq!(app.nav.cwd, root.join("a").join("b"));
+        assert_eq!(app.nav.selected().unwrap().name, "c");
+
+        // `0` is always the anchor.
+        app.handle_key(KeyInput::Char('0'));
+        assert_eq!(app.nav.cwd, root);
+        assert_eq!(app.nav.selected().unwrap().name, "a");
+
+        // A digit with no rung reports itself and changes nothing.
+        app.handle_key(KeyInput::Char('7'));
+        assert_eq!(app.nav.cwd, root);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("no ancestor '7'"));
+
+        // The digit for the current directory is a no-op, not a reload.
+        let mut app = App::new(
+            NavState::new(&deep).unwrap(),
+            None,
+            false,
+            Some(root.clone()),
+        );
+        app.nav.set_filter("nothing".to_string());
+        app.handle_key(KeyInput::Char('3'));
+        assert_eq!(app.nav.cwd, root.join("a").join("b").join("c"));
+        assert_eq!(app.nav.filter, "nothing");
+        assert!(last_msg(&app).text.contains("already at"));
+    }
+
+    #[test]
+    fn digit_jump_is_read_only_navigation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("keep.txt"), "k").unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let mut app = App::new(NavState::new(&deep).unwrap(), None, false, Some(root));
+        for digit in '0'..='9' {
+            app.handle_key(KeyInput::Char(digit));
+        }
+        assert!(deep.join("keep.txt").exists());
+        assert!(app.pending.is_none());
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn ladder_summary_states_depth_and_size_in_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("one.txt"), "1").unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let app = App::new(NavState::new(&root).unwrap(), None, false, Some(root));
+        assert_eq!(app.ladder_summary(), "depth 0 · 2 items");
+    }
+
+    #[test]
+    fn message_history_is_reachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        for i in 0..MAX_MESSAGES {
+            app.push_msg(Level::Info, format!("event {i}"));
+        }
+        app.handle_key(KeyInput::Char('M'));
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the message pager");
+        };
+        assert!(pager.title.starts_with("messages ("));
+        // The ring holds a hundred lines and all of them are now readable,
+        // not just the three the strip shows.
+        assert_eq!(pager.lines.len(), MAX_MESSAGES);
+        assert!(pager.lines.last().unwrap().contains("event 99"));
+        app.handle_key(KeyInput::Char('q'));
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn message_levels_share_one_prefix_width() {
+        for glyphs in [Glyphs::UNICODE, Glyphs::ASCII] {
+            for level in [Level::Info, Level::Ok, Level::Error] {
+                assert_eq!(
+                    bearings::display_width(&level.prefix(&glyphs)),
+                    5,
+                    "{level:?} in {glyphs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn message_pager_keeps_the_log_body_flush_across_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.messages.clear();
+        for level in [Level::Info, Level::Ok, Level::Error] {
+            app.push_msg(level, "aligned".to_string());
+        }
+        app.handle_key(KeyInput::Char('M'));
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the message pager");
+        };
+        let columns: Vec<usize> = pager
+            .lines
+            .iter()
+            .map(|line| bearings::display_width(&line[..line.find("aligned").unwrap()]))
+            .collect();
+        assert_eq!(columns, vec![6, 6, 6], "{:?}", pager.lines);
+    }
+
+    #[test]
+    fn message_history_is_readable_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.messages.clear();
+        app.handle_key(KeyInput::Char('M'));
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the message pager");
+        };
+        assert_eq!(pager.lines, vec!["(no messages yet)".to_string()]);
+    }
+
+    #[test]
+    fn no_browse_key_ever_mutates_the_filesystem() {
+        // Grammar rule: motion never mutates, and mutation is always
+        // select -> `:` command -> `y`. This is the mechanical enforcement.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/inner.txt"), "inner").unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join(".dot"), "d").unwrap();
+
+        let before = snapshot(tmp.path());
+        let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
+        keys.extend([
+            KeyInput::Enter,
+            KeyInput::Esc,
+            KeyInput::Backspace,
+            KeyInput::Up,
+            KeyInput::Down,
+            KeyInput::Left,
+            KeyInput::Right,
+            KeyInput::PageUp,
+            KeyInput::PageDown,
+            KeyInput::Home,
+            KeyInput::End,
+        ]);
+        for key in keys {
+            let mut app = app_in(&tmp);
+            for row in 0..app.nav.visible().len() {
+                app.nav.cursor = row;
+                if !matches!(app.mode, Mode::Browse) {
+                    app.mode = Mode::Browse;
+                }
+                let effect = app.handle_key(key);
+                assert!(
+                    !matches!(effect, Effect::SpawnDetached { .. }),
+                    "{key:?} spawned a process from browse mode"
+                );
+                assert!(app.pending.is_none(), "{key:?} armed an operation");
+            }
+            assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
         }
     }
 
