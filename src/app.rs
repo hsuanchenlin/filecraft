@@ -55,6 +55,9 @@ pub enum Effect {
 
 /// Which input surface currently owns the keyboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `Pager` owns its document and layout cache; boxing it would complicate the
+// public state-machine API solely to reduce the size of this short-lived enum.
+#[allow(clippy::large_enum_variant)]
 pub enum Mode {
     Browse,
     Command { input: String },
