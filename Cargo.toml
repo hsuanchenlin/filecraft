@@ -1,0 +1,30 @@
+[package]
+name = "filecraft"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "A keyboard-first, BBS-style terminal file navigator for macOS"
+license = "MIT"
+repository = "https://github.com/hsuanchenlin/filecraft"
+readme = "README.md"
+keywords = ["tui", "file-manager", "bbs", "terminal", "macos"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "filecraft"
+path = "src/main.rs"
+
+[lib]
+name = "filecraft"
+path = "src/lib.rs"
+
+[dependencies]
+ratatui = "0.29"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
