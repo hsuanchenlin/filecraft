@@ -1,23 +1,37 @@
 //! BBS-style screen rendering with ratatui.
 //!
-//! One stable full-screen layout: banner border, path bar, listing, status
-//! bar, message log, command prompt, and a one-line key hint. High
-//! contrast by design: selection uses reverse video, kinds carry textual
-//! markers (`/`, `@`, `@!`) and message levels carry textual prefixes, so
-//! color is never the only signal. Colors are the terminal's own ANSI
-//! palette and can be disabled entirely with `NO_COLOR`.
+//! One stable full-screen layout: banner border, ancestor ladder, listing
+//! with a position rail, speakable status line, message log, command
+//! prompt, and a one-line key hint. High contrast by design: selection
+//! uses reverse video, kinds carry textual markers (`/`, `@`, `@!`) and
+//! message levels carry textual prefixes, so color is never the only
+//! signal. Colors are the terminal's own ANSI palette and can be disabled
+//! entirely with `NO_COLOR`; `FILECRAFT_ASCII` additionally drops every
+//! drawing character outside printable ASCII.
+//!
+//! The screen has two halves and the boundary is a rule, not a habit:
+//! **everything above the listing is orientation only** - it cannot be
+//! focused and no key that starts there mutates anything - and the
+//! listing is the single operating locus every command acts on.
+//!
+//! All the arithmetic lives in [`crate::bearings`], which is pure; this
+//! module only turns it into spans.
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::SystemTime;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Level, Mode};
+use crate::bearings::{
+    self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
+};
 use crate::fsops::FsError;
 use crate::nav::{EntryKind, NavState};
 use crate::preview::{format_size, format_timestamp};
@@ -26,8 +40,20 @@ use crate::preview::{format_size, format_timestamp};
 /// messages, prompt, hints). `main` uses this to size PageUp/PageDown.
 pub const CHROME_ROWS: u16 = 9;
 
-/// How many recent messages the BBS log shows.
+/// Columns the left and right borders take; `main` uses this to tell the
+/// app how wide the ladder row really is.
+pub const BORDER_COLS: u16 = 2;
+
+/// How many recent messages the BBS log shows. `M` opens the rest.
 const MESSAGE_ROWS: usize = 3;
+
+/// Rows of lookahead kept below the cursor, so descending never pins the
+/// selection to the bottom edge.
+const SCROLL_MARGIN: usize = 3;
+
+/// Columns the listing spends on everything that is not the name: the
+/// rail, the cursor marker, the size field, and the relative time.
+const LISTING_FURNITURE: usize = 1 + 2 + 8 + 7;
 
 /// Styling switchboard. With `use_color: false` (the `NO_COLOR`
 /// convention) every style falls back to bold/reverse on the terminal's
@@ -35,6 +61,8 @@ const MESSAGE_ROWS: usize = 3;
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub use_color: bool,
+    /// Restrict every drawing character to printable ASCII.
+    pub ascii: bool,
 }
 
 impl Theme {
@@ -42,6 +70,56 @@ impl Theme {
     pub fn from_no_color_env(no_color: Option<&str>) -> Self {
         Theme {
             use_color: no_color.is_none_or(str::is_empty),
+            ascii: false,
+        }
+    }
+
+    /// `FILECRAFT_ASCII` set to any non-empty value swaps the box-drawing
+    /// and block characters for ASCII, for braille displays, serial
+    /// terminals, and locales where UTF-8 is not reliable.
+    pub fn from_env(no_color: Option<&str>, ascii: Option<&str>) -> Self {
+        Theme {
+            ascii: ascii.is_some_and(|value| !value.is_empty()),
+            ..Theme::from_no_color_env(no_color)
+        }
+    }
+
+    /// The drawing characters in force.
+    pub fn glyphs(&self) -> Glyphs {
+        Glyphs::for_ascii(self.ascii)
+    }
+
+    fn border_set(&self) -> border::Set {
+        if self.ascii {
+            border::Set {
+                top_left: "+",
+                top_right: "+",
+                bottom_left: "+",
+                bottom_right: "+",
+                vertical_left: "|",
+                vertical_right: "|",
+                horizontal_top: "-",
+                horizontal_bottom: "-",
+            }
+        } else {
+            BorderType::Double.to_border_set()
+        }
+    }
+
+    fn pager_border_set(&self) -> border::Set {
+        if self.ascii {
+            self.border_set()
+        } else {
+            BorderType::Plain.to_border_set()
+        }
+    }
+
+    fn banner_title(&self) -> String {
+        let version = env!("CARGO_PKG_VERSION");
+        if self.ascii {
+            format!(" === FILECRAFT v{version} === ")
+        } else {
+            format!(" ░▒▓ FILECRAFT v{version} ▓▒░ ")
         }
     }
 
@@ -55,6 +133,12 @@ impl Theme {
                     .intersection(Modifier::BOLD | Modifier::REVERSED | Modifier::UNDERLINED),
             )
         }
+    }
+
+    /// Orientation chrome. The ladder is a chain of directories, so it
+    /// reads in the directory style - but it is never focusable.
+    pub fn bearing(&self) -> Style {
+        self.dir()
     }
 
     pub fn banner(&self) -> Style {
@@ -155,62 +239,133 @@ pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
 
 /// Render the whole screen for the current state.
 pub fn draw(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+    draw_at(frame, app, theme, SystemTime::now());
+}
+
+/// [`draw`] with the clock injected, so golden-frame tests are
+/// deterministic and relative times are reproducible.
+pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime) {
     let area = frame.area();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_set(theme.border_set())
         .border_style(theme.banner())
         .title(Line::from(Span::styled(
-            format!(" ░▒▓ FILECRAFT v{} ▓▒░ ", env!("CARGO_PKG_VERSION")),
+            theme.banner_title(),
             theme.banner(),
         )));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    let [path_row, list_area, status_row, message_area, prompt_row, hint_row] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(MESSAGE_ROWS as u16),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    let [ladder_row, list_area, status_row, message_area, prompt_row, hint_row] =
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(MESSAGE_ROWS as u16),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
 
-    draw_path(frame, app, theme, path_row);
+    draw_ladder(frame, app, theme, ladder_row);
+    let rows = list_area.height as usize;
+    let visible = app.nav.visible();
+    let offset = bearings::viewport_offset(app.nav.cursor, visible.len(), rows, SCROLL_MARGIN);
+    // One reading of the locus, shared by the listing and the words that
+    // describe it, so the two can never disagree.
+    let bearings = Bearings::from_nav(&app.nav, offset, rows);
     match &app.mode {
         Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager),
-        _ => draw_listing(frame, app, theme, list_area),
+        _ => draw_listing(
+            frame, app, theme, list_area, &visible, offset, &bearings, now,
+        ),
     }
-    draw_status(frame, app, status_row);
+    draw_status(frame, theme, status_row, &bearings, now);
     draw_messages(frame, app, theme, message_area);
     draw_prompt(frame, app, theme, prompt_row);
-    draw_hints(frame, app, hint_row);
+    draw_hints(frame, app, theme, hint_row);
 }
 
-fn draw_path(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
-    let path = Paragraph::new(Line::from(vec![
-        Span::styled(" dir ", theme.prompt()),
-        Span::raw(sanitize(&app.nav.cwd.display().to_string())),
-    ]));
-    frame.render_widget(path, area);
+/// The ancestor ladder: a numbered, keyboard-jumpable chain that
+/// middle-elides instead of clipping, so the anchor and the current
+/// directory are both always on screen. Read-only - digits jump, nothing
+/// here can be operated on.
+fn draw_ladder(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
+    let glyphs = theme.glyphs();
+    let width = area.width as usize;
+    let summary = app.ladder_summary_with(&glyphs);
+    let summary_width = display_width(&summary);
+    let chain = bearings::ladder_line(&app.ladder_in(width, &glyphs), &glyphs);
+    // One leading space, the chain, then the summary flush right.
+    let chain_width = width.saturating_sub(summary_width + 2);
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            pad_to_width_with(&chain, chain_width, glyphs.ellipsis),
+            theme.bearing(),
+        ),
+        Span::raw(if width > summary_width + 1 {
+            summary
+        } else {
+            String::new()
+        }),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_listing(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
-    let visible = app.nav.visible();
+#[allow(clippy::too_many_arguments)]
+fn draw_listing(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    area: Rect,
+    visible: &[usize],
+    offset: usize,
+    bearings: &Bearings,
+    now: SystemTime,
+) {
     let rows = area.height as usize;
     if rows == 0 {
         return;
     }
-    let offset = app.nav.cursor.saturating_sub(rows.saturating_sub(1));
+    let glyphs = theme.glyphs();
+    let width = area.width as usize;
+    let name_width = width.saturating_sub(LISTING_FURNITURE);
+    // Every listing row is the rail plus this much content.
+    let body_width = width.saturating_sub(1);
+    let rail = bearings::rail(visible.len(), offset, rows);
+    // A filter that matched nothing must say so: the `..` row always
+    // passes, so a bare `../` would otherwise look like a real result.
+    let note = if visible.is_empty() {
+        Some("(no matching entries)".to_string())
+    } else if bearings::filter_matched_nothing(bearings) {
+        Some(format!("(no entries match '{}')", bearings.filter))
+    } else {
+        None
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
-    if visible.is_empty() {
-        lines.push(Line::from(Span::raw("  (no matching entries)")));
-    }
-    for (row, &entry_index) in visible.iter().enumerate().skip(offset).take(rows) {
+    for row in 0..rows {
+        let rail_span = Span::styled(
+            rail.get(row)
+                .copied()
+                .unwrap_or(RailCell::Track)
+                .glyph(&glyphs),
+            theme.bearing(),
+        );
+        let index = offset + row;
+        let Some(&entry_index) = visible.get(index) else {
+            // The note sits directly under the last row that survived.
+            let filler = match (&note, index == visible.len()) {
+                (Some(text), true) => pad_to_width(&format!("  {text}"), body_width),
+                _ => " ".repeat(body_width),
+            };
+            lines.push(Line::from(vec![rail_span, Span::raw(filler)]));
+            continue;
+        };
         let entry = &app.nav.entries[entry_index];
-        let selected = row == app.nav.cursor;
+        let selected = index == app.nav.cursor;
         let marker = if selected { "> " } else { "  " };
 
         let size = if entry.is_parent || entry.is_enterable() {
@@ -218,24 +373,31 @@ fn draw_listing(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         } else {
             format_size(entry.size)
         };
-        let date = entry.modified.map(format_timestamp).unwrap_or_default();
-
-        let name_width = (area.width as usize).saturating_sub(2 + 8 + 22);
-        let name = pad_to_width(&sanitize(&entry.display_name()), name_width);
+        // Relative time needs no timezone, and costs seven columns
+        // instead of twenty - which is what pays for the rail.
+        let age = entry
+            .modified
+            .map(|m| bearings::relative_time(now, m))
+            .unwrap_or_default();
+        let name = pad_to_width_with(
+            &sanitize(&entry.display_name()),
+            name_width,
+            glyphs.ellipsis,
+        );
 
         let base_style = match entry.kind {
             _ if selected => theme.selected(),
-            EntryKind::Dir | EntryKind::SymlinkDir if entry.is_parent => theme.dir(),
             EntryKind::Dir => theme.dir(),
             EntryKind::SymlinkDir | EntryKind::SymlinkFile => theme.symlink(),
             EntryKind::SymlinkBroken => theme.broken(),
             _ => Style::default(),
         };
         lines.push(Line::from(vec![
+            rail_span,
             Span::styled(marker.to_string(), base_style),
             Span::styled(name, base_style),
             Span::styled(format!(" {size:>6} "), base_style),
-            Span::styled(format!(" {date:<16}"), base_style),
+            Span::styled(format!(" {age:<6}"), base_style),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -244,7 +406,7 @@ fn draw_listing(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &crate::app::Pager) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
+        .border_set(theme.pager_border_set())
         .border_style(theme.banner())
         .title(Span::styled(
             format!(" {} ", sanitize(&pager.title)),
@@ -260,35 +422,35 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &crate::a
         .iter()
         .skip(pager.scroll)
         .take(rows)
-        .map(|l| Line::from(Span::raw(l.clone())))
+        .map(|l| Line::from(Span::raw(sanitize(l))))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let visible = app.nav.visible();
-    let position = if visible.is_empty() {
-        "0/0".to_string()
-    } else {
-        format!("{}/{}", app.nav.cursor + 1, visible.len())
-    };
-    let filter = if app.nav.filter.is_empty() {
-        String::new()
-    } else {
-        format!("  filter: '{}'", app.nav.filter)
-    };
-    let hidden = if app.nav.show_hidden {
-        "  dotfiles: shown"
-    } else {
-        ""
-    };
-    let status = Paragraph::new(Line::from(Span::raw(format!(
-        " [{position}]{filter}{hidden}"
-    ))));
-    frame.render_widget(status, area);
+/// The speakable status row: the whole locus in words, on a row that
+/// never moves. It is the textual dual of the rail and the ladder, so
+/// nothing on screen is carried by shape or color alone.
+fn draw_status(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    bearings: &Bearings,
+    now: SystemTime,
+) {
+    let glyphs = theme.glyphs();
+    let parts = bearings::speakable_parts(bearings, now);
+    let separator = format!(" {} ", glyphs.dot);
+    let text = bearings::fit_joined(&parts, &separator, (area.width as usize).saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
+        area,
+    );
 }
 
 fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
+    let glyphs = theme.glyphs();
+    // Five columns of level prefix, one of padding.
+    let text_width = (area.width as usize).saturating_sub(6);
     let start = app.messages.len().saturating_sub(MESSAGE_ROWS);
     let lines: Vec<Line> = app.messages[start..]
         .iter()
@@ -298,9 +460,15 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
                 Level::Ok => (" ok: ", theme.ok()),
                 Level::Error => (" err:", theme.error()),
             };
+            let prefix = if theme.ascii && message.level == Level::Info {
+                "  -  "
+            } else {
+                prefix
+            };
+            let text = pad_to_width_with(&sanitize(&message.text), text_width, glyphs.ellipsis);
             Line::from(vec![
                 Span::styled(prefix.to_string(), style),
-                Span::styled(format!(" {}", sanitize(&message.text)), style),
+                Span::styled(format!(" {}", text.trim_end()), style),
             ])
         })
         .collect();
@@ -308,16 +476,17 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
+    let caret = theme.glyphs().caret;
     let line = match &app.mode {
         Mode::Command { input } => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
-            Span::raw(input.clone()),
-            Span::styled("█", theme.prompt()),
+            Span::raw(sanitize(input)),
+            Span::styled(caret, theme.prompt()),
         ]),
         Mode::Filter { input } => Line::from(vec![
             Span::styled(" filter> ", theme.prompt()),
-            Span::raw(input.clone()),
-            Span::styled("█", theme.prompt()),
+            Span::raw(sanitize(input)),
+            Span::styled(caret, theme.prompt()),
         ]),
         Mode::ConfirmOp => {
             let description = app
@@ -333,7 +502,7 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         }
         Mode::Pager(_) => Line::from(vec![
             Span::styled(" view ", theme.prompt()),
-            Span::raw(" j/k scroll · g/G top/bottom · q close"),
+            Span::raw(" j/k scroll - g/G top/bottom - q close"),
         ]),
         Mode::Browse => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
@@ -343,68 +512,52 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_hints(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let hints = match &app.mode {
-        Mode::Browse => {
-            " j/k move · Enter open · h up · / filter · : cmd · . dotfiles · ? help · q quit"
-        }
-        Mode::Command { .. } => " Enter run · Esc cancel · try: help, cd, move, rename, preview",
-        Mode::Filter { .. } => " type to filter · Enter keep · Esc clear",
-        Mode::ConfirmOp => " y confirm · n cancel · nothing happens without y",
-        Mode::Pager(_) => " j/k scroll · PgUp/PgDn page · q/Esc back to files",
+/// Mode-appropriate keys, fitted by dropping whole hints. The row never
+/// ends inside a word, including at the documented 80x24 minimum.
+fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
+    let hints: &[&str] = match &app.mode {
+        // Ordered by how often they are needed: what falls off a narrow
+        // terminal is what the user needs least.
+        Mode::Browse => &[
+            "j/k move",
+            "l/Enter in",
+            "h out",
+            "0-9 jump",
+            "/ find",
+            ": cmd",
+            "? help",
+            "q quit",
+            ". dotfiles",
+            "M log",
+        ],
+        Mode::Command { .. } => &[
+            "Enter run",
+            "Esc cancel",
+            "try: help, cd, move, rename, preview",
+        ],
+        Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
+        Mode::ConfirmOp => &["y confirm", "n cancel", "nothing happens without y"],
+        Mode::Pager(_) => &["j/k scroll", "PgUp/PgDn page", "q/Esc back to files"],
     };
-    frame.render_widget(Paragraph::new(Line::from(Span::raw(hints))), area);
-}
-
-/// Replace control characters with `U+FFFD` so filesystem-derived names,
-/// paths, and messages can never inject terminal escape sequences into
-/// the screen. Display-only: stored names keep their real bytes so
-/// move/rename/edit still operate on the actual file.
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
-}
-
-/// Pad or truncate `text` to exactly `width` display columns, appending
-/// `…` when truncated. Width-aware so CJK names keep columns aligned.
-fn pad_to_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let text_width: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if text_width <= width {
-        let mut out = text.to_string();
-        out.extend(std::iter::repeat_n(' ', width - text_width));
-        return out;
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w > width - 1 {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out.push('…');
-    used += 1;
-    while used < width {
-        out.push(' ');
-        used += 1;
-    }
-    out
+    let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
+    let separator = format!(" {} ", theme.glyphs().dot);
+    let text = bearings::fit_joined(&hints, &separator, (area.width as usize).saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
+        area,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{App, KeyInput};
+    use crate::bearings::display_width;
     use crate::nav::NavState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::fs;
+    use unicode_width::UnicodeWidthChar;
 
     fn render(app: &App) -> String {
         render_size(app, 90, 30)
@@ -413,17 +566,48 @@ mod tests {
     fn render_size(app: &App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        let theme = Theme { use_color: true };
+        let theme = Theme::from_no_color_env(None);
         terminal.draw(|f| draw(f, app, &theme)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    /// The cell buffer as text. A wide character owns two cells; only the
+    /// first carries the symbol, so the text keeps the same display width
+    /// as the screen.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
         for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                out.push_str(buffer[(x, y)].symbol());
+            let mut x = 0;
+            while x < buffer.area.width {
+                let symbol = buffer[(x, y)].symbol();
+                out.push_str(symbol);
+                x += display_width(symbol).max(1) as u16;
             }
             out.push('\n');
         }
         out
+    }
+
+    /// Render with an explicit theme and geometry, exactly as `main`
+    /// drives it: the app is told the same width the frame has.
+    fn render_themed(app: &mut App, width: u16, height: u16, theme: &Theme) -> String {
+        app.viewport_rows = height.saturating_sub(CHROME_ROWS).max(1) as usize;
+        app.viewport_cols = width.saturating_sub(BORDER_COLS) as usize;
+        app.glyphs = theme.glyphs();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // An hour after the newest entry: every fixture then reads as
+        // `1h`, whatever wall clock the test runs on.
+        let now = app
+            .nav
+            .entries
+            .iter()
+            .filter_map(|e| e.modified)
+            .max()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+            + std::time::Duration::from_secs(3600);
+        terminal.draw(|f| draw_at(f, app, theme, now)).unwrap();
+        buffer_text(terminal.backend().buffer())
     }
 
     fn fixture_app() -> (tempfile::TempDir, App) {
@@ -434,12 +618,319 @@ mod tests {
         (tmp, App::new(nav, None, false, None))
     }
 
+    fn listing_fixture(entries: usize) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("nested")).unwrap();
+        for i in 1..=entries {
+            fs::write(tmp.path().join(format!("file_{i:03}.txt")), "").unwrap();
+        }
+        tmp
+    }
+
+    fn app_at(dir: &Path) -> App {
+        let home = dir.canonicalize().unwrap().parent().unwrap().to_path_buf();
+        App::new(NavState::new(dir).unwrap(), None, false, Some(home))
+    }
+
+    fn row(screen: &str, index: usize) -> String {
+        screen.lines().nth(index).unwrap().to_string()
+    }
+
+    const SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (132, 40), (60, 20)];
+
+    /// Frame row of the speakable status line: it is a fixed distance
+    /// from the bottom, which is what makes "read the current line" work.
+    fn status_row(height: u16) -> usize {
+        height as usize - 7
+    }
+
     #[test]
-    fn screen_shows_banner_path_listing_and_hints() {
+    fn every_frame_size_keeps_its_border_and_row_width() {
+        let tmp = listing_fixture(73);
+        let mut app = app_at(tmp.path());
+        app.nav.cursor_to_end();
+        for (width, height) in SIZES {
+            for theme in [
+                Theme::from_no_color_env(None),
+                Theme::from_no_color_env(Some("1")),
+                Theme::from_env(None, Some("1")),
+            ] {
+                let screen = render_themed(&mut app, width, height, &theme);
+                let lines: Vec<&str> = screen.lines().collect();
+                assert_eq!(lines.len(), height as usize);
+                for (index, line) in lines.iter().enumerate() {
+                    assert_eq!(
+                        display_width(line),
+                        width as usize,
+                        "{width}x{height} row {index} is the wrong width: {line:?}"
+                    );
+                    let last = line.chars().last().unwrap();
+                    let expected: &[char] = if theme.ascii {
+                        &['|', '+']
+                    } else {
+                        &['║', '╗', '╝']
+                    };
+                    assert!(
+                        expected.contains(&last),
+                        "{width}x{height} row {index} lost its right border: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hint_row_never_breaks_a_word_at_any_size() {
+        let tmp = listing_fixture(4);
+        let mut app = app_at(tmp.path());
+        // The complete browse hint vocabulary; the row may drop hints but
+        // must never cut one in half.
+        let words = [
+            "j/k move",
+            "l/Enter in",
+            "h out",
+            "0-9 jump",
+            "/ find",
+            ": cmd",
+            "? help",
+            "q quit",
+            ". dotfiles",
+            "M log",
+        ];
+        for (width, height) in SIZES {
+            let theme = Theme::from_no_color_env(None);
+            let screen = render_themed(&mut app, width, height, &theme);
+            let hints = row(&screen, height as usize - 2);
+            let hints = hints.trim_matches(['║', ' ']);
+            assert!(!hints.is_empty(), "{width}x{height} lost the hint row");
+            assert!(
+                words.iter().any(|w| hints.ends_with(w)),
+                "{width}x{height} hint row ended mid-word: {hints:?}"
+            );
+            assert!(hints.starts_with("j/k move"));
+        }
+    }
+
+    #[test]
+    fn ladder_replaces_the_clipped_path_and_keeps_both_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp
+            .path()
+            .join("clients")
+            .join("acme-holdings")
+            .join("2026")
+            .join("q3")
+            .join("deliverables")
+            .join("final")
+            .join("assets");
+        fs::create_dir_all(&deep).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let mut app = App::new(NavState::new(&deep).unwrap(), None, false, Some(home));
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let ladder = row(&screen, 1);
+
+        assert!(ladder.contains("0·~"), "{ladder}");
+        assert!(ladder.contains("…"), "deep path should elide: {ladder}");
+        assert!(ladder.contains("7·assets"), "{ladder}");
+        assert!(ladder.contains("depth 7"), "{ladder}");
+        // Every digit drawn is a key that works.
+        let drawn: Vec<u8> = app.ladder().rungs.iter().map(|r| r.digit).collect();
+        for digit in drawn {
+            assert!(
+                ladder.contains(&format!("{digit}·")),
+                "digit {digit} is jumpable but not drawn: {ladder}"
+            );
+        }
+    }
+
+    #[test]
+    fn rail_shows_position_and_the_status_row_says_it_in_words() {
+        let tmp = listing_fixture(73);
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(None);
+
+        // At the top of a long listing the thumb is at the top.
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let status = status_row(24);
+        assert!(row(&screen, 2).starts_with("║█"), "{}", row(&screen, 2));
+        assert!(row(&screen, 16).starts_with("║│"), "{}", row(&screen, 16));
+        assert!(row(&screen, status).contains("rows 1-15 of 75"), "{screen}");
+
+        // At the bottom it is at the bottom, and the words agree.
+        app.nav.cursor_to_end();
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(row(&screen, 2).starts_with("║│"), "{}", row(&screen, 2));
+        assert!(row(&screen, 16).starts_with("║█"), "{}", row(&screen, 16));
+        assert!(
+            row(&screen, status).contains("rows 61-75 of 75"),
+            "{screen}"
+        );
+        assert!(row(&screen, status).contains("row 75 of 75"), "{screen}");
+
+        // A listing that fits has no thumb at all: there is nowhere else
+        // to be, and a full-height thumb would imply otherwise.
+        let small = listing_fixture(3);
+        let mut app = app_at(small.path());
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(!screen.contains('█'));
+        assert!(row(&screen, status).contains("all rows shown"), "{screen}");
+    }
+
+    #[test]
+    fn descending_keeps_a_scroll_margin_below_the_cursor() {
+        let tmp = listing_fixture(73);
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(None);
+        for _ in 0..30 {
+            app.handle_key(KeyInput::Char('j'));
+        }
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let listing: Vec<String> = (2..status_row(24)).map(|i| row(&screen, i)).collect();
+        let cursor = listing
+            .iter()
+            .position(|line| line.contains("> "))
+            .expect("the cursor row is on screen");
+        // Three rows of what is coming stay visible below the cursor.
+        assert_eq!(listing.len() - 1 - cursor, SCROLL_MARGIN);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so() {
+        let tmp = listing_fixture(6);
+        let mut app = app_at(tmp.path());
+        app.handle_key(KeyInput::Char('/'));
+        for c in "zzz".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        // The `..` row always passes the filter, so without this the
+        // screen would show a bare `../` and claim `[1/1]`.
+        assert!(screen.contains("../"));
+        assert!(screen.contains("(no entries match 'zzz')"), "{screen}");
+        assert!(screen.contains("filter 'zzz': 0 of 7 match"), "{screen}");
+    }
+
+    #[test]
+    fn relative_times_replace_the_utc_stamp_in_the_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "x").unwrap();
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(!screen.contains("UTC"), "{screen}");
+        // The fixture was written after the injected clock, so it reads
+        // as brand new rather than as an error.
+        assert!(screen.contains("note.txt"));
+        assert!(row(&screen, 3).contains(" 1h"), "{}", row(&screen, 3));
+        // The reclaimed columns went to the name, not away: today's
+        // 46-column name field is the floor.
+        let name_width = 78 - LISTING_FURNITURE;
+        assert!(name_width >= 46, "name field shrank to {name_width}");
+    }
+
+    #[test]
+    fn wide_characters_keep_the_columns_aligned() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("ascii_name.txt"), "").unwrap();
+        fs::write(tmp.path().join("中文檔案名稱測試用範例.txt"), "").unwrap();
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let column_of_size = |needle: &str| {
+            let line = screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("row for {needle} missing in\n{screen}"));
+            let cut = line.find(needle).unwrap() + needle.len();
+            let offset = line[cut..].find("0B").expect("size column");
+            display_width(&line[..cut + offset])
+        };
+        assert_eq!(
+            column_of_size("ascii_name.txt"),
+            column_of_size("範例.txt"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn no_color_keeps_every_new_signal_in_text() {
+        let tmp = listing_fixture(73);
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(Some("1"));
+        assert!(!theme.use_color);
+        let top = render_themed(&mut app, 80, 24, &theme);
+        // Kind is still a marker, not a color.
+        assert!(top.contains("nested/"), "{top}");
+        assert!(top.contains("../"), "{top}");
+        assert!(top.contains("rows 1-15 of 75"), "{top}");
+
+        app.nav.cursor_to_end();
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("depth "), "{screen}");
+        assert!(screen.contains("row 75 of 75"), "{screen}");
+        assert!(screen.contains("rows 61-75 of 75"), "{screen}");
+        assert!(screen.contains('█'), "the rail is still drawn");
+    }
+
+    #[test]
+    fn ascii_mode_draws_nothing_outside_printable_ascii() {
+        let tmp = listing_fixture(73);
+        let mut app = app_at(tmp.path());
+        app.nav.cursor_to_end();
+        let theme = Theme::from_env(None, Some("1"));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        for c in screen.chars().filter(|c| *c != '\n') {
+            assert!(
+                (' '..='~').contains(&c),
+                "non-ascii {c:?} on an ascii screen:\n{screen}"
+            );
+        }
+        // The bearings are still all there, in words and in ASCII shapes.
+        assert!(screen.contains("depth 1"), "{screen}");
+        assert!(screen.contains("rows 61-75 of 75"), "{screen}");
+        assert!(screen.contains('#'), "the rail still draws");
+        assert!(screen.contains("0:~"), "{screen}");
+
+        assert!(!Theme::from_env(None, None).ascii);
+        assert!(!Theme::from_env(None, Some("")).ascii);
+    }
+
+    #[test]
+    fn message_history_pager_renders_over_the_listing() {
+        let (_tmp, mut app) = fixture_app();
+        for i in 0..40 {
+            app.push_msg(Level::Info, format!("event {i}"));
+        }
+        app.handle_key(KeyInput::Char('M'));
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("messages ("), "{screen}");
+        assert!(screen.contains("event 0"), "{screen}");
+    }
+
+    #[test]
+    fn long_messages_are_truncated_not_broken_at_the_border() {
+        let (_tmp, mut app) = fixture_app();
+        app.push_msg(Level::Error, "e".repeat(200));
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let message = row(&screen, status_row(24) + 2);
+        assert!(message.contains('…'), "{message}");
+        assert_eq!(display_width(&message), 80);
+    }
+
+    #[test]
+    fn screen_shows_banner_ladder_listing_and_hints() {
         let (_tmp, app) = fixture_app();
         let screen = render(&app);
         assert!(screen.contains("FILECRAFT"));
-        assert!(screen.contains(&app.nav.cwd.display().to_string()));
+        // The raw path line is gone; the ladder names the current
+        // directory and says how deep it is.
+        let current = app.nav.cwd.file_name().unwrap().to_string_lossy();
+        assert!(screen.contains(&format!("·{current}")), "{screen}");
+        assert!(screen.contains("depth "));
         assert!(screen.contains("projects/"));
         assert!(screen.contains("readme.md"));
         assert!(screen.contains("<DIR>"));
@@ -480,12 +971,15 @@ mod tests {
         let (_tmp, mut app) = fixture_app();
         app.handle_key(KeyInput::Char('?'));
         let screen = render(&app);
-        assert!(screen.contains("COMMANDS"));
         assert!(screen.contains("KEYS"));
-        // The move line sits just below the first pager page; one row down
-        // brings it into view without skipping it.
-        app.handle_key(KeyInput::Char('j'));
+        assert!(screen.contains("jump to that ancestor"));
+        // The commands sit just below the first pager page; scrolling
+        // brings them into view without skipping anything.
+        for _ in 0..6 {
+            app.handle_key(KeyInput::Char('j'));
+        }
         let screen = render(&app);
+        assert!(screen.contains("COMMANDS"));
         assert!(screen.contains("move <destination>"));
     }
 

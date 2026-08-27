@@ -40,6 +40,9 @@ The binary is named `filecraft`. Put Cargo's bin directory on your
   Color uses the terminal's ANSI palette. Set `NO_COLOR` to any non-empty
   value to disable color; selection (reverse video), kind markers
   (`/`, `@`, `@!`), and message prefixes (`ok:`, `err:`) stay visible.
+  Set `FILECRAFT_ASCII` to any non-empty value to draw the screen using
+  printable ASCII only, for braille displays, serial terminals, and
+  locales where the box-drawing range is unreliable.
 - **Editor:** `$EDITOR` if set, otherwise `nvim`. `preview` uses a
   read-only Neovim invocation (`nvim -R -M -n`) when `nvim` is on
   `$PATH` and the file looks like text; otherwise a built-in metadata
@@ -65,17 +68,59 @@ In browse mode:
 | PgUp / PgDn | move focus a page |
 | `g` / `G` | first / last entry |
 | Enter | enter a directory, or edit the selected file |
-| Backspace, `h`, `l`, Left | parent directory |
-| Right | enter selected directory |
+| `l`, Right | enter the selected directory |
+| `h`, Left, Backspace | parent directory |
+| `0`-`9` | jump to that ancestor on the ladder |
 | `/` | filter the listing (Esc clears) |
 | `:` | command prompt |
 | `.` | show/hide dotfiles |
 | `r` | refresh listing |
+| `M` | message history |
 | `?` | help |
-| `q`, Esc, Ctrl-C | quit |
+| Esc | back out one level (clears an active filter) |
+| `q`, Ctrl-C | quit |
 
 Files are never opened automatically. Enter on a file, or the `edit`
 command, is the only way into an editor.
+
+Every browse key is read-only. Nothing on the keyboard mutates the
+filesystem: every change goes through select -> `:` command -> `y`.
+
+**Changed in this slice:** `l` now **enters** the selected directory instead of
+going to the parent, matching vim, ranger, lf, and nnn. Esc now **backs
+out one level** - it clears an active filter, or closes a pager - instead
+of quitting. Quitting is `q` or Ctrl-C.
+
+## Bearings
+
+The screen has an orientation half and an operating half, and the
+boundary is a rule: **everything above the listing is read-only**. It
+cannot be focused, and no key that starts there changes anything. The
+listing is the single thing commands act on.
+
+```
+╔ ░▒▓ FILECRAFT v0.1.0 ▓▒░ ════════════════════════════════════════════════════╗
+║ 0·~ ▸ … ▸ 7·final ▸ 8·assets                              depth 8 · 73 items ║
+║│  file_059.txt                                                     0B  1h    ║
+║█  file_060.txt                                                     0B  1h    ║
+║█> file_061.txt                                                     0B  2d    ║
+║ row 61 of 74 · file_061.txt · file · 0B · 2d ago · rows 47-61 of 74          ║
+```
+
+- **Ladder** - the ancestor chain, replacing the raw path line. Digits
+  jump to the ancestor they label; `0` is `~` under your home directory
+  and `/` elsewhere. Deep paths elide in the middle, so the anchor and
+  where you actually are are both always on screen.
+- **Rail** - the left gutter shows which slice of the listing is on
+  screen. When everything fits there is no thumb.
+- **Speakable status** - one row, at a fixed height, describing the whole
+  position in words: `row 61 of 74 · file_061.txt · file · 0B · 2d ago ·
+  rows 47-61 of 74`. It is the textual dual of the rail and the ladder, so
+  nothing is carried by shape or color alone and "read the current line"
+  always works.
+- **Relative times** - `2d`, `11m`, `1h` in the listing instead of a
+  20-column UTC stamp, which needs no timezone and returns those columns
+  to the filename. Absolute times stay in `preview`.
 
 ## Commands
 
@@ -128,8 +173,11 @@ cargo build --release
 
 The library under `src/` is terminal-free and is the home for
 deterministic tests (navigation, parsing, path safety, confirmation,
-editor argv, agent boundary). `tests/cli.rs` drives the binary for
-`--help`/`--list`/non-TTY behavior.
+editor argv, agent boundary, bearings). `src/bearings.rs` holds the pure
+orientation arithmetic - ladder, rail, scroll margin, relative time,
+speakable status - so all of it is tested without a TTY, and `src/ui.rs`
+adds golden-frame tests at 80x24, 100x30, 132x40, and 60x20.
+`tests/cli.rs` drives the binary for `--help`/`--list`/non-TTY behavior.
 
 ## License
 
