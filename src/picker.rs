@@ -141,8 +141,7 @@ impl FolderPicker {
             PickerKind::Dir | PickerKind::SymlinkDir => {
                 let dest = std::fs::canonicalize(&entry.path)
                     .map_err(|e| fsops::io_error(&entry.path, &e))?;
-                self.cwd = dest;
-                self.reload()?;
+                self.transition_to(dest)?;
                 self.focus_current();
                 Ok(())
             }
@@ -161,8 +160,7 @@ impl FolderPicker {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         let dest = std::fs::canonicalize(parent).map_err(|e| fsops::io_error(parent, &e))?;
-        self.cwd = dest;
-        self.reload()?;
+        self.transition_to(dest)?;
         if let Some(name) = from {
             if let Some(pos) = self.entries.iter().position(|entry| entry.name == name) {
                 self.cursor = pos;
@@ -184,16 +182,33 @@ impl FolderPicker {
     }
 
     fn reload(&mut self) -> Result<(), FsError> {
-        let listing = nav::read_directory(&self.cwd, self.show_hidden)?;
+        let entries = Self::read_entries(&self.cwd, self.show_hidden)?;
+        self.entries = entries;
+        if self.cursor >= self.entries.len() {
+            self.cursor = self.entries.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn transition_to(&mut self, cwd: PathBuf) -> Result<(), FsError> {
+        let entries = Self::read_entries(&cwd, self.show_hidden)?;
+        self.cwd = cwd;
+        self.entries = entries;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn read_entries(cwd: &Path, show_hidden: bool) -> Result<Vec<PickerEntry>, FsError> {
+        let listing = nav::read_directory(cwd, show_hidden)?;
         let mut entries = Vec::new();
         entries.push(PickerEntry {
             name: ".".to_string(),
             kind: PickerKind::Current,
-            path: self.cwd.clone(),
+            path: cwd.to_path_buf(),
         });
         for entry in listing {
             if entry.is_parent {
-                let Some(parent) = self.cwd.parent() else {
+                let Some(parent) = cwd.parent() else {
                     continue;
                 };
                 let path = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
@@ -206,7 +221,7 @@ impl FolderPicker {
                     },
                 );
             } else if entry.is_enterable() {
-                let child = self.cwd.join(&entry.name);
+                let child = cwd.join(&entry.name);
                 let path = std::fs::canonicalize(&child).unwrap_or(child);
                 let kind = match entry.kind {
                     EntryKind::SymlinkDir => PickerKind::SymlinkDir,
@@ -219,11 +234,7 @@ impl FolderPicker {
                 });
             }
         }
-        self.entries = entries;
-        if self.cursor >= self.entries.len() {
-            self.cursor = self.entries.len().saturating_sub(1);
-        }
-        Ok(())
+        Ok(entries)
     }
 }
 
@@ -345,6 +356,17 @@ mod tests {
         picker.enter_focused().unwrap();
         assert_eq!(picker.cwd, cwd);
         assert_eq!(picker.cursor, cursor);
+    }
+
+    #[test]
+    fn failed_directory_transition_preserves_picker_state() {
+        let (tmp, mut picker) = fixture();
+        picker.cursor_to_end();
+        let before = picker.clone();
+
+        assert!(picker.transition_to(tmp.path().join("note.txt")).is_err());
+
+        assert_eq!(picker, before);
     }
 
     #[test]
