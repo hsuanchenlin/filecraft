@@ -295,17 +295,15 @@ fn draw_ladder(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
     let glyphs = theme.glyphs();
     let width = area.width as usize;
     let summary = app.ladder_summary_with(&glyphs);
-    let summary_width = display_width(&summary);
+    let layout = bearings::ladder_row(width, display_width(&summary));
     let chain = bearings::ladder_line(&app.ladder_in(width, &glyphs), &glyphs);
-    // One leading space, the chain, then the summary flush right.
-    let chain_width = width.saturating_sub(summary_width + 2);
     let line = Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            pad_to_width_with(&chain, chain_width, glyphs.ellipsis),
+            pad_to_width_with(&chain, layout.chain_width, glyphs.ellipsis),
             theme.bearing(),
         ),
-        Span::raw(if width > summary_width + 1 {
+        Span::raw(if layout.show_summary {
             summary
         } else {
             String::new()
@@ -462,14 +460,14 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
     let lines: Vec<Line> = app.messages[start..]
         .iter()
         .map(|message| {
-            let (prefix, style) = match message.level {
-                Level::Info => (format!("  {}  ", glyphs.dot), Style::default()),
-                Level::Ok => (" ok: ".to_string(), theme.ok()),
-                Level::Error => (" err:".to_string(), theme.error()),
+            let style = match message.level {
+                Level::Info => Style::default(),
+                Level::Ok => theme.ok(),
+                Level::Error => theme.error(),
             };
             let text = pad_to_width_with(&sanitize(&message.text), text_width, glyphs.ellipsis);
             Line::from(vec![
-                Span::styled(prefix, style),
+                Span::styled(message.level.prefix(&glyphs), style),
                 Span::styled(format!(" {}", text.trim_end()), style),
             ])
         })
@@ -478,7 +476,8 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
-    let caret = theme.glyphs().caret;
+    let glyphs = theme.glyphs();
+    let caret = glyphs.caret;
     let line = match &app.mode {
         Mode::Command { input } => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
@@ -504,7 +503,10 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         }
         Mode::Pager(_) => Line::from(vec![
             Span::styled(" view ", theme.prompt()),
-            Span::raw(" j/k scroll - g/G top/bottom - q close"),
+            Span::raw(format!(
+                " j/k scroll {dot} g/G top/bottom {dot} q close",
+                dot = glyphs.dot
+            )),
         ]),
         Mode::Browse => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),

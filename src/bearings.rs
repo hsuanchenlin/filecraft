@@ -273,6 +273,35 @@ pub fn ladder_line(ladder: &Ladder, glyphs: &Glyphs) -> String {
     items.join(&sep)
 }
 
+/// How the ladder row divides its columns.
+///
+/// One owner for the whole row's arithmetic, because the invariant "every
+/// digit drawn is a digit the keys can reach" lives in the relation
+/// between these two numbers: [`LadderRow::chain_budget`] is what
+/// [`ladder`] is fitted to and is never wider than
+/// [`LadderRow::chain_width`], the column the chain is actually drawn in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderRow {
+    /// Width [`ladder`] must fit inside when choosing how many rungs to keep.
+    pub chain_budget: usize,
+    /// Width the rendered chain is padded to before the summary.
+    pub chain_width: usize,
+    /// Whether the right-aligned summary fits on the row at all.
+    pub show_summary: bool,
+}
+
+/// Split a ladder row of `cols` columns between the chain and the
+/// right-aligned summary: one leading space, the chain, one column of
+/// breathing room, then the summary.
+pub fn ladder_row(cols: usize, summary_width: usize) -> LadderRow {
+    let chain_width = cols.saturating_sub(summary_width + 2);
+    LadderRow {
+        chain_budget: chain_width.saturating_sub(1),
+        chain_width,
+        show_summary: cols > summary_width + 1,
+    }
+}
+
 fn assemble(
     anchor_label: &str,
     anchor_path: &Path,
@@ -546,6 +575,19 @@ pub fn speakable_parts(bearings: &Bearings, now: SystemTime) -> Vec<String> {
             bearings.filter, bearings.filter_matches, bearings.entries_total
         ));
     }
+    // Before the selected name, because this is the rail's only textual
+    // dual and the name is the one segment whose width the user controls.
+    // Trailing segments are what a narrow row drops, so nothing that a
+    // graphic depends on may sit behind an unbounded filename.
+    match bearings.viewport {
+        Some((first, last)) if first == 1 && last == bearings.rows_total => {
+            parts.push("all rows shown".to_string())
+        }
+        Some((first, last)) => {
+            parts.push(format!("rows {first}-{last} of {}", bearings.rows_total))
+        }
+        None => {}
+    }
     if let Some(name) = &bearings.name {
         parts.push(name.clone());
     }
@@ -557,15 +599,6 @@ pub fn speakable_parts(bearings: &Bearings, now: SystemTime) -> Vec<String> {
     }
     if let Some(modified) = bearings.modified {
         parts.push(format!("{} ago", relative_time(now, modified)));
-    }
-    match bearings.viewport {
-        Some((first, last)) if first == 1 && last == bearings.rows_total => {
-            parts.push("all rows shown".to_string())
-        }
-        Some((first, last)) => {
-            parts.push(format!("rows {first}-{last} of {}", bearings.rows_total))
-        }
-        None => {}
     }
     if bearings.show_hidden {
         parts.push("dotfiles shown".to_string());
@@ -872,7 +905,7 @@ mod tests {
         let line = speakable_parts(&bearings, at(base, 3600)).join(" · ");
         assert_eq!(
             line,
-            "row 73 of 73 · file_060.txt · file · 0B · 1h ago · rows 59-73 of 73"
+            "row 73 of 73 · rows 59-73 of 73 · file_060.txt · file · 0B · 1h ago"
         );
     }
 
@@ -892,8 +925,48 @@ mod tests {
         let parts = speakable_parts(&bearings, now);
         assert_eq!(
             parts.join(" · "),
-            "row 4 of 12 · src/ · directory · all rows shown"
+            "row 4 of 12 · all rows shown · src/ · directory"
         );
+    }
+
+    #[test]
+    fn speakable_keeps_the_rail_dual_ahead_of_a_long_name() {
+        let now = SystemTime::UNIX_EPOCH;
+        let bearings = Bearings {
+            row: Some(40),
+            rows_total: 74,
+            name: Some("quarterly-report-2026-q3-final.pdf".to_string()),
+            kind: Some("file"),
+            size: Some(12_600),
+            viewport: Some((29, 43)),
+            ..bearings_fixture()
+        };
+        // The status row's own budget at the documented 80x24 minimum:
+        // two border columns and one leading space off eighty.
+        let line = fit_joined(&speakable_parts(&bearings, now), " · ", 77, "…");
+        assert!(line.contains("rows 29-43 of 74"), "{line}");
+        assert!(display_width(&line) <= 77, "{line}");
+    }
+
+    #[test]
+    fn ladder_row_never_budgets_more_keys_than_it_draws() {
+        for cols in 1..200usize {
+            for summary_width in 0..40usize {
+                let layout = ladder_row(cols, summary_width);
+                assert!(
+                    layout.chain_budget <= layout.chain_width,
+                    "cols={cols} summary={summary_width}"
+                );
+                let drawn = 1
+                    + layout.chain_width
+                    + if layout.show_summary {
+                        summary_width
+                    } else {
+                        0
+                    };
+                assert!(drawn <= cols, "cols={cols} summary={summary_width}");
+            }
+        }
     }
 
     #[test]

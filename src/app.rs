@@ -103,6 +103,20 @@ pub enum Level {
     Error,
 }
 
+impl Level {
+    /// The level's textual dual, in the character set the screen is
+    /// drawing with. All three are exactly five columns wide, so the log
+    /// body stays flush whatever levels are in the ring - the message
+    /// strip and the `M` pager share this one table.
+    pub fn prefix(self, glyphs: &Glyphs) -> String {
+        match self {
+            Level::Info => format!("  {}  ", glyphs.dot),
+            Level::Ok => " ok: ".to_string(),
+            Level::Error => " err:".to_string(),
+        }
+    }
+}
+
 /// One line in the BBS message log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -435,12 +449,13 @@ impl App {
     /// event loop last reported, and they are the same number.
     pub fn ladder_in(&self, cols: usize, glyphs: &Glyphs) -> Ladder {
         let summary = self.ladder_summary_with(glyphs);
-        // One leading space, one column of breathing room, and the
-        // right-aligned summary.
-        let budget = cols
-            .saturating_sub(bearings::display_width(&summary))
-            .saturating_sub(3);
-        bearings::ladder(&self.nav.cwd, self.home.as_deref(), budget, glyphs)
+        let layout = bearings::ladder_row(cols, bearings::display_width(&summary));
+        bearings::ladder(
+            &self.nav.cwd,
+            self.home.as_deref(),
+            layout.chain_budget,
+            glyphs,
+        )
     }
 
     /// The ladder's textual dual: depth and size in words, never implied
@@ -496,14 +511,7 @@ impl App {
         } else {
             self.messages
                 .iter()
-                .map(|message| {
-                    let prefix = match message.level {
-                        Level::Info => format!(" {}  ", self.glyphs.dot),
-                        Level::Ok => " ok:".to_string(),
-                        Level::Error => " err:".to_string(),
-                    };
-                    format!("{prefix} {}", message.text)
-                })
+                .map(|message| format!("{} {}", message.level.prefix(&self.glyphs), message.text))
                 .collect()
         };
         self.mode = Mode::Pager(Pager {
@@ -1266,6 +1274,39 @@ mod tests {
         assert!(pager.lines.last().unwrap().contains("event 99"));
         app.handle_key(KeyInput::Char('q'));
         assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn message_levels_share_one_prefix_width() {
+        for glyphs in [Glyphs::UNICODE, Glyphs::ASCII] {
+            for level in [Level::Info, Level::Ok, Level::Error] {
+                assert_eq!(
+                    bearings::display_width(&level.prefix(&glyphs)),
+                    5,
+                    "{level:?} in {glyphs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn message_pager_keeps_the_log_body_flush_across_levels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.messages.clear();
+        for level in [Level::Info, Level::Ok, Level::Error] {
+            app.push_msg(level, "aligned".to_string());
+        }
+        app.handle_key(KeyInput::Char('M'));
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the message pager");
+        };
+        let columns: Vec<usize> = pager
+            .lines
+            .iter()
+            .map(|line| bearings::display_width(&line[..line.find("aligned").unwrap()]))
+            .collect();
+        assert_eq!(columns, vec![6, 6, 6], "{:?}", pager.lines);
     }
 
     #[test]
