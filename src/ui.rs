@@ -232,7 +232,7 @@ pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "keys: j/k move  Enter open  Backspace/h/l up  / filter  : cmd  ? help  q quit"
+        "keys: j/k move  Enter/l open  Backspace/h up  / filter  : cmd  ? help  q quit"
     );
     Ok(out)
 }
@@ -358,7 +358,9 @@ fn draw_listing(
         let Some(&entry_index) = visible.get(index) else {
             // The note sits directly under the last row that survived.
             let filler = match (&note, index == visible.len()) {
-                (Some(text), true) => pad_to_width(&format!("  {text}"), body_width),
+                (Some(text), true) => {
+                    pad_to_width_with(&format!("  {text}"), body_width, glyphs.ellipsis)
+                }
                 _ => " ".repeat(body_width),
             };
             lines.push(Line::from(vec![rail_span, Span::raw(filler)]));
@@ -440,7 +442,12 @@ fn draw_status(
     let glyphs = theme.glyphs();
     let parts = bearings::speakable_parts(bearings, now);
     let separator = format!(" {} ", glyphs.dot);
-    let text = bearings::fit_joined(&parts, &separator, (area.width as usize).saturating_sub(1));
+    let text = bearings::fit_joined(
+        &parts,
+        &separator,
+        (area.width as usize).saturating_sub(1),
+        glyphs.ellipsis,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
         area,
@@ -456,18 +463,13 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         .iter()
         .map(|message| {
             let (prefix, style) = match message.level {
-                Level::Info => ("  ·  ", Style::default()),
-                Level::Ok => (" ok: ", theme.ok()),
-                Level::Error => (" err:", theme.error()),
-            };
-            let prefix = if theme.ascii && message.level == Level::Info {
-                "  -  "
-            } else {
-                prefix
+                Level::Info => (format!("  {}  ", glyphs.dot), Style::default()),
+                Level::Ok => (" ok: ".to_string(), theme.ok()),
+                Level::Error => (" err:".to_string(), theme.error()),
             };
             let text = pad_to_width_with(&sanitize(&message.text), text_width, glyphs.ellipsis);
             Line::from(vec![
-                Span::styled(prefix.to_string(), style),
+                Span::styled(prefix, style),
                 Span::styled(format!(" {}", text.trim_end()), style),
             ])
         })
@@ -540,8 +542,14 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         Mode::Pager(_) => &["j/k scroll", "PgUp/PgDn page", "q/Esc back to files"],
     };
     let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
-    let separator = format!(" {} ", theme.glyphs().dot);
-    let text = bearings::fit_joined(&hints, &separator, (area.width as usize).saturating_sub(1));
+    let glyphs = theme.glyphs();
+    let separator = format!(" {} ", glyphs.dot);
+    let text = bearings::fit_joined(
+        &hints,
+        &separator,
+        (area.width as usize).saturating_sub(1),
+        glyphs.ellipsis,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
         area,
@@ -892,6 +900,19 @@ mod tests {
         assert!(screen.contains("rows 61-75 of 75"), "{screen}");
         assert!(screen.contains('#'), "the rail still draws");
         assert!(screen.contains("0:~"), "{screen}");
+
+        // The message-history pager is drawn from app-built lines, so it
+        // must honor the same invariant as the frame around it.
+        app.push_msg(Level::Info, "an info line in the log".to_string());
+        app.handle_key(KeyInput::Char('M'));
+        let pager = render_themed(&mut app, 80, 24, &theme);
+        for c in pager.chars().filter(|c| *c != '\n') {
+            assert!(
+                (' '..='~').contains(&c),
+                "non-ascii {c:?} on an ascii pager:\n{pager}"
+            );
+        }
+        assert!(pager.contains("an info line in the log"), "{pager}");
 
         assert!(!Theme::from_env(None, None).ascii);
         assert!(!Theme::from_env(None, Some("")).ascii);

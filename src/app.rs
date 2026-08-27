@@ -498,9 +498,9 @@ impl App {
                 .iter()
                 .map(|message| {
                     let prefix = match message.level {
-                        Level::Info => " ·  ",
-                        Level::Ok => " ok:",
-                        Level::Error => " err:",
+                        Level::Info => format!(" {}  ", self.glyphs.dot),
+                        Level::Ok => " ok:".to_string(),
+                        Level::Error => " err:".to_string(),
                     };
                     format!("{prefix} {}", message.text)
                 })

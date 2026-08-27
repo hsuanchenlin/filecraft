@@ -142,8 +142,9 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
 /// Join `parts` with `sep`, dropping whole trailing parts that do not
 /// fit. The result never exceeds `width` columns and never ends inside a
 /// word - which is what makes the hint row safe at the documented 80x24
-/// minimum.
-pub fn fit_joined(parts: &[String], sep: &str, width: usize) -> String {
+/// minimum. `ellipsis` is the truncation mark for the one case a part
+/// must be cut, so ASCII mode never draws `…`.
+pub fn fit_joined(parts: &[String], sep: &str, width: usize, ellipsis: &str) -> String {
     let sep_width = display_width(sep);
     let mut out = String::new();
     let mut used = 0usize;
@@ -166,7 +167,9 @@ pub fn fit_joined(parts: &[String], sep: &str, width: usize) -> String {
     // A single part wider than the whole row is better truncated than dropped.
     if out.is_empty() {
         if let Some(first) = parts.first() {
-            out = pad_to_width(first, width).trim_end().to_string();
+            out = pad_to_width_with(first, width, ellipsis)
+                .trim_end()
+                .to_string();
         }
     }
     out
@@ -799,15 +802,17 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(
-            fit_joined(&parts, " · ", 80),
+            fit_joined(&parts, " · ", 80, "…"),
             "j/k move · l/Enter in · h out · 0-9 jump"
         );
-        let clipped = fit_joined(&parts, " · ", 25);
+        let clipped = fit_joined(&parts, " · ", 25, "…");
         assert_eq!(clipped, "j/k move · l/Enter in");
         assert!(display_width(&clipped) <= 25);
+        // The oversized-first-part fallback keeps the caller's mark.
+        assert_eq!(fit_joined(&parts, " - ", 4, "~"), "j/k~");
         // Every width produces a complete-word prefix, never a half word.
         for width in 0..60 {
-            let line = fit_joined(&parts, " · ", width);
+            let line = fit_joined(&parts, " · ", width, "…");
             assert!(display_width(&line) <= width.max(0));
             if !line.is_empty() && width >= 8 {
                 assert!(
