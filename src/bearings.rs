@@ -45,6 +45,12 @@ pub struct Glyphs {
     pub caret: &'static str,
     /// Truncation mark appended by [`pad_to_width_with`].
     pub ellipsis: &'static str,
+    /// List bullet in the reader.
+    pub bullet: &'static str,
+    /// Blockquote bar in the reader.
+    pub quote_bar: &'static str,
+    /// Horizontal rule and code-fence line in the reader.
+    pub rule: &'static str,
 }
 
 impl Glyphs {
@@ -57,6 +63,9 @@ impl Glyphs {
         rail_track: "│",
         caret: "█",
         ellipsis: "…",
+        bullet: "•",
+        quote_bar: "│",
+        rule: "─",
     };
 
     pub const ASCII: Glyphs = Glyphs {
@@ -68,6 +77,9 @@ impl Glyphs {
         rail_track: "|",
         caret: "_",
         ellipsis: "~",
+        bullet: "*",
+        quote_bar: "|",
+        rule: "-",
     };
 
     pub fn for_ascii(ascii: bool) -> Glyphs {

@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Level, Mode};
@@ -33,7 +33,9 @@ use crate::bearings::{
     self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
 };
 use crate::fsops::FsError;
+use crate::markdown::{self, Ink, Kind, Row};
 use crate::nav::{EntryKind, NavState};
+use crate::pager::Pager;
 use crate::preview::{format_size, format_timestamp};
 
 /// Rows used by everything except the file list (borders, path, status,
@@ -184,6 +186,32 @@ impl Theme {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
+    }
+
+    /// Reader heading style. Level is part of it, but so is the `#`
+    /// marker the line keeps, so a colorless screen still ranks them.
+    pub fn heading(&self, level: u8) -> Style {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        match level {
+            1 => self.color(bold.fg(Color::Cyan)),
+            2 => self.color(bold.fg(Color::Yellow)),
+            _ => self.color(bold),
+        }
+    }
+
+    /// Code, fenced or inline.
+    pub fn code(&self) -> Style {
+        self.color(Style::default().fg(Color::Green))
+    }
+
+    /// Blockquote bar and body.
+    pub fn quote(&self) -> Style {
+        self.color(Style::default().fg(Color::Cyan))
+    }
+
+    /// Rules, fences, and reader notices: present but quiet.
+    pub fn meta(&self) -> Style {
+        self.color(Style::default().fg(Color::DarkGray))
     }
 
     pub fn confirm(&self) -> Style {
@@ -403,28 +431,80 @@ fn draw_listing(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &crate::app::Pager) {
-    let block = Block::default()
+/// The full-screen reader. The frame names what is being read at the
+/// top and says where in it the view sits at the bottom, in words - the
+/// same rule the status row follows, so the position is never carried by
+/// the scroll thumb alone.
+fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
         .borders(Borders::ALL)
         .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let width = inner.width as usize;
+    let view = inner.height as usize;
+
+    let block = frame_only
         .border_style(theme.banner())
         .title(Span::styled(
             format!(" {} ", sanitize(&pager.title)),
             theme.prompt(),
-        ));
-    let inner = block.inner(area);
+        ))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(" {} ", pager.position(width, view, &glyphs)),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let rows = inner.height as usize;
-    let lines: Vec<Line> = pager
-        .lines
+    let rows = pager.rows(width, &glyphs);
+    let scroll = pager.scroll.min(Pager::max_scroll(rows.len(), view));
+    let lines: Vec<Line> = rows
         .iter()
-        .skip(pager.scroll)
-        .take(rows)
-        .map(|l| Line::from(Span::raw(sanitize(l))))
+        .skip(scroll)
+        .take(view)
+        .map(|row| reader_line(row, theme, &pager.query))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One drawn row of the reader, with the active search query picked out.
+fn reader_line(row: &Row, theme: &Theme, query: &str) -> Line<'static> {
+    let spans = markdown::highlight(&row.spans, query);
+    Line::from(
+        spans
+            .into_iter()
+            .map(|span| Span::styled(sanitize(&span.text), ink_style(row.kind, span.ink, theme)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// How a run of reader text is drawn: the line's kind sets the base, the
+/// inline ink modifies it. Everything that carries meaning also carries a
+/// character (`#`, a bullet, a quote bar, backticks), so `NO_COLOR` loses
+/// nothing but color.
+fn ink_style(kind: Kind, ink: Ink, theme: &Theme) -> Style {
+    let base = match kind {
+        Kind::Heading(level) => theme.heading(level),
+        Kind::Code => theme.code(),
+        Kind::Quote => theme.quote(),
+        Kind::Fence | Kind::Rule | Kind::Meta => theme.meta(),
+        Kind::Body | Kind::Bullet => Style::default(),
+    };
+    match ink {
+        Ink::Match => Style::default().add_modifier(Modifier::REVERSED),
+        Ink::Marker if matches!(kind, Kind::Bullet) => theme.prompt(),
+        Ink::Marker => base,
+        Ink::Code => theme.code(),
+        Ink::Strong => base.add_modifier(Modifier::BOLD),
+        Ink::Emph => base.add_modifier(Modifier::UNDERLINED),
+        Ink::Meta => theme.meta(),
+        Ink::Plain => base,
+    }
 }
 
 /// The speakable status row: the whole locus in words, on a row that
@@ -504,13 +584,20 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
                 Span::raw(sanitize(&description)),
             ])
         }
-        Mode::Pager(_) => Line::from(vec![
-            Span::styled(" view ", theme.prompt()),
-            Span::raw(format!(
-                " j/k scroll {dot} g/G top/bottom {dot} q close",
-                dot = glyphs.dot
-            )),
-        ]),
+        Mode::Pager(pager) => match &pager.find {
+            Some(input) => Line::from(vec![
+                Span::styled(" find> ", theme.prompt()),
+                Span::raw(sanitize(input)),
+                Span::styled(caret, theme.prompt()),
+            ]),
+            None => Line::from(vec![
+                Span::styled(" read ", theme.prompt()),
+                Span::raw(format!(
+                    " j/k line {dot} d/u half {dot} g/G top/bottom {dot} / find {dot} h/q back",
+                    dot = glyphs.dot
+                )),
+            ]),
+        },
         Mode::Browse => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
             Span::raw("press : to type a command"),
@@ -544,7 +631,17 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         ],
         Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
         Mode::ConfirmOp => &["y confirm", "n cancel", "nothing happens without y"],
-        Mode::Pager(_) => &["j/k scroll", "PgUp/PgDn page", "q/Esc back to files"],
+        Mode::Pager(pager) if pager.find.is_some() => {
+            &["type to find", "Enter search", "Esc keep reading"]
+        }
+        Mode::Pager(_) => &[
+            "j/k line",
+            "h/q/Esc back to files",
+            "d/u half page",
+            "/ find",
+            "n/N next/prev",
+            "PgUp/PgDn page",
+        ],
     };
     let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
     let glyphs = theme.glyphs();
@@ -1022,14 +1119,140 @@ mod tests {
         let screen = render(&app);
         assert!(screen.contains("KEYS"));
         assert!(screen.contains("jump to that ancestor"));
-        // The commands sit just below the first pager page; scrolling
-        // brings them into view without skipping anything.
-        for _ in 0..6 {
+        // The commands sit below the first pager page; scrolling brings
+        // them into view without skipping anything.
+        for _ in 0..16 {
             app.handle_key(KeyInput::Char('j'));
         }
         let screen = render(&app);
         assert!(screen.contains("COMMANDS"));
         assert!(screen.contains("move <destination>"));
+    }
+
+    /// The reader over a fixture file, driven exactly as `main` does.
+    fn reader_app(name: &str, body: &str) -> (tempfile::TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(name), body).unwrap();
+        let mut app = app_at(tmp.path());
+        let visible = app.nav.visible();
+        app.nav.cursor = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == name)
+            .unwrap();
+        app.handle_key(KeyInput::Char('l'));
+        (tmp, app)
+    }
+
+    #[test]
+    fn the_reader_draws_markdown_structure_and_says_where_it_is() {
+        let (_tmp, mut app) = reader_app(
+            "notes.md",
+            "# Title\n\nbody with `code` here\n\n- one\n- two\n\n> quoted\n\n---\n",
+        );
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("notes.md"), "{screen}");
+        assert!(screen.contains("# Title"), "{screen}");
+        assert!(screen.contains("• one"), "{screen}");
+        assert!(screen.contains("│ quoted"), "{screen}");
+        assert!(
+            screen.contains("`code`"),
+            "the backticks are the dual: {screen}"
+        );
+        assert!(screen.contains("line 1 of 10 · 100%"), "{screen}");
+        assert!(screen.contains("/ find"), "{screen}");
+    }
+
+    #[test]
+    fn the_reader_is_given_exactly_the_geometry_it_scrolls_by() {
+        // A line one column wider than the reader has must wrap into two
+        // rows: the width the app clamps scrolling to is the width the
+        // frame actually draws in.
+        let (_tmp, mut app) = {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("wide.log"), "x".repeat(200)).unwrap();
+            let mut app = app_at(tmp.path());
+            app.viewport_rows = 24usize - CHROME_ROWS as usize;
+            app.viewport_cols = 80usize - BORDER_COLS as usize;
+            let visible = app.nav.visible();
+            app.nav.cursor = visible
+                .iter()
+                .position(|&i| app.nav.entries[i].name == "wide.log")
+                .unwrap();
+            app.handle_key(KeyInput::Char('l'));
+            (tmp, app)
+        };
+        let theme = Theme::from_no_color_env(None);
+        let cols = app.pager_cols();
+        let rows = app.pager_rows();
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        // Only the rows inside the reader's own frame.
+        let body: Vec<&str> = screen
+            .lines()
+            .skip_while(|line| !line.contains("wide.log"))
+            .skip(1)
+            .take_while(|line| !line.contains("line 1 of 1"))
+            .collect();
+        let widths: Vec<usize> = body
+            .iter()
+            .map(|line| line.matches('x').count())
+            .filter(|n| *n > 0)
+            .collect();
+        // 200 columns of one unbroken word, cut at exactly the width the
+        // app clamps scrolling to - and every row of it on screen.
+        assert!(rows >= widths.len(), "{screen}");
+        assert_eq!(widths, vec![cols, cols, 200 - 2 * cols], "{screen}");
+    }
+
+    #[test]
+    fn the_reader_never_lets_wide_characters_break_the_frame() {
+        let paragraph = "檔案總管視窗介面設計與鍵盤操作".repeat(12);
+        let (_tmp, mut app) = reader_app("cjk.md", &format!("# 標題\n\n{paragraph}\n"));
+        let theme = Theme::from_no_color_env(None);
+        for (width, height) in SIZES {
+            let screen = render_themed(&mut app, width, height, &theme);
+            for line in screen.lines() {
+                assert_eq!(
+                    display_width(line),
+                    width as usize,
+                    "row width drifted at {width}x{height}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_reader_keeps_every_signal_in_text_without_color_or_unicode() {
+        let (_tmp, mut app) = reader_app(
+            "notes.md",
+            "# Title\n\n- one\n\n> quoted\n\n```sh\ncargo test\n```\n",
+        );
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        for c in screen.chars().filter(|c| *c != '\n') {
+            assert!(
+                (' '..='~').contains(&c),
+                "non-ascii {c:?} in the ascii reader:\n{screen}"
+            );
+        }
+        // Structure survives with no color and no drawing characters.
+        assert!(screen.contains("# Title"), "{screen}");
+        assert!(screen.contains("* one"), "{screen}");
+        assert!(screen.contains("| quoted"), "{screen}");
+        assert!(screen.contains("cargo test"), "{screen}");
+    }
+
+    #[test]
+    fn the_find_prompt_shows_what_is_being_typed() {
+        let (_tmp, mut app) = reader_app("notes.md", "alpha\nbeta\ngamma\n");
+        app.handle_key(KeyInput::Char('/'));
+        for c in "bet".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("find> bet"), "{screen}");
+        assert!(screen.contains("Enter search"), "{screen}");
     }
 
     #[test]
