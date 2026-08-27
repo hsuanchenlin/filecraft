@@ -10,9 +10,9 @@
 //! project rule is that color - and now shape - is never the only signal:
 //!
 //! - [`ladder`] answers *where am I and how do I get back up* (dual: `depth N`).
-//! - [`rail`] answers *how big is here and where am I in it* (dual: [`speakable_parts`]'s
-//!   `rows A-B of N`).
-//! - [`speakable_parts`] states the whole locus in words, on one row.
+//! - [`rail`] answers *how big is here and where am I in it* (dual: [`speakable`]'s
+//!   `rows A-B of N`, which the status row pins so it can never be dropped).
+//! - [`speakable`] states the whole locus in words, on one row.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -145,12 +145,40 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
 /// minimum. `ellipsis` is the truncation mark for the one case a part
 /// must be cut, so ASCII mode never draws `…`.
 pub fn fit_joined(parts: &[String], sep: &str, width: usize, ellipsis: &str) -> String {
+    fit_joined_pinned(parts, sep, width, ellipsis, None)
+}
+
+/// [`fit_joined`] with one segment the row is not allowed to drop.
+///
+/// `pinned` indexes a part whose columns are claimed before anything else
+/// competes for them, so a segment that is the only textual dual of a
+/// graphic survives at any width and behind any number of segments whose
+/// length the user controls. Everything else keeps the ordinary
+/// drop-whole-trailing-parts behaviour. A pin wider than the whole row is
+/// ignored rather than honoured, because there is no row left to keep it in.
+pub fn fit_joined_pinned(
+    parts: &[String],
+    sep: &str,
+    width: usize,
+    ellipsis: &str,
+    pinned: Option<usize>,
+) -> String {
     let sep_width = display_width(sep);
-    let mut out = String::new();
+    let pinned = pinned.filter(|&i| i < parts.len() && display_width(&parts[i]) <= width);
+    let mut keep = vec![false; parts.len()];
+    let mut kept = 0usize;
     let mut used = 0usize;
-    for part in parts {
+    if let Some(index) = pinned {
+        keep[index] = true;
+        kept = 1;
+        used = display_width(&parts[index]);
+    }
+    for (index, part) in parts.iter().enumerate() {
+        if keep[index] {
+            continue;
+        }
         let part_width = display_width(part);
-        let extra = if out.is_empty() {
+        let extra = if kept == 0 {
             part_width
         } else {
             sep_width + part_width
@@ -158,16 +186,21 @@ pub fn fit_joined(parts: &[String], sep: &str, width: usize, ellipsis: &str) -> 
         if used + extra > width {
             break;
         }
-        if !out.is_empty() {
-            out.push_str(sep);
-        }
-        out.push_str(part);
+        keep[index] = true;
+        kept += 1;
         used += extra;
     }
+    let out = parts
+        .iter()
+        .zip(&keep)
+        .filter(|(_, &keep)| keep)
+        .map(|(part, _)| part.as_str())
+        .collect::<Vec<_>>()
+        .join(sep);
     // A single part wider than the whole row is better truncated than dropped.
     if out.is_empty() {
         if let Some(first) = parts.first() {
-            out = pad_to_width_with(first, width, ellipsis)
+            return pad_to_width_with(first, width, ellipsis)
                 .trim_end()
                 .to_string();
         }
@@ -555,14 +588,27 @@ impl Bearings {
     }
 }
 
-/// The speakable status line, as segments the caller joins with ` · `.
+/// The speakable status line: segments the caller joins with ` · `, plus
+/// the one segment a narrow row may not drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Speakable {
+    pub parts: Vec<String>,
+    /// Index into `parts` of the rail's textual dual, whenever the rail
+    /// has anything to draw. Handed to [`fit_joined_pinned`], this is what
+    /// makes "the rail is never a shape-only signal" structural rather
+    /// than a property of how long the other segments happen to be.
+    pub pinned: Option<usize>,
+}
+
+/// The speakable status line for a locus.
 ///
 /// This is the textual dual of every graphic on screen: the rail's thumb
 /// is `rows A-B of N`, the ladder's shape is `depth N`, and the cursor's
 /// highlight is `row R of T`. Read aloud it is a sentence about exactly
 /// one locus.
-pub fn speakable_parts(bearings: &Bearings, now: SystemTime) -> Vec<String> {
+pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
     let mut parts = Vec::new();
+    let mut pinned = None;
     match bearings.row {
         Some(row) => parts.push(format!("row {row} of {}", bearings.rows_total)),
         None => parts.push("no rows".to_string()),
@@ -575,15 +621,17 @@ pub fn speakable_parts(bearings: &Bearings, now: SystemTime) -> Vec<String> {
             bearings.filter, bearings.filter_matches, bearings.entries_total
         ));
     }
-    // Before the selected name, because this is the rail's only textual
-    // dual and the name is the one segment whose width the user controls.
-    // Trailing segments are what a narrow row drops, so nothing that a
-    // graphic depends on may sit behind an unbounded filename.
+    // Ahead of the selected name so the row reads in a sensible order,
+    // and pinned so that ordering is not what the invariant rests on:
+    // both the name and the filter are segments whose width the user
+    // controls, and neither may crowd out the rail's only dual.
     match bearings.viewport {
         Some((first, last)) if first == 1 && last == bearings.rows_total => {
+            pinned = Some(parts.len());
             parts.push("all rows shown".to_string())
         }
         Some((first, last)) => {
+            pinned = Some(parts.len());
             parts.push(format!("rows {first}-{last} of {}", bearings.rows_total))
         }
         None => {}
@@ -603,7 +651,7 @@ pub fn speakable_parts(bearings: &Bearings, now: SystemTime) -> Vec<String> {
     if bearings.show_hidden {
         parts.push("dotfiles shown".to_string());
     }
-    parts
+    Speakable { parts, pinned }
 }
 
 /// True when a filter is active and nothing but the `..` row survived it.
@@ -829,6 +877,46 @@ mod tests {
     }
 
     #[test]
+    fn fit_joined_pinned_keeps_its_segment_at_every_width() {
+        let parts: Vec<String> = [
+            "row 40 of 74",
+            "filter '2026-q3-deliverable': 40 of 200 match",
+            "rows 29-43 of 74",
+            "quarterly-report-2026-q3-final.pdf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let pin = Some(2);
+        // Wide enough for everything: pinning changes nothing.
+        assert_eq!(
+            fit_joined_pinned(&parts, " · ", 200, "…", pin),
+            fit_joined(&parts, " · ", 200, "…")
+        );
+        // Narrow enough that the unpinned fitter drops the dual.
+        assert!(!fit_joined(&parts, " · ", 77, "…").contains("rows 29-43 of 74"));
+        for width in 0..200 {
+            let line = fit_joined_pinned(&parts, " · ", width, "…", pin);
+            assert!(display_width(&line) <= width, "{width}: {line:?}");
+            // The pin is honoured whenever the row is wide enough to hold
+            // it at all; below that there is no row left to keep it in.
+            if width >= display_width(&parts[2]) {
+                assert!(line.contains("rows 29-43 of 74"), "{width}: {line:?}");
+            }
+        }
+        // Segments stay in their authored order, pinned or not.
+        assert_eq!(
+            fit_joined_pinned(&parts, " · ", 32, "…", pin),
+            "row 40 of 74 · rows 29-43 of 74"
+        );
+        // An out-of-range pin degrades to the ordinary fitter.
+        assert_eq!(
+            fit_joined_pinned(&parts, " · ", 40, "…", Some(9)),
+            fit_joined(&parts, " · ", 40, "…")
+        );
+    }
+
+    #[test]
     fn fit_joined_never_breaks_a_word() {
         let parts: Vec<String> = ["j/k move", "l/Enter in", "h out", "0-9 jump"]
             .iter()
@@ -902,7 +990,7 @@ mod tests {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let mut bearings = bearings_fixture();
         bearings.modified = Some(base);
-        let line = speakable_parts(&bearings, at(base, 3600)).join(" · ");
+        let line = speakable(&bearings, at(base, 3600)).parts.join(" · ");
         assert_eq!(
             line,
             "row 73 of 73 · rows 59-73 of 73 · file_060.txt · file · 0B · 1h ago"
@@ -922,7 +1010,7 @@ mod tests {
             viewport: Some((1, 12)),
             ..bearings_fixture()
         };
-        let parts = speakable_parts(&bearings, now);
+        let parts = speakable(&bearings, now).parts;
         assert_eq!(
             parts.join(" · "),
             "row 4 of 12 · all rows shown · src/ · directory"
@@ -943,7 +1031,7 @@ mod tests {
         };
         // The status row's own budget at the documented 80x24 minimum:
         // two border columns and one leading space off eighty.
-        let line = fit_joined(&speakable_parts(&bearings, now), " · ", 77, "…");
+        let line = fit_joined(&speakable(&bearings, now).parts, " · ", 77, "…");
         assert!(line.contains("rows 29-43 of 74"), "{line}");
         assert!(display_width(&line) <= 77, "{line}");
     }
@@ -986,7 +1074,8 @@ mod tests {
             show_hidden: false,
         };
         assert!(filter_matched_nothing(&bearings));
-        assert!(speakable_parts(&bearings, now)
+        assert!(speakable(&bearings, now)
+            .parts
             .join(" · ")
             .contains("filter 'zzz': 0 of 12 match"));
 
@@ -996,7 +1085,8 @@ mod tests {
             ..bearings
         };
         assert!(!filter_matched_nothing(&matching));
-        assert!(speakable_parts(&matching, now)
+        assert!(speakable(&matching, now)
+            .parts
             .join(" · ")
             .contains("filter 'app': 2 of 12 match"));
     }
@@ -1018,7 +1108,7 @@ mod tests {
             show_hidden: true,
         };
         assert_eq!(
-            speakable_parts(&bearings, now).join(" · "),
+            speakable(&bearings, now).parts.join(" · "),
             "no rows · dotfiles shown"
         );
     }

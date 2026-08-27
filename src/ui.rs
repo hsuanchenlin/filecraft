@@ -438,13 +438,14 @@ fn draw_status(
     now: SystemTime,
 ) {
     let glyphs = theme.glyphs();
-    let parts = bearings::speakable_parts(bearings, now);
+    let speakable = bearings::speakable(bearings, now);
     let separator = format!(" {} ", glyphs.dot);
-    let text = bearings::fit_joined(
-        &parts,
+    let text = bearings::fit_joined_pinned(
+        &speakable.parts,
         &separator,
         (area.width as usize).saturating_sub(1),
         glyphs.ellipsis,
+        speakable.pinned,
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
@@ -785,6 +786,29 @@ mod tests {
         let screen = render_themed(&mut app, 80, 24, &theme);
         assert!(!screen.contains('█'));
         assert!(row(&screen, status).contains("all rows shown"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_filter_never_evicts_the_rails_textual_dual() {
+        // A filter long enough to crowd the row, still matching enough
+        // entries that the listing overflows and the rail draws a thumb.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 1..=40 {
+            fs::write(
+                tmp.path().join(format!("2026-q3-deliverable-{i:03}.txt")),
+                "",
+            )
+            .unwrap();
+        }
+        let mut app = app_at(tmp.path());
+        app.nav.set_filter("2026-q3-deliverable".to_string());
+        app.nav.cursor_to_end();
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let status = row(&screen, status_row(24));
+        assert!(screen.contains('█'), "{screen}");
+        assert!(status.contains("rows 27-41 of 41"), "{status}");
+        assert_eq!(display_width(&status), 80, "{status}");
     }
 
     #[test]

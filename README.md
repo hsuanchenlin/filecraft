@@ -104,7 +104,7 @@ listing is the single thing commands act on.
 ║│  file_059.txt                                                     0B  1h    ║
 ║█  file_060.txt                                                     0B  1h    ║
 ║█> file_061.txt                                                     0B  2d    ║
-║ row 61 of 74 · file_061.txt · file · 0B · 2d ago · rows 47-61 of 74          ║
+║ row 61 of 74 · rows 47-61 of 74 · file_061.txt · file · 0B · 2d ago          ║
 ```
 
 - **Ladder** - the ancestor chain, replacing the raw path line. Digits
@@ -114,10 +114,11 @@ listing is the single thing commands act on.
 - **Rail** - the left gutter shows which slice of the listing is on
   screen. When everything fits there is no thumb.
 - **Speakable status** - one row, at a fixed height, describing the whole
-  position in words: `row 61 of 74 · file_061.txt · file · 0B · 2d ago ·
-  rows 47-61 of 74`. It is the textual dual of the rail and the ladder, so
-  nothing is carried by shape or color alone and "read the current line"
-  always works.
+  position in words: `row 61 of 74 · rows 47-61 of 74 · file_061.txt ·
+  file · 0B · 2d ago`. It is the textual dual of the rail and the
+  ladder, so nothing is carried by shape or color alone and "read the
+  current line" always works. A narrow row drops trailing segments, but
+  never `rows A-B of N` - the rail always has its words.
 - **Relative times** - `2d`, `11m`, `1h` in the listing instead of a
   20-column UTC stamp, which needs no timezone and returns those columns
   to the filename. Absolute times stay in `preview`.
