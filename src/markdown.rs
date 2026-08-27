@@ -225,7 +225,7 @@ pub fn parse_markdown(text: &str) -> Vec<DocLine> {
     for raw in text.lines() {
         let line = clean(raw);
         if let Some(open) = fence {
-            if fence_char(&line) == Some(open) {
+            if is_closing_fence(&line, open) {
                 fence = None;
                 out.push(DocLine::new(Kind::Fence, Marker::None, Vec::new()));
                 continue;
@@ -260,6 +260,12 @@ fn fence_char(line: &str) -> Option<char> {
     ['`', '~'].into_iter().find(|&mark| {
         trimmed.starts_with(mark) && trimmed.chars().take_while(|c| *c == mark).count() >= 3
     })
+}
+
+fn is_closing_fence(line: &str, mark: char) -> bool {
+    let trimmed = line.trim_start();
+    let run = trimmed.chars().take_while(|c| *c == mark).count();
+    run >= 3 && trimmed[run * mark.len_utf8()..].trim().is_empty()
 }
 
 fn parse_block_line(line: &str) -> DocLine {
@@ -706,6 +712,15 @@ mod tests {
             vec![Kind::Fence, Kind::Code, Kind::Code, Kind::Fence, Kind::Body]
         );
         assert_eq!(drawn(&doc, &Glyphs::UNICODE)[1], "  # not a heading");
+    }
+
+    #[test]
+    fn fenced_code_closes_only_with_a_bare_matching_fence() {
+        let doc = parse_markdown("```rust\n```not-a-close\n~~~\n```   \nafter\n");
+        assert_eq!(
+            kinds(&doc),
+            vec![Kind::Fence, Kind::Code, Kind::Code, Kind::Fence, Kind::Body]
+        );
     }
 
     #[test]
