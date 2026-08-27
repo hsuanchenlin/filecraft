@@ -598,6 +598,24 @@ pub struct Speakable {
     /// makes "the rail is never a shape-only signal" structural rather
     /// than a property of how long the other segments happen to be.
     pub pinned: Option<usize>,
+    pub filter: Option<usize>,
+}
+
+/// Bound the active-filter segment to the columns left after the leading
+/// row count and pinned rail dual have claimed their space.
+pub fn bound_speakable_filter(speakable: &mut Speakable, sep: &str, width: usize, ellipsis: &str) {
+    let (Some(filter), Some(pinned)) = (speakable.filter, speakable.pinned) else {
+        return;
+    };
+    let reserved = display_width(&speakable.parts[0])
+        + display_width(&speakable.parts[pinned])
+        + 2 * display_width(sep);
+    let budget = width.saturating_sub(reserved);
+    if display_width(&speakable.parts[filter]) > budget {
+        speakable.parts[filter] = pad_to_width_with(&speakable.parts[filter], budget, ellipsis)
+            .trim_end()
+            .to_string();
+    }
 }
 
 /// The speakable status line for a locus.
@@ -609,6 +627,7 @@ pub struct Speakable {
 pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
     let mut parts = Vec::new();
     let mut pinned = None;
+    let mut filter = None;
     match bearings.row {
         Some(row) => parts.push(format!("row {row} of {}", bearings.rows_total)),
         None => parts.push("no rows".to_string()),
@@ -616,6 +635,7 @@ pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
     // Directly after the row count, because a filter is what makes that
     // count mean something other than the size of the directory.
     if !bearings.filter.is_empty() {
+        filter = Some(parts.len());
         parts.push(format!(
             "filter '{}': {} of {} match",
             bearings.filter, bearings.filter_matches, bearings.entries_total
@@ -651,7 +671,11 @@ pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
     if bearings.show_hidden {
         parts.push("dotfiles shown".to_string());
     }
-    Speakable { parts, pinned }
+    Speakable {
+        parts,
+        pinned,
+        filter,
+    }
 }
 
 /// True when a filter is active and nothing but the `..` row survived it.
@@ -1089,6 +1113,28 @@ mod tests {
             .parts
             .join(" · ")
             .contains("filter 'app': 2 of 12 match"));
+    }
+
+    #[test]
+    fn long_filter_degrades_without_losing_filter_or_rows_dual() {
+        let now = SystemTime::UNIX_EPOCH;
+        let bearings = Bearings {
+            row: Some(40),
+            rows_total: 74,
+            viewport: Some((29, 43)),
+            filter: "quarterly-report-2026-q3-final-approved-copy".repeat(4),
+            filter_matches: 2,
+            entries_total: 74,
+            ..bearings_fixture()
+        };
+        let mut speakable = speakable(&bearings, now);
+        bound_speakable_filter(&mut speakable, " · ", 77, "…");
+        let line = fit_joined_pinned(&speakable.parts, " · ", 77, "…", speakable.pinned);
+
+        assert!(line.contains("filter '"), "{line}");
+        assert!(line.contains('…'), "{line}");
+        assert!(line.contains("rows 29-43 of 74"), "{line}");
+        assert!(display_width(&line) <= 77, "{line}");
     }
 
     #[test]

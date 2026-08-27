@@ -438,12 +438,14 @@ fn draw_status(
     now: SystemTime,
 ) {
     let glyphs = theme.glyphs();
-    let speakable = bearings::speakable(bearings, now);
+    let mut speakable = bearings::speakable(bearings, now);
     let separator = format!(" {} ", glyphs.dot);
+    let width = (area.width as usize).saturating_sub(1);
+    bearings::bound_speakable_filter(&mut speakable, &separator, width, glyphs.ellipsis);
     let text = bearings::fit_joined_pinned(
         &speakable.parts,
         &separator,
-        (area.width as usize).saturating_sub(1),
+        width,
         glyphs.ellipsis,
         speakable.pinned,
     );
