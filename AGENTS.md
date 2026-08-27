@@ -14,6 +14,16 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   scroll margin, relative time, speakable status, width padding,
   sanitizing). Put new rendering arithmetic there, not in `ui.rs`, so it
   stays testable without a TTY.
+- The reader (`l` on a text/Markdown file) splits the same way:
+  `src/markdown.rs` classifies lines and wraps them to a column budget,
+  `src/pager.rs` owns scroll/search/position, `ui.rs` only turns a
+  `markdown::Span` into a ratatui span. A `DocLine`'s marker stays a
+  `markdown::Marker` until layout, so one parsed document draws correctly
+  in either character set - never bake glyphs into parsed state.
+- `pager::FRAME_ROWS`/`FRAME_COLS` are what `App::pager_rows`/`pager_cols`
+  subtract from the mirrored viewport; they must match the reader block's
+  borders plus padding in `ui::draw_pager` or scrolling and drawing
+  disagree about what a row is.
 - Screens are asserted as golden frames in `src/ui.rs` tests via ratatui's
   `TestBackend` at 80x24, 100x30, 132x40, and 60x20. A wide character owns
   two cells and only the first carries the symbol; dump a buffer with the
@@ -21,13 +31,23 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - `App::viewport_rows`/`viewport_cols`/`glyphs` are mirrored from the
   terminal by `main.rs` every frame. Key handling fits the ladder to those
   same numbers, which is what makes every digit drawn a key that works.
+  Mirror geometry through `App::set_viewport`, never by assigning the
+  fields: it is also where an open reader's offset is re-clamped, so a
+  resize cannot leave `top_line`, the position footer, and `n`/`N`
+  reading an offset the screen no longer has.
+- `Pager::rows` memoizes the laid-out document on `(width, glyphs)`; a
+  frame and a keypress each ask for it several times. Text the app itself
+  writes reaches the reader through `markdown::DocLine::body`/`meta`,
+  which is where tabs and control characters are cleaned - every column
+  budget downstream assumes that has already happened.
 - v0 has no delete command. Do not add recursive (or any) deletion without an explicit product decision.
 - One operating locus: the listing. Chrome above it is read-only and must
   never become a second selectable/operable pane - that ambiguity is what
   the confirmation flow's safety argument rests on.
 - Every browse key must stay read-only; `no_browse_key_ever_mutates_the_filesystem`
   in `src/app.rs` enforces it mechanically. `?` help, the README keyboard
-  table, and `help_lines()` ship in the same change as any key change.
+  table, and `help_lines()` ship in the same change as any key change -
+  the reader's keys included.
 - `agent` is a disabled seam (`src/agent.rs`, contract in `docs/agent-seam.md`). Do not invoke an LLM, scan a tree for an agent, or enable autonomous changes.
 
 ## Maintaining this file

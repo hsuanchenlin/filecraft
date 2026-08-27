@@ -9,7 +9,12 @@
 //! - [`fsops`] canonicalizes/validates paths and performs safe move/rename.
 //! - [`nav`] models directory listings and cursor/filter state.
 //! - [`editor`] constructs editor/preview invocations (`$EDITOR`, `nvim`).
-//! - [`preview`] builds the built-in metadata/text preview.
+//! - [`preview`] builds the built-in metadata/text preview and reads
+//!   files for the reader.
+//! - [`markdown`] turns Markdown or plain text into styled, wrapped
+//!   display rows.
+//! - [`pager`] is the read-only full-screen reader: scroll, search, and
+//!   the position it reports.
 //! - [`agent`] is the disabled-by-default future AI-agent seam.
 //! - [`app`] is the state machine: keys in, [`app::Effect`]s out.
 //! - [`cli`] parses argv for the binary.
@@ -25,6 +30,8 @@ pub mod cli;
 pub mod command;
 pub mod editor;
 pub mod fsops;
+pub mod markdown;
 pub mod nav;
+pub mod pager;
 pub mod preview;
 pub mod ui;

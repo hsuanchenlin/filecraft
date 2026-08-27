@@ -43,6 +43,9 @@ The binary is named `filecraft`. Put Cargo's bin directory on your
   Set `FILECRAFT_ASCII` to any non-empty value to draw the screen using
   printable ASCII only, for braille displays, serial terminals, and
   locales where the box-drawing range is unreliable.
+- **Reader:** built in and read-only, for Markdown (`.md`, `.markdown`)
+  and any other file that looks like text. No external pager is needed
+  and none is launched.
 - **Editor:** `$EDITOR` if set, otherwise `nvim`. `preview` uses a
   read-only Neovim invocation (`nvim -R -M -n`) when `nvim` is on
   `$PATH` and the file looks like text; otherwise a built-in metadata
@@ -68,7 +71,7 @@ In browse mode:
 | PgUp / PgDn | move focus a page |
 | `g` / `G` | first / last entry |
 | Enter | enter a directory, or edit the selected file |
-| `l`, Right | enter the selected directory |
+| `l`, Right | enter the selected directory, or read the selected file |
 | `h`, Left, Backspace | parent directory |
 | `0`-`9` | jump to that ancestor on the ladder |
 | `/` | filter the listing (Esc clears) |
@@ -87,10 +90,46 @@ Every navigation and orientation key is read-only. Filesystem commands
 still go through select -> `:` command -> `y`; opening a file in the
 configured editor remains the explicit path for editing file contents.
 
-**Changed in this slice:** `l` now **enters** the selected directory instead of
-going to the parent, matching vim, ranger, lf, and nnn. Esc now **backs
-out one level** - it clears an active filter, or closes a pager - instead
-of quitting. Quitting is `q` or Ctrl-C.
+**Changed in this slice:** `l` on a text or Markdown file now opens the
+built-in reader (below) instead of refusing. On a directory it still
+enters, and on `../` it still goes up, so the key means one thing: go
+in. Nothing about it can change a file.
+
+**Changed in an earlier slice:** `l` **enters** the selected directory
+instead of going to the parent, matching vim, ranger, lf, and nnn. Esc
+**backs out one level** - it clears an active filter, or closes a pager -
+instead of quitting. Quitting is `q` or Ctrl-C.
+
+## Reader
+
+`l` (or Right) on a Markdown or plain-text file opens a full-screen,
+read-only reader. It never writes, never shells out, and never leaves the
+listing: closing it lands on exactly the row it was opened from.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, Down / Up | scroll one line |
+| `d` / `u` | scroll half a page |
+| `f` / `b`, PgDn / PgUp | scroll a page |
+| `g` / `G`, Home / End | top / bottom |
+| `/` | find in this file (type, then Enter) |
+| `n` / `N` | next / previous match |
+| `h`, `q`, Esc | back to the listing |
+
+The frame names the file at the top and says where the view sits at the
+bottom in words - `line 42 of 310 · 13%` - the same rule the status row
+follows, so the position is never carried by a scroll thumb alone.
+
+Markdown is drawn in the BBS palette: headings, list bullets, blockquotes,
+fenced and inline code, and thematic breaks. Every one of them keeps a
+textual marker (`#`, a bullet, a quote bar, backticks), so `NO_COLOR` and
+`FILECRAFT_ASCII` lose the color and the drawing characters but not the
+structure. Lines wrap on real display columns, so wide CJK text reflows
+without jitter and a wrapped bullet stays under its own text.
+
+A binary file is refused in a message rather than painted on the screen;
+so are broken symlinks and special files. Files are shown up to 1 MiB and
+20,000 lines, and a truncated file says so on its last line.
 
 ## Bearings
 
@@ -175,9 +214,12 @@ cargo build --release
 
 The library under `src/` is terminal-free and is the home for
 deterministic tests (navigation, parsing, path safety, confirmation,
-editor argv, agent boundary, bearings). `src/bearings.rs` holds the pure
-orientation arithmetic - ladder, rail, scroll margin, relative time,
-speakable status - so all of it is tested without a TTY, and `src/ui.rs`
+editor argv, agent boundary, bearings, reader). `src/bearings.rs` holds
+the pure orientation arithmetic - ladder, rail, scroll margin, relative
+time, speakable status - so all of it is tested without a TTY;
+`src/markdown.rs` holds the reader's line classification, inline
+emphasis, and width-aware wrapping, and `src/pager.rs` its scroll,
+search, and position. `src/ui.rs`
 adds golden-frame tests at 80x24, 100x30, 132x40, and 60x20.
 `tests/cli.rs` drives the binary for `--help`/`--list`/non-TTY behavior.
 

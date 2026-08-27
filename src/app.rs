@@ -13,8 +13,10 @@ use crate::bearings::{self, Glyphs, Ladder};
 use crate::command::{self, Command};
 use crate::editor;
 use crate::fsops::{self, FsError};
+use crate::markdown::{self, DocLine};
 use crate::nav::NavState;
-use crate::preview::{self, PreviewData};
+use crate::pager::{self, Pager};
+use crate::preview::{self, PreviewData, ViewSource};
 
 /// Abstract key input, decoupled from any terminal backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,17 +53,11 @@ pub enum Effect {
     },
 }
 
-/// A scrollable full-screen text pane (help, built-in preview, agent
-/// explanation).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pager {
-    pub title: String,
-    pub lines: Vec<String>,
-    pub scroll: usize,
-}
-
 /// Which input surface currently owns the keyboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `Pager` owns its document and layout cache; boxing it would complicate the
+// public state-machine API solely to reduce the size of this short-lived enum.
+#[allow(clippy::large_enum_variant)]
 pub enum Mode {
     Browse,
     Command { input: String },
@@ -230,7 +226,7 @@ impl App {
             }
             KeyInput::Enter => self.activate_selection(),
             KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => self.go_up(),
-            KeyInput::Right | KeyInput::Char('l') => self.enter_selected_dir(),
+            KeyInput::Right | KeyInput::Char('l') => self.open_selected(),
             // Digits address the ancestor ladder; `0` is always the anchor.
             KeyInput::Char(c) if c.is_ascii_digit() => self.jump_to_rung(c as u8 - b'0'),
             KeyInput::Char('M') => self.show_messages(),
@@ -366,27 +362,126 @@ impl App {
         }
     }
 
+    /// Mirror the terminal's geometry into the state key handling and
+    /// the reader compute against, and re-establish the reader's one
+    /// invariant against it: the offset never points past the last page.
+    ///
+    /// Every surface that drives the app - the event loop, the golden
+    /// frame tests - goes through here, so a resize can never leave
+    /// `top_line`, the position footer, and `n`/`N` reading a stale
+    /// offset while the screen shows the real last page.
+    pub fn set_viewport(&mut self, rows: usize, cols: usize) {
+        self.viewport_rows = rows.max(1);
+        self.viewport_cols = cols;
+        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        if let Mode::Pager(pager) = &mut self.mode {
+            pager.clamp(width, view, &glyphs);
+        }
+    }
+
+    /// Columns of text the reader has, mirrored from the terminal the
+    /// same way the ladder's width is: the frame it draws sits inside the
+    /// listing area, so scrolling and drawing agree on what a row is.
+    pub fn pager_cols(&self) -> usize {
+        self.viewport_cols.saturating_sub(pager::FRAME_COLS).max(1)
+    }
+
+    /// Rows of text the reader has.
+    pub fn pager_rows(&self) -> usize {
+        self.viewport_rows.saturating_sub(pager::FRAME_ROWS).max(1)
+    }
+
     fn handle_pager_key(&mut self, key: KeyInput) -> Effect {
-        let page = self.viewport_rows.max(1);
-        let Mode::Pager(pager) = &mut self.mode else {
-            return Effect::None;
-        };
-        let max_scroll = pager.lines.len().saturating_sub(1);
-        match key {
-            KeyInput::Char('j') | KeyInput::Down => {
-                pager.scroll = (pager.scroll + 1).min(max_scroll);
+        if matches!(&self.mode, Mode::Pager(p) if p.find.is_some()) {
+            return self.handle_find_key(key);
+        }
+        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        let page = view as isize;
+        let half = (view as isize / 2).max(1);
+        let mut close = false;
+        let mut missed: Option<(Level, String)> = None;
+        {
+            let Mode::Pager(pager) = &mut self.mode else {
+                return Effect::None;
+            };
+            match key {
+                KeyInput::Char('j') | KeyInput::Down => {
+                    pager.scroll_by(1, width, view, &glyphs);
+                }
+                KeyInput::Char('k') | KeyInput::Up => {
+                    pager.scroll_by(-1, width, view, &glyphs);
+                }
+                KeyInput::Char('d') => pager.scroll_by(half, width, view, &glyphs),
+                KeyInput::Char('u') => pager.scroll_by(-half, width, view, &glyphs),
+                KeyInput::Char('f') | KeyInput::PageDown => {
+                    pager.scroll_by(page, width, view, &glyphs)
+                }
+                KeyInput::Char('b') | KeyInput::PageUp => {
+                    pager.scroll_by(-page, width, view, &glyphs)
+                }
+                KeyInput::Char('g') | KeyInput::Home => pager.scroll = 0,
+                KeyInput::Char('G') | KeyInput::End => pager.scroll_to_end(width, view, &glyphs),
+                KeyInput::Char('/') => pager.find = Some(String::new()),
+                KeyInput::Char('n') | KeyInput::Char('N') => {
+                    let forward = key == KeyInput::Char('n');
+                    if pager.query.is_empty() {
+                        missed = Some((Level::Info, "no search yet - press / to find".to_string()));
+                    } else if !pager.step_match(forward, width, view, &glyphs) {
+                        missed = Some((Level::Error, format!("no match for '{}'", pager.query)));
+                    }
+                }
+                KeyInput::Char('q')
+                | KeyInput::Char('h')
+                | KeyInput::Left
+                | KeyInput::Esc
+                | KeyInput::Enter => close = true,
+                _ => {}
             }
-            KeyInput::Char('k') | KeyInput::Up => {
-                pager.scroll = pager.scroll.saturating_sub(1);
+        }
+        if close {
+            // The listing is untouched underneath, so closing lands on
+            // exactly the row the reader was opened from.
+            self.mode = Mode::Browse;
+        }
+        if let Some((level, text)) = missed {
+            self.push_msg(level, text);
+        }
+        Effect::None
+    }
+
+    /// The `/` prompt inside the reader. Esc leaves the search, not the
+    /// reader - backing out is always exactly one level.
+    fn handle_find_key(&mut self, key: KeyInput) -> Effect {
+        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        let mut missed: Option<String> = None;
+        {
+            let Mode::Pager(pager) = &mut self.mode else {
+                return Effect::None;
+            };
+            let Some(input) = pager.find.as_mut() else {
+                return Effect::None;
+            };
+            match key {
+                KeyInput::Char(c) => input.push(c),
+                KeyInput::Backspace => {
+                    input.pop();
+                }
+                KeyInput::Esc => pager.find = None,
+                KeyInput::Enter => {
+                    let query = std::mem::take(input);
+                    pager.find = None;
+                    pager.query = query;
+                    if pager.query.is_empty() {
+                        // An empty query clears the highlight, nothing else.
+                    } else if !pager.seek_match(width, view, &glyphs) {
+                        missed = Some(format!("no match for '{}'", pager.query));
+                    }
+                }
+                _ => {}
             }
-            KeyInput::PageDown => pager.scroll = (pager.scroll + page).min(max_scroll),
-            KeyInput::PageUp => pager.scroll = pager.scroll.saturating_sub(page),
-            KeyInput::Char('g') | KeyInput::Home => pager.scroll = 0,
-            KeyInput::Char('G') | KeyInput::End => pager.scroll = max_scroll,
-            KeyInput::Char('q') | KeyInput::Esc | KeyInput::Enter => {
-                self.mode = Mode::Browse;
-            }
-            _ => {}
+        }
+        if let Some(text) = missed {
+            return self.err(text);
         }
         Effect::None
     }
@@ -412,6 +507,65 @@ impl App {
             }
             _ => self.err(format!("cannot open special file '{}'", entry.name)),
         }
+    }
+
+    /// `l` / Right: descend into a directory, or open a text file in the
+    /// read-only reader. Both halves are read-only - this key never
+    /// launches an editor and never touches the file.
+    fn open_selected(&mut self) -> Effect {
+        let Some(entry) = self.nav.selected().cloned() else {
+            return self.err("nothing selected".to_string());
+        };
+        if entry.is_parent {
+            return self.go_up();
+        }
+        if entry.is_enterable() {
+            return self.enter_selected_dir();
+        }
+        if entry.is_file_like() {
+            return self.open_pager_for_file();
+        }
+        match entry.kind {
+            crate::nav::EntryKind::SymlinkBroken => {
+                self.err(format!("broken symlink: '{}' points nowhere", entry.name))
+            }
+            _ => self.err(format!("cannot read special file '{}'", entry.name)),
+        }
+    }
+
+    /// Open the selected regular file in the reader. Markdown gets its
+    /// structure drawn; anything else readable is shown as it is; a
+    /// binary is refused in words rather than painted on the screen.
+    fn open_pager_for_file(&mut self) -> Effect {
+        let (name, path) = match self.selected_operand() {
+            Ok(v) => v,
+            Err(e) => return self.err(format!("read: {e}")),
+        };
+        let source = match preview::read_view(&path) {
+            Ok(source) => source,
+            Err(e) => return self.err(format!("read: {e}")),
+        };
+        let ViewSource::Text { text, truncated } = source else {
+            return self.err(format!(
+                "cannot read '{name}' as text - it is binary; try ':' then open"
+            ));
+        };
+        let mut doc = if text.is_empty() {
+            vec![DocLine::meta("(empty file)")]
+        } else if markdown::is_markdown(&path) {
+            markdown::parse_markdown(&text)
+        } else {
+            markdown::parse_plain(&text)
+        };
+        if truncated {
+            doc.push(DocLine::meta(format!(
+                "(truncated at {} lines / {} KiB)",
+                preview::MAX_VIEW_LINES,
+                preview::MAX_VIEW_BYTES / 1024
+            )));
+        }
+        self.mode = Mode::Pager(Pager::document(name, doc));
+        Effect::None
     }
 
     fn enter_selected_dir(&mut self) -> Effect {
@@ -514,11 +668,10 @@ impl App {
                 .map(|message| format!("{} {}", message.level.prefix(&self.glyphs), message.text))
                 .collect()
         };
-        self.mode = Mode::Pager(Pager {
-            title: format!("messages ({} of {MAX_MESSAGES})", self.messages.len()),
+        self.mode = Mode::Pager(Pager::plain(
+            format!("messages ({} of {MAX_MESSAGES})", self.messages.len()),
             lines,
-            scroll: 0,
-        });
+        ));
         Effect::None
     }
 
@@ -744,11 +897,7 @@ impl App {
         }
         match preview::build_preview(&path) {
             Ok(PreviewData { title, lines }) => {
-                self.mode = Mode::Pager(Pager {
-                    title: format!("preview: {title}"),
-                    lines,
-                    scroll: 0,
-                });
+                self.mode = Mode::Pager(Pager::plain(format!("preview: {title}"), lines));
                 Effect::None
             }
             Err(e) => self.err(format!("preview: {e}")),
@@ -769,20 +918,12 @@ impl App {
         debug_assert!(!seam.is_enabled(), "v0 must never ship an enabled agent");
         let reply = seam.handle(&request);
         self.push_msg(Level::Info, "agent: not configured in v0".to_string());
-        self.mode = Mode::Pager(Pager {
-            title: "agent (not configured)".to_string(),
-            lines: reply.lines,
-            scroll: 0,
-        });
+        self.mode = Mode::Pager(Pager::plain("agent (not configured)", reply.lines));
         Effect::None
     }
 
     fn show_help(&mut self) -> Effect {
-        self.mode = Mode::Pager(Pager {
-            title: "help".to_string(),
-            lines: help_lines(),
-            scroll: 0,
-        });
+        self.mode = Mode::Pager(Pager::plain("help", help_lines()));
         Effect::None
     }
 }
@@ -797,7 +938,7 @@ pub fn help_lines() -> Vec<String> {
         "  PgUp / PgDn          move focus a page",
         "  g / G                first / last entry",
         "  Enter                enter directory, or edit selected file",
-        "  l, Right             enter selected directory",
+        "  l, Right             enter directory, or read the selected file",
         "  h, Left, Backspace   go to parent directory",
         "  0-9                  jump to that ancestor on the ladder",
         "  /                    filter the listing (Esc clears)",
@@ -808,6 +949,15 @@ pub fn help_lines() -> Vec<String> {
         "  ?                    this help",
         "  Esc                  back out one level (clears a filter)",
         "  q, Ctrl-C            quit",
+        "",
+        "KEYS (reader - l on a text or Markdown file)",
+        "  j / k, Down / Up     scroll one line",
+        "  d / u                scroll half a page",
+        "  f / b, PgDn / PgUp   scroll a page",
+        "  g / G, Home / End    top / bottom",
+        "  /                    find in this file (Enter searches)",
+        "  n / N                next / previous match",
+        "  h, q, Esc            back to the listing, on the same row",
         "",
         "COMMANDS (at the : prompt)",
         "  cd [path]            change directory (~ ok; quote spaces)",
@@ -821,6 +971,7 @@ pub fn help_lines() -> Vec<String> {
         "  quit                 leave filecraft",
         "",
         "SAFETY",
+        "  - the reader is read-only: no key in it can change a file",
         "  - moves and renames never overwrite and always ask first",
         "  - there is no delete command in v0",
         "  - commands are parsed directly; nothing touches a shell",
@@ -833,7 +984,7 @@ pub fn help_lines() -> Vec<String> {
         "  - the rail column shows where the viewport sits in the listing",
         "  - the status row says the same thing in words, for speech",
         "",
-        "press q or Esc to close this help",
+        "press h, q, or Esc to close this help",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1160,14 +1311,390 @@ mod tests {
             assert_eq!(app.handle_key(key), Effect::None);
             assert!(app.nav.cwd.ends_with("sub"), "{key:?} should descend");
 
-            // On a file it is a plain refusal, never an edit or a move.
+            // On a file it opens the read-only reader: same key, same
+            // direction, never an editor and never a change on disk.
             let mut app = app_in(&tmp);
             select(&mut app, "note.txt");
             assert_eq!(app.handle_key(key), Effect::None);
             assert_eq!(app.nav.cwd, tmp.path().canonicalize().unwrap());
-            assert_eq!(last_msg(&app).level, Level::Error);
+            let Mode::Pager(pager) = &app.mode else {
+                panic!("{key:?} should open the reader");
+            };
+            assert_eq!(pager.title, "note.txt");
+            assert_eq!(pager.text(), "n");
             assert!(tmp.path().join("note.txt").exists());
         }
+    }
+
+    /// The reader as the event loop drives it: the app is told the same
+    /// geometry the screen has, so scrolling and drawing agree.
+    fn reader(app: &App) -> &Pager {
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the reader, got {:?}", app.mode);
+        };
+        pager
+    }
+
+    #[test]
+    fn l_reads_a_markdown_file_with_its_structure_drawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("notes.md"),
+            "# Title\n\n- one\n\n> quoted\n\n```sh\ncargo test\n```\n",
+        )
+        .unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "notes.md");
+        assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+
+        let pager = reader(&app);
+        assert_eq!(pager.title, "notes.md");
+        let kinds: Vec<markdown::Kind> = pager.doc().iter().map(|l| l.kind).collect();
+        assert!(kinds.contains(&markdown::Kind::Heading(1)));
+        assert!(kinds.contains(&markdown::Kind::Bullet));
+        assert!(kinds.contains(&markdown::Kind::Quote));
+        assert!(kinds.contains(&markdown::Kind::Code));
+        // The code block is shown as it is, never re-read as Markdown.
+        assert!(pager.text().contains("cargo test"));
+    }
+
+    #[test]
+    fn l_reads_a_plain_text_file_without_inventing_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("plain.txt"),
+            "# not a heading\n- not a bullet\n",
+        )
+        .unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "plain.txt");
+        app.handle_key(KeyInput::Char('l'));
+        let pager = reader(&app);
+        assert!(pager.doc().iter().all(|l| l.kind == markdown::Kind::Body));
+        assert_eq!(pager.text(), "# not a heading\n- not a bullet");
+    }
+
+    #[test]
+    fn l_refuses_a_binary_file_in_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "blob.bin");
+        assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("binary"));
+    }
+
+    #[test]
+    fn l_reads_an_empty_file_without_an_empty_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("empty.md"), "").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "empty.md");
+        app.handle_key(KeyInput::Char('l'));
+        assert_eq!(reader(&app).text(), "(empty file)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn l_on_a_broken_symlink_says_so_instead_of_opening_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target", tmp.path().join("dangling")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "dangling");
+        assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(last_msg(&app).text.contains("broken symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn l_on_a_special_file_says_so_instead_of_opening_nothing() {
+        let mut app = App::new(
+            NavState::new(std::path::Path::new("/dev")).unwrap(),
+            None,
+            false,
+            None,
+        );
+        let Some(pos) = app
+            .nav
+            .visible()
+            .iter()
+            .position(|&i| app.nav.entries[i].kind == crate::nav::EntryKind::Other)
+        else {
+            return; // no special file to point at; nothing to assert
+        };
+        app.nav.cursor = pos;
+        assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(last_msg(&app).text.contains("special file"));
+    }
+
+    #[test]
+    fn reader_scrolling_is_bounded_at_both_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        fs::write(tmp.path().join("long.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        app.viewport_rows = 12; // 10 rows of text inside the reader frame
+        app.viewport_cols = 40;
+        select(&mut app, "long.txt");
+        app.handle_key(KeyInput::Char('l'));
+
+        for _ in 0..500 {
+            app.handle_key(KeyInput::Char('j'));
+        }
+        let last_page = Pager::max_scroll(100, app.pager_rows());
+        assert_eq!(reader(&app).scroll, last_page);
+
+        for _ in 0..500 {
+            app.handle_key(KeyInput::Char('k'));
+        }
+        assert_eq!(reader(&app).scroll, 0);
+
+        // Half and full pages, and the two ends.
+        app.handle_key(KeyInput::Char('d'));
+        assert_eq!(reader(&app).scroll, app.pager_rows() / 2);
+        app.handle_key(KeyInput::Char('u'));
+        assert_eq!(reader(&app).scroll, 0);
+        app.handle_key(KeyInput::PageDown);
+        assert_eq!(reader(&app).scroll, app.pager_rows());
+        app.handle_key(KeyInput::PageUp);
+        assert_eq!(reader(&app).scroll, 0);
+        app.handle_key(KeyInput::Char('G'));
+        assert_eq!(reader(&app).scroll, last_page);
+        app.handle_key(KeyInput::Char('g'));
+        assert_eq!(reader(&app).scroll, 0);
+    }
+
+    #[test]
+    fn widening_the_terminal_reclamps_the_reader_and_keeps_the_position_honest() {
+        // Lines that wrap at 40 columns fit on one row at 200, so the
+        // bottom of the document moves up under the offset.
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=100)
+            .map(|i| format!("line {i} with enough words to wrap more than once here\n"))
+            .collect();
+        fs::write(tmp.path().join("wrap.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        app.set_viewport(12, 40);
+        select(&mut app, "wrap.txt");
+        app.handle_key(KeyInput::Char('l'));
+        app.handle_key(KeyInput::Char('G'));
+        let narrow_scroll = reader(&app).scroll;
+        assert!(narrow_scroll > 100);
+
+        app.set_viewport(12, 200);
+        let (width, view, glyphs) = (app.pager_cols(), app.pager_rows(), app.glyphs);
+        let pager = reader(&app);
+        assert_eq!(pager.scroll, Pager::max_scroll(100, view));
+        // The footer reports the last page, not line 1 of the file.
+        assert_eq!(pager.top_line(width, &glyphs), 100 - view);
+        assert!(pager.position(width, view, &glyphs).ends_with("100%"));
+
+        // A search resumes from the visible position: "line 9" also
+        // matches source line 9, and a stale offset would have landed
+        // there instead of on the first match below the top of the view.
+        app.handle_key(KeyInput::Char('/'));
+        for c in "line 9".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(reader(&app).top_line(width, &glyphs), 100 - view);
+    }
+
+    #[test]
+    fn the_help_documents_every_reader_key_that_is_bound() {
+        let help = help_lines().join("\n");
+        for key in ["j / k", "d / u", "f / b", "PgDn / PgUp", "g / G", "n / N"] {
+            assert!(help.contains(key), "help never mentions {key}");
+        }
+    }
+
+    #[test]
+    fn every_reader_exit_key_returns_to_the_same_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        for key in [
+            KeyInput::Char('h'),
+            KeyInput::Char('q'),
+            KeyInput::Esc,
+            KeyInput::Left,
+            KeyInput::Enter,
+        ] {
+            let mut app = app_in(&tmp);
+            select(&mut app, "b.txt");
+            let row = app.nav.cursor;
+            let cwd = app.nav.cwd.clone();
+            app.handle_key(KeyInput::Char('l'));
+            assert!(matches!(app.mode, Mode::Pager(_)), "{key:?}");
+            assert_eq!(app.handle_key(key), Effect::None);
+            assert_eq!(app.mode, Mode::Browse, "{key:?} should close the reader");
+            assert_eq!(app.nav.cursor, row, "{key:?} moved the cursor");
+            assert_eq!(app.nav.cwd, cwd, "{key:?} moved the directory");
+        }
+    }
+
+    #[test]
+    fn reader_search_finds_types_and_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+        fs::write(tmp.path().join("long.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        app.viewport_rows = 12;
+        app.viewport_cols = 40;
+        select(&mut app, "long.txt");
+        app.handle_key(KeyInput::Char('l'));
+
+        app.handle_key(KeyInput::Char('/'));
+        assert_eq!(reader(&app).find.as_deref(), Some(""));
+        for c in "LINE 42".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        assert_eq!(reader(&app).find.as_deref(), Some("LINE 42"));
+        app.handle_key(KeyInput::Enter);
+
+        let width = app.pager_cols();
+        let glyphs = app.glyphs;
+        let pager = reader(&app);
+        assert!(pager.find.is_none());
+        assert_eq!(pager.query, "LINE 42");
+        // Case-insensitive: line 42 is source line 41.
+        assert_eq!(pager.top_line(width, &glyphs), 41);
+
+        // `n` wraps around to the only other match on that stem.
+        app.handle_key(KeyInput::Char('n'));
+        assert_eq!(reader(&app).top_line(width, &glyphs), 41);
+
+        // A query nobody can match says so and leaves the view alone.
+        app.handle_key(KeyInput::Char('/'));
+        for c in "zebra".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("no match for 'zebra'"));
+        assert_eq!(reader(&app).top_line(width, &glyphs), 41);
+    }
+
+    #[test]
+    fn esc_in_the_find_prompt_leaves_the_search_not_the_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "a.txt");
+        app.handle_key(KeyInput::Char('l'));
+        app.handle_key(KeyInput::Char('/'));
+        app.handle_key(KeyInput::Char('b'));
+        app.handle_key(KeyInput::Backspace);
+        assert_eq!(reader(&app).find.as_deref(), Some(""));
+        app.handle_key(KeyInput::Esc);
+        let pager = reader(&app);
+        assert!(pager.find.is_none(), "Esc should close the find prompt");
+        assert!(pager.query.is_empty());
+        assert!(
+            matches!(app.mode, Mode::Pager(_)),
+            "Esc should not close the reader"
+        );
+    }
+
+    #[test]
+    fn a_file_bigger_than_the_caps_is_truncated_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (0..preview::MAX_VIEW_LINES + 10)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        fs::write(tmp.path().join("huge.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "huge.txt");
+        app.handle_key(KeyInput::Char('l'));
+        let pager = reader(&app);
+        assert_eq!(pager.doc().len(), preview::MAX_VIEW_LINES + 1);
+        assert!(pager.text().contains("truncated"));
+    }
+
+    #[test]
+    fn enter_still_hands_a_file_to_the_editor_not_the_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "a.txt");
+        assert!(matches!(
+            app.handle_key(KeyInput::Enter),
+            Effect::RunInteractive { .. }
+        ));
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn no_reader_key_ever_mutates_the_filesystem() {
+        // The reader is the one place a file's contents are on screen.
+        // Same grammar rule as browse mode, enforced the same way.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "# Title\n\n- one\n> quoted\n").unwrap();
+        let before = snapshot(tmp.path());
+        let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
+        keys.extend([
+            KeyInput::Backspace,
+            KeyInput::Up,
+            KeyInput::Down,
+            KeyInput::Left,
+            KeyInput::Right,
+            KeyInput::PageUp,
+            KeyInput::PageDown,
+            KeyInput::Home,
+            KeyInput::End,
+        ]);
+        for key in keys {
+            let mut app = app_in(&tmp);
+            select(&mut app, "notes.md");
+            app.handle_key(KeyInput::Char('l'));
+            assert!(matches!(app.mode, Mode::Pager(_)));
+            let effect = app.handle_key(key);
+            assert_eq!(effect, Effect::None, "{key:?} produced an effect");
+            assert!(app.pending.is_none(), "{key:?} armed an operation");
+            assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
+        }
+    }
+
+    #[test]
+    fn n_without_a_search_says_what_to_press() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "a.txt");
+        app.handle_key(KeyInput::Char('l'));
+        app.handle_key(KeyInput::Char('n'));
+        assert_eq!(last_msg(&app).level, Level::Info);
+        assert!(last_msg(&app).text.contains("press / to find"));
+        assert!(matches!(app.mode, Mode::Pager(_)));
+    }
+
+    #[test]
+    fn shift_n_steps_backwards_through_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=60).map(|i| format!("mark {i}\n")).collect();
+        fs::write(tmp.path().join("m.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        app.viewport_rows = 12;
+        app.viewport_cols = 40;
+        select(&mut app, "m.txt");
+        app.handle_key(KeyInput::Char('l'));
+        app.handle_key(KeyInput::Char('/'));
+        for c in "mark 3".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        app.handle_key(KeyInput::Enter);
+        let (width, glyphs) = (app.pager_cols(), app.glyphs);
+        // mark 3, then mark 30..39.
+        assert_eq!(reader(&app).top_line(width, &glyphs), 2);
+        app.handle_key(KeyInput::Char('n'));
+        assert_eq!(reader(&app).top_line(width, &glyphs), 29);
+        app.handle_key(KeyInput::Char('N'));
+        assert_eq!(reader(&app).top_line(width, &glyphs), 2);
     }
 
     #[test]
@@ -1270,8 +1797,8 @@ mod tests {
         assert!(pager.title.starts_with("messages ("));
         // The ring holds a hundred lines and all of them are now readable,
         // not just the three the strip shows.
-        assert_eq!(pager.lines.len(), MAX_MESSAGES);
-        assert!(pager.lines.last().unwrap().contains("event 99"));
+        assert_eq!(pager.lines().len(), MAX_MESSAGES);
+        assert!(pager.lines().last().unwrap().contains("event 99"));
         app.handle_key(KeyInput::Char('q'));
         assert_eq!(app.mode, Mode::Browse);
     }
@@ -1302,11 +1829,11 @@ mod tests {
             panic!("expected the message pager");
         };
         let columns: Vec<usize> = pager
-            .lines
+            .lines()
             .iter()
             .map(|line| bearings::display_width(&line[..line.find("aligned").unwrap()]))
             .collect();
-        assert_eq!(columns, vec![6, 6, 6], "{:?}", pager.lines);
+        assert_eq!(columns, vec![6, 6, 6], "{:?}", pager.lines());
     }
 
     #[test]
@@ -1318,7 +1845,7 @@ mod tests {
         let Mode::Pager(pager) = &app.mode else {
             panic!("expected the message pager");
         };
-        assert_eq!(pager.lines, vec!["(no messages yet)".to_string()]);
+        assert_eq!(pager.lines(), vec!["(no messages yet)".to_string()]);
     }
 
     #[test]
@@ -1374,7 +1901,7 @@ mod tests {
         let Mode::Pager(pager) = &app.mode else {
             panic!("expected built-in pager");
         };
-        assert!(pager.lines.join("\n").contains("content here"));
+        assert!(pager.lines().join("\n").contains("content here"));
     }
 
     #[test]
@@ -1402,7 +1929,7 @@ mod tests {
         let Mode::Pager(pager) = &app.mode else {
             panic!("expected built-in pager for binary file");
         };
-        assert!(pager.lines.join("\n").contains("binary file"));
+        assert!(pager.lines().join("\n").contains("binary file"));
     }
 
     #[test]
@@ -1531,7 +2058,7 @@ mod tests {
         app.handle_key(KeyInput::Char('?'));
         let Mode::Pager(p) = &app.mode else { panic!() };
         assert_eq!(p.title, "help");
-        assert!(p.lines.iter().any(|l| l.contains("move <destination>")));
+        assert!(p.lines().iter().any(|l| l.contains("move <destination>")));
 
         app.handle_key(KeyInput::Char('j'));
         app.handle_key(KeyInput::PageDown);
@@ -1554,7 +2081,7 @@ mod tests {
             panic!("expected explanation pager");
         };
         assert!(pager.title.contains("not configured"));
-        assert!(pager.lines.join("\n").contains("not sent anywhere"));
+        assert!(pager.lines().join("\n").contains("not sent anywhere"));
         // Nothing changed on disk.
         assert_eq!(
             fs::read_to_string(tmp.path().join("secret.txt")).unwrap(),

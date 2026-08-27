@@ -45,6 +45,12 @@ pub struct Glyphs {
     pub caret: &'static str,
     /// Truncation mark appended by [`pad_to_width_with`].
     pub ellipsis: &'static str,
+    /// List bullet in the reader.
+    pub bullet: &'static str,
+    /// Blockquote bar in the reader.
+    pub quote_bar: &'static str,
+    /// Horizontal rule and code-fence line in the reader.
+    pub rule: &'static str,
 }
 
 impl Glyphs {
@@ -57,6 +63,9 @@ impl Glyphs {
         rail_track: "│",
         caret: "█",
         ellipsis: "…",
+        bullet: "•",
+        quote_bar: "│",
+        rule: "─",
     };
 
     pub const ASCII: Glyphs = Glyphs {
@@ -68,6 +77,9 @@ impl Glyphs {
         rail_track: "|",
         caret: "_",
         ellipsis: "~",
+        bullet: "*",
+        quote_bar: "|",
+        rule: "-",
     };
 
     pub fn for_ascii(ascii: bool) -> Glyphs {
@@ -79,10 +91,17 @@ impl Glyphs {
     }
 }
 
+/// Display columns one character occupies. Wide (CJK) characters count
+/// as two. This is the per-cell primitive every width budget is built
+/// from, so measuring a character never allocates a `String` for it.
+pub fn char_width(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
+
 /// Display columns `text` occupies. Wide (CJK) characters count as two,
 /// so every column budget in this module is in real cells.
 pub fn display_width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+    text.chars().map(char_width).sum()
 }
 
 /// Replace control characters with `U+FFFD` so filesystem-derived names,
@@ -123,7 +142,7 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        let w = char_width(c);
         if used + w > width - mark_width {
             break;
         }

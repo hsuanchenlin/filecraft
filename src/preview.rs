@@ -14,12 +14,57 @@ pub const SNIFF_BYTES: usize = 8192;
 pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
 /// Line cap for the built-in preview.
 pub const MAX_PREVIEW_LINES: usize = 500;
+/// Content cap for the full-screen reader, which shows whole files
+/// rather than a head.
+pub const MAX_VIEW_BYTES: u64 = 1024 * 1024;
+/// Line cap for the full-screen reader.
+pub const MAX_VIEW_LINES: usize = 20_000;
 
 /// A rendered preview: a title and plain text lines for the pager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewData {
     pub title: String,
     pub lines: Vec<String>,
+}
+
+/// What the full-screen reader found in a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewSource {
+    /// Not text: the reader refuses rather than painting control bytes.
+    Binary,
+    /// Readable text, already capped. `truncated` marks a file that had
+    /// more to give than the caps allow.
+    Text { text: String, truncated: bool },
+}
+
+/// Read a file for the full-screen reader: whole-file text up to
+/// [`MAX_VIEW_BYTES`] and [`MAX_VIEW_LINES`], or [`ViewSource::Binary`].
+/// Read-only, like everything else here.
+pub fn read_view(path: &Path) -> Result<ViewSource, FsError> {
+    let file = std::fs::File::open(path).map_err(|e| fsops::io_error(path, &e))?;
+    let mut buf = Vec::new();
+    file.take(MAX_VIEW_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| fsops::io_error(path, &e))?;
+    let mut truncated = buf.len() as u64 > MAX_VIEW_BYTES;
+    if truncated {
+        buf.truncate(MAX_VIEW_BYTES as usize);
+    }
+    let head = &buf[..buf.len().min(SNIFF_BYTES)];
+    if !buf.is_empty() && !is_probably_text(head) {
+        return Ok(ViewSource::Binary);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let text = if text.lines().count() > MAX_VIEW_LINES {
+        truncated = true;
+        text.lines()
+            .take(MAX_VIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text.into_owned()
+    };
+    Ok(ViewSource::Text { text, truncated })
 }
 
 /// Heuristic text detection: text contains no NUL bytes in the sample.

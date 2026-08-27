@@ -100,8 +100,10 @@ fn event_loop(
 ) -> io::Result<()> {
     loop {
         let size = terminal.size()?;
-        app.viewport_rows = size.height.saturating_sub(ui::CHROME_ROWS).max(1) as usize;
-        app.viewport_cols = size.width.saturating_sub(ui::BORDER_COLS) as usize;
+        app.set_viewport(
+            size.height.saturating_sub(ui::CHROME_ROWS) as usize,
+            size.width.saturating_sub(ui::BORDER_COLS) as usize,
+        );
         terminal.draw(|frame| ui::draw(frame, app, theme))?;
 
         match event::read()? {
