@@ -958,7 +958,7 @@ mod tests {
         // Every width produces a complete-word prefix, never a half word.
         for width in 0..60 {
             let line = fit_joined(&parts, " · ", width, "…");
-            assert!(display_width(&line) <= width.max(0));
+            assert!(display_width(&line) <= width);
             if !line.is_empty() && width >= 8 {
                 assert!(
                     parts.iter().any(|p| line.ends_with(p.as_str())),
