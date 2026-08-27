@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# PR checks come from this workflow on the PR head. Rust jobs run only when
+# Cargo.toml is present, so a README-only ref still reports a real check.
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust workspace
+        id: rust
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.rust.outputs.present == 'true'
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        if: steps.rust.outputs.present == 'true'
+        run: cargo fmt --check
+      - name: Clippy
+        if: steps.rust.outputs.present == 'true'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        if: steps.rust.outputs.present == 'true'
+        run: cargo test --locked --all-targets
+      - name: Skip Rust jobs
+        if: steps.rust.outputs.present != 'true'
+        run: echo "No Cargo.toml on this ref; CI check reported without Rust jobs."
