@@ -10,8 +10,9 @@
 pub enum Command {
     /// `cd [path]` - change directory. No argument means the home directory.
     Cd { path: Option<String> },
-    /// `move <destination>` - move the selected entry (asks for confirmation).
-    Move { destination: String },
+    /// `move [destination]` - move the selected entry. No destination
+    /// opens the folder picker; a path goes straight to confirmation.
+    Move { destination: Option<String> },
     /// `rename <name>` - rename the selected entry (asks for confirmation).
     Rename { name: String },
     /// `open` - open the selected entry with macOS `open`.
@@ -142,10 +143,11 @@ pub fn tokenize(line: &str) -> Result<Vec<String>, ParseError> {
 
 /// Parse one BBS command line.
 ///
-/// Commands taking a path/name argument are strict: exactly one argument,
+/// Commands taking a path/name argument are strict: at most one argument,
 /// quoted if it contains spaces. This avoids silently misreading
 /// `move a b` (Filecraft's `move` acts on the *selected* entry, so a second
-/// word is almost certainly a mistake).
+/// word is almost certainly a mistake). `move` with no argument opens the
+/// folder picker instead of requiring a typed path.
 pub fn parse(line: &str) -> Result<Command, ParseError> {
     let words = tokenize(line)?;
     let Some((head, args)) = words.split_first() else {
@@ -165,12 +167,13 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             }),
         },
         "move" | "mv" => match args {
+            [] => Ok(Command::Move { destination: None }),
             [destination] => Ok(Command::Move {
-                destination: destination.clone(),
+                destination: Some(destination.clone()),
             }),
             _ => Err(ParseError::Usage {
                 command: "move",
-                usage: "<destination>   (moves the selected entry; quote spaces)",
+                usage: "[destination]   (no path opens the folder picker; quote spaces)",
             }),
         },
         "rename" => match args {
@@ -313,14 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_move_requires_exactly_one_destination() {
+    fn parse_move_destination_is_optional() {
         assert_eq!(
             parse("move ../archive").unwrap(),
             Command::Move {
-                destination: "../archive".into()
+                destination: Some("../archive".into())
             }
         );
-        assert!(matches!(parse("move"), Err(ParseError::Usage { .. })));
+        assert_eq!(parse("move").unwrap(), Command::Move { destination: None });
         assert!(matches!(parse("move a b"), Err(ParseError::Usage { .. })));
     }
 
@@ -329,9 +332,10 @@ mod tests {
         assert_eq!(
             parse("mv dest").unwrap(),
             Command::Move {
-                destination: "dest".into()
+                destination: Some("dest".into())
             }
         );
+        assert_eq!(parse("mv").unwrap(), Command::Move { destination: None });
     }
 
     #[test]

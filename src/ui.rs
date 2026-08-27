@@ -36,6 +36,7 @@ use crate::fsops::FsError;
 use crate::markdown::{self, Ink, Kind, Row};
 use crate::nav::{EntryKind, NavState};
 use crate::pager::Pager;
+use crate::picker::FolderPicker;
 use crate::preview::{format_size, format_timestamp};
 
 /// Rows used by everything except the file list (borders, path, status,
@@ -305,6 +306,7 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
     let bearings = Bearings::from_nav(&app.nav, offset, rows);
     match &app.mode {
         Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager),
+        Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker),
         _ => draw_listing(
             frame, app, theme, list_area, &visible, offset, &bearings, now,
         ),
@@ -472,6 +474,78 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The folder picker popup. Same listing-area frame as the reader, so
+/// the listing underneath is unchanged and cancelling lands on the same
+/// row. The dest header is the dual of the focused folder: color never
+/// carries the target by itself.
+fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &FolderPicker) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let block = frame_only
+        .border_style(theme.banner())
+        .title(Span::styled(" folder picker ", theme.prompt()))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(
+                    " j/k {dot} l in {dot} h up {dot} Enter/m select {dot} q cancel ",
+                    dot = glyphs.dot
+                ),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let [dest_row, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let dest = pad_to_width_with(
+        &sanitize(&picker.dest_line()),
+        dest_row.width as usize,
+        glyphs.ellipsis,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(dest, theme.prompt()))),
+        dest_row,
+    );
+
+    let rows = list_area.height as usize;
+    if rows == 0 {
+        return;
+    }
+    let name_width = (list_area.width as usize).saturating_sub(2);
+    let offset = bearings::viewport_offset(picker.cursor, picker.entries.len(), rows, 1);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = offset + row;
+        let Some(entry) = picker.entries.get(index) else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let selected = index == picker.cursor;
+        let marker = if selected { "> " } else { "  " };
+        let name = pad_to_width_with(
+            &sanitize(&entry.display_name()),
+            name_width,
+            glyphs.ellipsis,
+        );
+        let style = if selected {
+            theme.selected()
+        } else {
+            theme.dir()
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}{name}"), style)));
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
+}
+
 /// One drawn row of the reader, with the active search query picked out.
 fn reader_line(row: &Row, theme: &Theme, query: &str) -> Line<'static> {
     let spans = markdown::highlight(&row.spans, query);
@@ -598,6 +672,14 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
                 )),
             ]),
         },
+        Mode::FolderPicker(picker) => Line::from(vec![
+            Span::styled(" pick ", theme.prompt()),
+            Span::raw(sanitize(&format!(
+                "moving '{}' -> '{}'",
+                picker.source_name,
+                picker.destination().display()
+            ))),
+        ]),
         Mode::Browse => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
             Span::raw("press : to type a command"),
@@ -631,6 +713,13 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         ],
         Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
         Mode::ConfirmOp => &["y confirm", "n cancel", "nothing happens without y"],
+        Mode::FolderPicker(_) => &[
+            "j/k focus",
+            "l in",
+            "h up",
+            "Enter/m select",
+            "q/Esc cancel",
+        ],
         Mode::Pager(pager) if pager.find.is_some() => {
             &["type to find", "Enter search", "Esc keep reading"]
         }
@@ -1123,12 +1212,127 @@ mod tests {
         assert!(screen.contains("jump to that ancestor"));
         // The commands sit below the first pager page; scrolling brings
         // them into view without skipping anything.
-        for _ in 0..16 {
+        let mut found = false;
+        for _ in 0..80 {
+            let screen = render(&app);
+            if screen.contains("COMMANDS") && screen.contains("move [destination]") {
+                found = true;
+                break;
+            }
             app.handle_key(KeyInput::Char('j'));
         }
-        let screen = render(&app);
-        assert!(screen.contains("COMMANDS"));
-        assert!(screen.contains("move <destination>"));
+        assert!(
+            found,
+            "COMMANDS never appeared while scrolling the help pager"
+        );
+    }
+
+    #[test]
+    fn folder_picker_popup_names_the_destination() {
+        let (_tmp, mut app) = fixture_app();
+        let visible = app.nav.visible();
+        let pos = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "readme.md")
+            .unwrap();
+        app.nav.cursor = pos;
+        app.execute_line("move");
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("folder picker"), "{screen}");
+        assert!(screen.contains("dest:"), "{screen}");
+        assert!(screen.contains("./"), "{screen}");
+        assert!(screen.contains("../"), "{screen}");
+        assert!(screen.contains("projects/"), "{screen}");
+        assert!(screen.contains("pick"), "{screen}");
+        assert!(screen.contains("moving 'readme.md'"), "{screen}");
+        assert!(!screen.contains("readme.md/"), "{screen}");
+    }
+
+    #[test]
+    fn folder_picker_ascii_theme_stays_inside_printable_ascii_box() {
+        let (_tmp, mut app) = fixture_app();
+        let visible = app.nav.visible();
+        app.nav.cursor = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "readme.md")
+            .unwrap();
+        app.execute_line("move");
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("folder picker"), "{screen}");
+        assert!(screen.contains("dest:"), "{screen}");
+        assert!(screen.contains("+"), "{screen}");
+        assert!(screen.contains("|"), "{screen}");
+        assert!(!screen.contains('╔'), "{screen}");
+        assert!(!screen.contains('─'), "{screen}");
+        for (index, line) in screen.lines().enumerate() {
+            assert_eq!(display_width(line), 80, "row {index}: {line:?}");
+            let last = line.chars().last().unwrap();
+            assert!(
+                ['|', '+'].contains(&last),
+                "row {index} lost its ascii border: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_picker_select_handoff_draws_the_confirm_prompt() {
+        let (_tmp, mut app) = fixture_app();
+        let visible = app.nav.visible();
+        app.nav.cursor = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "readme.md")
+            .unwrap();
+        app.execute_line("move");
+        let crate::app::Mode::FolderPicker(picker) = &mut app.mode else {
+            panic!("expected folder picker");
+        };
+        picker.cursor = picker
+            .entries
+            .iter()
+            .position(|e| e.name == "projects")
+            .expect("projects/ in picker");
+        app.handle_key(KeyInput::Enter);
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("confirm"), "{screen}");
+        assert!(screen.contains("[y]es / [n]o"), "{screen}");
+        assert!(screen.contains("readme.md"), "{screen}");
+        assert!(screen.contains("projects"), "{screen}");
+    }
+
+    #[test]
+    fn folder_picker_hint_row_never_breaks_a_word() {
+        let (_tmp, mut app) = fixture_app();
+        let visible = app.nav.visible();
+        app.nav.cursor = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "readme.md")
+            .unwrap();
+        app.execute_line("move");
+        let words = [
+            "j/k focus",
+            "l in",
+            "h up",
+            "Enter/m select",
+            "q/Esc cancel",
+        ];
+        for (width, height) in SIZES {
+            let theme = Theme::from_no_color_env(None);
+            let screen = render_themed(&mut app, width, height, &theme);
+            let hints = row(&screen, height as usize - 2);
+            let hints = hints.trim_matches(['║', ' ', '|', '+']);
+            assert!(!hints.is_empty(), "{width}x{height} lost the hint row");
+            assert!(
+                words.iter().any(|w| hints.ends_with(w)),
+                "{width}x{height} hint row ended mid-word: {hints:?}"
+            );
+            assert!(
+                hints.starts_with("j/k focus"),
+                "{width}x{height}: {hints:?}"
+            );
+        }
     }
 
     /// The reader over a fixture file, driven exactly as `main` does.

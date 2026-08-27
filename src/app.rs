@@ -16,6 +16,7 @@ use crate::fsops::{self, FsError};
 use crate::markdown::{self, DocLine};
 use crate::nav::NavState;
 use crate::pager::{self, Pager};
+use crate::picker::{self, FolderPicker};
 use crate::preview::{self, PreviewData, ViewSource};
 
 /// Abstract key input, decoupled from any terminal backend.
@@ -63,6 +64,7 @@ pub enum Mode {
     Command { input: String },
     Filter { input: String },
     ConfirmOp,
+    FolderPicker(FolderPicker),
     Pager(Pager),
 }
 
@@ -194,6 +196,7 @@ impl App {
             Mode::Command { .. } => self.handle_command_key(key),
             Mode::Filter { .. } => self.handle_filter_key(key),
             Mode::ConfirmOp => self.handle_confirm_key(key),
+            Mode::FolderPicker(_) => self.handle_picker_key(key),
             Mode::Pager(_) => self.handle_pager_key(key),
         }
     }
@@ -698,7 +701,10 @@ impl App {
     fn execute(&mut self, cmd: Command) -> Effect {
         match cmd {
             Command::Cd { path } => self.cmd_cd(path),
-            Command::Move { destination } => self.cmd_move(&destination),
+            Command::Move { destination: None } => self.open_move_picker(),
+            Command::Move {
+                destination: Some(destination),
+            } => self.cmd_move(&destination),
             Command::Rename { name } => self.cmd_rename(&name),
             Command::Open => self.cmd_open(),
             Command::Edit => self.cmd_edit(),
@@ -741,6 +747,89 @@ impl App {
             return Err("cannot operate on '..' - select a real entry".to_string());
         }
         Ok((entry.name.clone(), self.nav.cwd.join(&entry.name)))
+    }
+
+    /// `:move` with no path: pick a destination folder, then confirm.
+    fn open_move_picker(&mut self) -> Effect {
+        let (name, src) = match self.selected_operand() {
+            Ok(v) => v,
+            Err(e) => return self.err(format!("move: {e}")),
+        };
+        match FolderPicker::open(&self.nav.cwd, name, src, self.nav.show_hidden) {
+            Ok(picker) => {
+                self.mode = Mode::FolderPicker(picker);
+                Effect::None
+            }
+            Err(e) => self.err(format!("move: {e}")),
+        }
+    }
+
+    /// Rows of folders the picker has, mirrored from the listing area
+    /// the same way the reader's rows are: the dest header and borders
+    /// sit inside that area, so paging and drawing agree on a row.
+    pub fn picker_rows(&self) -> usize {
+        self.viewport_rows.saturating_sub(picker::FRAME_ROWS).max(1)
+    }
+
+    fn handle_picker_key(&mut self, key: KeyInput) -> Effect {
+        let rows = self.picker_rows();
+        let mut select = false;
+        let mut cancel = false;
+        let mut err: Option<String> = None;
+        let mut info: Option<String> = None;
+        {
+            let Mode::FolderPicker(picker) = &mut self.mode else {
+                return Effect::None;
+            };
+            match key {
+                KeyInput::Char('j') | KeyInput::Down => picker.move_cursor(1),
+                KeyInput::Char('k') | KeyInput::Up => picker.move_cursor(-1),
+                KeyInput::PageDown => picker.move_cursor(rows as isize),
+                KeyInput::PageUp => picker.move_cursor(-(rows as isize)),
+                KeyInput::Char('g') | KeyInput::Home => picker.cursor_to_start(),
+                KeyInput::Char('G') | KeyInput::End => picker.cursor_to_end(),
+                KeyInput::Char('l') | KeyInput::Right => {
+                    if let Err(e) = picker.enter_focused() {
+                        err = Some(format!("move: {e}"));
+                    }
+                }
+                KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => {
+                    match picker.go_up() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            info = Some("already at the filesystem root".to_string());
+                        }
+                        Err(e) => err = Some(format!("move: {e}")),
+                    }
+                }
+                KeyInput::Enter | KeyInput::Char('m') => select = true,
+                KeyInput::Esc | KeyInput::Char('q') => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.mode = Mode::Browse;
+            self.push_msg(Level::Info, "cancelled: folder picker".to_string());
+            return Effect::None;
+        }
+        if select {
+            return self.confirm_picker_destination();
+        }
+        if let Some(text) = err {
+            return self.err(text);
+        }
+        if let Some(text) = info {
+            self.push_msg(Level::Info, text);
+        }
+        Effect::None
+    }
+
+    fn confirm_picker_destination(&mut self) -> Effect {
+        let dest = match &self.mode {
+            Mode::FolderPicker(picker) => picker.destination().to_string_lossy().into_owned(),
+            _ => return Effect::None,
+        };
+        self.cmd_move(&dest)
     }
 
     fn cmd_move(&mut self, destination: &str) -> Effect {
@@ -959,9 +1048,17 @@ pub fn help_lines() -> Vec<String> {
         "  n / N                next / previous match",
         "  h, q, Esc            back to the listing, on the same row",
         "",
+        "KEYS (folder picker - :move with no path)",
+        "  j / k, Down / Up     move focus",
+        "  l, Right             enter the focused folder",
+        "  h, Left, Backspace   go to parent directory",
+        "  g / G                first / last folder",
+        "  Enter, m             choose the focused folder (then y/n)",
+        "  q, Esc               cancel, back to the listing",
+        "",
         "COMMANDS (at the : prompt)",
         "  cd [path]            change directory (~ ok; quote spaces)",
-        "  move <destination>   move selected entry (asks y/n first)",
+        "  move [destination]   folder picker, or a path (asks y/n first)",
         "  rename <new-name>    rename selected entry (asks y/n first)",
         "  open                 open selected entry with macOS 'open'",
         "  edit                 edit selected file in $EDITOR (or nvim)",
@@ -1125,6 +1222,214 @@ mod tests {
         assert!(app.pending.is_none());
     }
 
+    fn picker(app: &App) -> &FolderPicker {
+        match &app.mode {
+            Mode::FolderPicker(p) => p,
+            other => panic!("expected folder picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_without_destination_opens_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        let cwd = app.nav.cwd.clone();
+        let row = app.nav.cursor;
+
+        app.execute_line("move");
+        assert!(matches!(app.mode, Mode::FolderPicker(_)));
+        assert!(picker(&app).destination() == cwd);
+        assert!(picker(&app).entries.iter().any(|e| e.name == "archive"));
+        assert!(tmp.path().join("note.txt").exists());
+        assert_eq!(app.nav.cwd, cwd);
+        assert_eq!(app.nav.cursor, row);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn picker_j_k_move_focus_and_header_tracks_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::create_dir(tmp.path().join("docs")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+
+        let start = picker(&app).cursor;
+        app.handle_key(KeyInput::Char('j'));
+        assert_eq!(picker(&app).cursor, start + 1);
+        app.handle_key(KeyInput::Char('k'));
+        assert_eq!(picker(&app).cursor, start);
+        app.handle_key(KeyInput::Char('G'));
+        assert_eq!(picker(&app).cursor, picker(&app).entries.len() - 1);
+        app.handle_key(KeyInput::Char('g'));
+        assert_eq!(picker(&app).cursor, 0);
+        assert!(picker(&app).dest_line().starts_with("dest: "));
+    }
+
+    #[test]
+    fn picker_l_descends_and_h_returns_without_changing_the_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir_all(tmp.path().join("archive/nested")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        let listing_cwd = app.nav.cwd.clone();
+        app.execute_line("move");
+
+        let archive = picker(&app)
+            .entries
+            .iter()
+            .position(|e| e.name == "archive")
+            .unwrap();
+        {
+            let Mode::FolderPicker(p) = &mut app.mode else {
+                panic!();
+            };
+            p.cursor = archive;
+        }
+        app.handle_key(KeyInput::Char('l'));
+        assert!(picker(&app).cwd.ends_with("archive"));
+        assert!(picker(&app).entries.iter().any(|e| e.name == "nested"));
+        assert_eq!(app.nav.cwd, listing_cwd, "listing cwd must not follow");
+
+        app.handle_key(KeyInput::Char('h'));
+        assert_eq!(picker(&app).cwd, listing_cwd);
+        assert_eq!(picker(&app).focused().unwrap().name, "archive");
+    }
+
+    #[test]
+    fn picker_enter_selects_focused_folder_and_asks_to_confirm() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+
+        let archive = picker(&app)
+            .entries
+            .iter()
+            .position(|e| e.name == "archive")
+            .unwrap();
+        {
+            let Mode::FolderPicker(p) = &mut app.mode else {
+                panic!();
+            };
+            p.cursor = archive;
+        }
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(app.mode, Mode::ConfirmOp);
+        let pending = app.pending.clone().unwrap();
+        assert!(pending.describe().contains("note.txt"));
+        assert!(pending.describe().contains("archive"));
+        assert!(tmp.path().join("note.txt").exists());
+
+        app.handle_key(KeyInput::Char('y'));
+        assert!(!tmp.path().join("note.txt").exists());
+        assert!(tmp.path().join("archive/note.txt").exists());
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn picker_m_also_selects_the_focused_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("docs")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+        let docs = picker(&app)
+            .entries
+            .iter()
+            .position(|e| e.name == "docs")
+            .unwrap();
+        {
+            let Mode::FolderPicker(p) = &mut app.mode else {
+                panic!();
+            };
+            p.cursor = docs;
+        }
+        app.handle_key(KeyInput::Char('m'));
+        assert_eq!(app.mode, Mode::ConfirmOp);
+        assert!(app.pending.as_ref().unwrap().describe().contains("docs"));
+        assert!(tmp.path().join("note.txt").exists());
+    }
+
+    #[test]
+    fn picker_esc_and_q_cancel_without_moving() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        for key in [KeyInput::Esc, KeyInput::Char('q')] {
+            let mut app = app_in(&tmp);
+            select(&mut app, "note.txt");
+            let row = app.nav.cursor;
+            app.execute_line("move");
+            assert!(matches!(app.mode, Mode::FolderPicker(_)));
+            assert_eq!(app.handle_key(key), Effect::None);
+            assert_eq!(app.mode, Mode::Browse, "{key:?}");
+            assert!(app.pending.is_none(), "{key:?}");
+            assert!(tmp.path().join("note.txt").exists(), "{key:?}");
+            assert!(!tmp.path().join("archive/note.txt").exists(), "{key:?}");
+            assert_eq!(app.nav.cursor, row, "{key:?}");
+            assert!(last_msg(&app).text.contains("cancelled"), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn picker_selecting_current_dir_is_the_same_path_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+        app.handle_key(KeyInput::Enter);
+        assert!(matches!(app.mode, Mode::FolderPicker(_)));
+        assert!(app.pending.is_none());
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("same"));
+        assert!(tmp.path().join("note.txt").exists());
+    }
+
+    #[test]
+    fn picker_does_not_overwrite_or_move_without_y() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("archive/note.txt"), "keep").unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "note.txt");
+        app.execute_line("move");
+        let archive = picker(&app)
+            .entries
+            .iter()
+            .position(|e| e.name == "archive")
+            .unwrap();
+        {
+            let Mode::FolderPicker(p) = &mut app.mode else {
+                panic!();
+            };
+            p.cursor = archive;
+        }
+        app.handle_key(KeyInput::Enter);
+        assert!(matches!(app.mode, Mode::FolderPicker(_)));
+        assert!(app.pending.is_none());
+        assert!(last_msg(&app).text.contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("note.txt")).unwrap(),
+            "n"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("archive/note.txt")).unwrap(),
+            "keep"
+        );
+    }
+
     #[test]
     fn confirm_ignores_other_keys() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1231,7 +1536,7 @@ mod tests {
         app.nav.change_dir(sub, None).unwrap();
         select(&mut app, "..");
 
-        for line in ["move x", "rename x", "edit", "preview", "open"] {
+        for line in ["move", "move x", "rename x", "edit", "preview", "open"] {
             app.execute_line(line);
             assert_eq!(last_msg(&app).level, Level::Error, "'{line}' on '..'");
             assert!(last_msg(&app).text.contains("'..'"));
@@ -1510,6 +1815,15 @@ mod tests {
         for key in ["j / k", "d / u", "f / b", "PgDn / PgUp", "g / G", "n / N"] {
             assert!(help.contains(key), "help never mentions {key}");
         }
+    }
+
+    #[test]
+    fn the_help_documents_the_folder_picker() {
+        let help = help_lines().join("\n");
+        assert!(help.contains("KEYS (folder picker"));
+        assert!(help.contains("choose the focused folder"));
+        assert!(help.contains("move [destination]"));
+        assert!(help.contains("Enter, m"));
     }
 
     #[test]
@@ -2058,7 +2372,7 @@ mod tests {
         app.handle_key(KeyInput::Char('?'));
         let Mode::Pager(p) = &app.mode else { panic!() };
         assert_eq!(p.title, "help");
-        assert!(p.lines().iter().any(|l| l.contains("move <destination>")));
+        assert!(p.lines().iter().any(|l| l.contains("move [destination]")));
 
         app.handle_key(KeyInput::Char('j'));
         app.handle_key(KeyInput::PageDown);

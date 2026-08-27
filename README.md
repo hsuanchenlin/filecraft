@@ -90,6 +90,24 @@ Every navigation and orientation key is read-only. Filesystem commands
 still go through select -> `:` command -> `y`; opening a file in the
 configured editor remains the explicit path for editing file contents.
 
+## Folder picker
+
+`:move` with no path opens a BBS-styled folder picker over the listing.
+It shows the current directory, its parent, and sibling/child folders.
+The header names the destination currently under the cursor. Choosing a
+folder (`Enter` or `m`) hands that canonical path to the same `y/n`
+confirmation as a typed `:move <path>`. `q` or Esc cancels and returns
+to the listing; nothing is moved until `y`.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, Down / Up | move focus |
+| `l`, Right | enter the focused folder |
+| `h`, Left, Backspace | parent directory |
+| `g` / `G` | first / last folder |
+| Enter, `m` | choose the focused folder, then confirm |
+| `q`, Esc | cancel, back to the listing |
+
 **Changed in this slice:** `l` on a text or Markdown file now opens the
 built-in reader (below) instead of refusing. On a directory it still
 enters, and on `../` it still goes up, so the key means one thing: go
@@ -171,7 +189,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | Command | Action |
 | --- | --- |
 | `cd [path]` | change directory (`~` is home; no argument also goes home) |
-| `move <destination>` | move the selected entry (asks `y/n`, never overwrites) |
+| `move [destination]` | move the selected entry (asks `y/n`, never overwrites). No path opens a folder picker; a typed path still goes straight to confirm |
 | `rename <new-name>` | rename the selected entry (asks `y/n`, never overwrites) |
 | `open` | hand the selected entry to macOS `open` |
 | `edit` | edit the selected regular file in `$EDITOR` or `nvim` |
@@ -214,14 +232,15 @@ cargo build --release
 
 The library under `src/` is terminal-free and is the home for
 deterministic tests (navigation, parsing, path safety, confirmation,
-editor argv, agent boundary, bearings, reader). `src/bearings.rs` holds
-the pure orientation arithmetic - ladder, rail, scroll margin, relative
-time, speakable status - so all of it is tested without a TTY;
-`src/markdown.rs` holds the reader's line classification, inline
-emphasis, and width-aware wrapping, and `src/pager.rs` its scroll,
-search, and position. `src/ui.rs`
-adds golden-frame tests at 80x24, 100x30, 132x40, and 60x20.
-`tests/cli.rs` drives the binary for `--help`/`--list`/non-TTY behavior.
+editor argv, agent boundary, bearings, reader, folder picker).
+`src/bearings.rs` holds the pure orientation arithmetic - ladder, rail,
+scroll margin, relative time, speakable status - so all of it is tested
+without a TTY; `src/markdown.rs` holds the reader's line classification,
+inline emphasis, and width-aware wrapping, and `src/pager.rs` its
+scroll, search, and position. `src/picker.rs` holds the move folder
+picker's listing, cursor, and destination path. `src/ui.rs` adds
+golden-frame tests at 80x24, 100x30, 132x40, and 60x20. `tests/cli.rs`
+drives the binary for `--help`/`--list`/non-TTY behavior.
 
 ## License
 

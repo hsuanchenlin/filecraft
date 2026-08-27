@@ -24,6 +24,13 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   subtract from the mirrored viewport; they must match the reader block's
   borders plus padding in `ui::draw_pager` or scrolling and drawing
   disagree about what a row is.
+- The `:move` folder picker splits the same way: `src/picker.rs` owns
+  folder listing, cursor, descend/ascend, and the dest path;
+  `ui.rs` only draws it. `picker::FRAME_ROWS` must match the popup's
+  borders plus dest header in `ui::draw_picker`. `l`/Right descend;
+  Enter/`m` select into the existing confirm flow; `q`/Esc cancel.
+  `:move <path>` still skips the picker. The picker does not change
+  `NavState::cwd` - cancelling lands on the same listing row.
 - Screens are asserted as golden frames in `src/ui.rs` tests via ratatui's
   `TestBackend` at 80x24, 100x30, 132x40, and 60x20. A wide character owns
   two cells and only the first carries the symbol; dump a buffer with the
