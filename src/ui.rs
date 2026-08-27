@@ -1413,6 +1413,48 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_is_given_exactly_the_geometry_it_pages_by() {
+        // The rows PageUp/PageDown move by are the rows the popup draws:
+        // the dest header and both borders are already subtracted.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 1..=40 {
+            fs::create_dir(tmp.path().join(format!("pick_{i:03}"))).unwrap();
+        }
+        fs::write(tmp.path().join("note.txt"), "n").unwrap();
+        let mut app = app_at(tmp.path());
+        let visible = app.nav.visible();
+        app.nav.cursor = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "note.txt")
+            .unwrap();
+        app.execute_line("move");
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let rows = app.picker_rows();
+        let dest = screen
+            .lines()
+            .position(|line| line.contains("dest:"))
+            .unwrap_or_else(|| panic!("no dest header:\n{screen}"));
+        // More folders than fit, so every drawn row carries one.
+        let body: Vec<&str> = screen.lines().skip(dest + 1).take(rows).collect();
+        assert_eq!(body.len(), rows, "{screen}");
+        assert!(body[0].contains("../"), "{screen}");
+        assert!(body[1].contains("> ./"), "{screen}");
+        assert!(
+            body[2..].iter().all(|line| line.contains("pick_")),
+            "picker drew fewer rows than it pages by:\n{screen}"
+        );
+        let after = screen
+            .lines()
+            .nth(dest + 1 + rows)
+            .unwrap_or_else(|| panic!("no row below the folder list:\n{screen}"));
+        assert!(
+            !after.contains("pick_"),
+            "picker drew more rows than it pages by:\n{screen}"
+        );
+    }
+
+    #[test]
     fn the_reader_never_lets_wide_characters_break_the_frame() {
         let paragraph = "檔案總管視窗介面設計與鍵盤操作".repeat(12);
         let (_tmp, mut app) = reader_app("cjk.md", &format!("# 標題\n\n{paragraph}\n"));

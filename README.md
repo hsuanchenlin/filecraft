@@ -90,10 +90,21 @@ Every navigation and orientation key is read-only. Filesystem commands
 still go through select -> `:` command -> `y`; opening a file in the
 configured editor remains the explicit path for editing file contents.
 
+**Changed in this slice:** `l` on a text or Markdown file now opens the
+built-in reader (below) instead of refusing. On a directory it still
+enters, and on `../` it still goes up, so the key means one thing: go
+in. Nothing about it can change a file.
+
+**Changed in an earlier slice:** `l` **enters** the selected directory
+instead of going to the parent, matching vim, ranger, lf, and nnn. Esc
+**backs out one level** - it clears an active filter, or closes a pager -
+instead of quitting. Quitting is `q` or Ctrl-C.
+
 ## Folder picker
 
 `:move` with no path opens a BBS-styled folder picker over the listing.
-It shows the current directory, its parent, and sibling/child folders.
+It lists `./`, `../`, and the child folders of the directory it is
+showing - siblings only come into view after going up with `h`.
 The header names the destination currently under the cursor. Choosing a
 folder (`Enter` or `m`) hands that canonical path to the same `y/n`
 confirmation as a typed `:move <path>`. `q` or Esc cancels and returns
@@ -107,16 +118,6 @@ to the listing; nothing is moved until `y`.
 | `g` / `G` | first / last folder |
 | Enter, `m` | choose the focused folder, then confirm |
 | `q`, Esc | cancel, back to the listing |
-
-**Changed in this slice:** `l` on a text or Markdown file now opens the
-built-in reader (below) instead of refusing. On a directory it still
-enters, and on `../` it still goes up, so the key means one thing: go
-in. Nothing about it can change a file.
-
-**Changed in an earlier slice:** `l` **enters** the selected directory
-instead of going to the parent, matching vim, ranger, lf, and nnn. Esc
-**backs out one level** - it clears an active filter, or closes a pager -
-instead of quitting. Quitting is `q` or Ctrl-C.
 
 ## Reader
 

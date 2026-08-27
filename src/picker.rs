@@ -15,9 +15,6 @@ use crate::nav::{self, EntryKind};
 /// Rows the picker's own frame costs inside the listing area: two
 /// border rows plus the dest header that names the targeted folder.
 pub const FRAME_ROWS: usize = 3;
-/// Columns the picker's own frame costs inside the listing area: two
-/// border columns plus one column of padding on each side.
-pub const FRAME_COLS: usize = 4;
 
 /// What a picker row is. Files never appear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,10 +219,14 @@ impl FolderPicker {
                 );
             } else if entry.is_enterable() {
                 let child = cwd.join(&entry.name);
-                let path = std::fs::canonicalize(&child).unwrap_or(child);
-                let kind = match entry.kind {
-                    EntryKind::SymlinkDir => PickerKind::SymlinkDir,
-                    _ => PickerKind::Dir,
+                // `cwd` is canonical, so a real directory child already is
+                // too. Only a symlink needs resolving to name its target.
+                let (kind, path) = match entry.kind {
+                    EntryKind::SymlinkDir => (
+                        PickerKind::SymlinkDir,
+                        std::fs::canonicalize(&child).unwrap_or(child),
+                    ),
+                    _ => (PickerKind::Dir, child),
                 };
                 entries.push(PickerEntry {
                     name: entry.name,
