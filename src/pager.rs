@@ -219,11 +219,7 @@ impl Pager {
         let total_lines = self.doc.len().max(1);
         let rows = self.rows(width, glyphs).len();
         let max = Pager::max_scroll(rows, view_rows);
-        let percent = if max == 0 {
-            100
-        } else {
-            (self.scroll.min(max) * 100) / max
-        };
+        let percent = (self.scroll.min(max) * 100).checked_div(max).unwrap_or(100);
         let line = self.top_line(width, glyphs) + 1;
         format!(
             "line {line} of {total_lines} {dot} {percent}%",
