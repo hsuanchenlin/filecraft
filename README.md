@@ -113,6 +113,7 @@ to the listing; nothing is moved until `y`.
 | Key | Action |
 | --- | --- |
 | `j` / `k`, Down / Up | move focus |
+| PgUp / PgDn | move focus a page |
 | `l`, Right | enter the focused folder |
 | `h`, Left, Backspace | parent directory |
 | `g` / `G` | first / last folder |

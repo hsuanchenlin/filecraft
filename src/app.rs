@@ -1050,6 +1050,7 @@ pub fn help_lines() -> Vec<String> {
         "",
         "KEYS (folder picker - :move with no path)",
         "  j / k, Down / Up     move focus",
+        "  PgUp / PgDn          move focus a page",
         "  l, Right             enter the focused folder",
         "  h, Left, Backspace   go to parent directory",
         "  g / G                first / last folder",
@@ -1824,6 +1825,26 @@ mod tests {
         assert!(help.contains("choose the focused folder"));
         assert!(help.contains("move [destination]"));
         assert!(help.contains("Enter, m"));
+        // Every key the picker binds is named in its own block, paging
+        // included: the block starts at its heading and ends at the blank
+        // line before COMMANDS.
+        let block: String = help
+            .lines()
+            .skip_while(|line| !line.starts_with("KEYS (folder picker"))
+            .take_while(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for key in [
+            "j / k, Down / Up",
+            "PgUp / PgDn",
+            "l, Right",
+            "h, Left, Backspace",
+            "g / G",
+            "Enter, m",
+            "q, Esc",
+        ] {
+            assert!(block.contains(key), "picker help never names {key}:\n{block}");
+        }
     }
 
     #[test]
