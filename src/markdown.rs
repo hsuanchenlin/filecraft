@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use crate::bearings::{display_width, Glyphs};
+use crate::bearings::{char_width, display_width, pad_to_width_with, Glyphs};
 
 /// Columns a tab expands to, before any width arithmetic runs.
 const TAB_STOP: usize = 4;
@@ -128,13 +128,26 @@ impl DocLine {
     }
 
     /// A plain body line.
+    ///
+    /// The text is [`clean`]ed here rather than at the call site, so
+    /// every line the reader holds - parsed from a file or written by the
+    /// app itself - satisfies the same invariant: no tabs, no control
+    /// characters, and a display width the screen will actually spend.
     pub fn body(text: impl Into<String>) -> Self {
-        DocLine::new(Kind::Body, Marker::None, vec![Span::new(text, Ink::Plain)])
+        DocLine::new(
+            Kind::Body,
+            Marker::None,
+            vec![Span::new(clean(&text.into()), Ink::Plain)],
+        )
     }
 
     /// A reader notice (`(empty file)`, the truncation footer).
     pub fn meta(text: impl Into<String>) -> Self {
-        DocLine::new(Kind::Meta, Marker::None, vec![Span::new(text, Ink::Meta)])
+        DocLine::new(
+            Kind::Meta,
+            Marker::None,
+            vec![Span::new(clean(&text.into()), Ink::Meta)],
+        )
     }
 
     /// The line's own text, without the decoration the reader adds. This
@@ -188,7 +201,7 @@ fn clean(line: &str) -> String {
             }
             c => {
                 out.push(c);
-                column += display_width(&c.to_string());
+                column += char_width(c);
             }
         }
     }
@@ -198,9 +211,7 @@ fn clean(line: &str) -> String {
 /// Render `text` as plain text: one body line per source line, no
 /// Markdown structure invented that the file does not have.
 pub fn parse_plain(text: &str) -> Vec<DocLine> {
-    text.lines()
-        .map(|line| DocLine::body(clean(line)))
-        .collect()
+    text.lines().map(DocLine::body).collect()
 }
 
 /// Render `text` as Markdown in the given character set.
@@ -482,7 +493,9 @@ fn fence_rule(line: &DocLine, width: usize, glyphs: &Glyphs) -> String {
     let text = format!("{head} {label} ");
     let used = display_width(&text);
     if used >= width {
-        return text.chars().take(width).collect();
+        // Columns, not characters: a wide label must not be cut mid-cell
+        // and must never draw past the frame.
+        return pad_to_width_with(&text, width, "");
     }
     format!("{text}{}", fill(glyphs.rule, width - used))
 }
@@ -504,7 +517,7 @@ fn wrap(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
     let mut last_break: Option<usize> = None;
     let mut break_before_next = false;
     for (c, ink) in cells {
-        let cell_width = display_width(&c.to_string());
+        let cell_width = char_width(c);
         if c == ' ' {
             // Leading spaces survive on the first row (a text file's own
             // indentation) but never open a continuation row.
@@ -539,10 +552,7 @@ fn wrap(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
             }
             rows.push(std::mem::take(&mut current));
             current = rest;
-            used = current
-                .iter()
-                .map(|(c, _)| display_width(&c.to_string()))
-                .sum();
+            used = current.iter().map(|(c, _)| char_width(*c)).sum();
             last_break = None;
         }
         current.push((c, ink));
@@ -818,6 +828,32 @@ mod tests {
         assert!(rows[1].text().contains("rust"));
         assert_eq!(display_width(&rows[1].text()), 20);
         assert_eq!(display_width(&rows[3].text()), 20);
+    }
+
+    #[test]
+    fn a_wide_fence_label_is_cut_by_columns_not_by_characters() {
+        // 40 CJK characters is 80 columns of label, far past any frame
+        // the reader has: the cut has to land on a cell boundary.
+        let doc = parse_markdown(&format!("```{}\ncode\n```\n", "檔".repeat(40)));
+        for width in 1..=30 {
+            let rows = layout(&doc, width, &Glyphs::UNICODE);
+            let rule = rows[0].text();
+            assert_eq!(
+                display_width(&rule),
+                width,
+                "width {width} drew {rule:?} instead of filling the frame"
+            );
+            assert!(rule.chars().all(|c| c != '\u{FFFD}'));
+        }
+    }
+
+    #[test]
+    fn app_authored_lines_are_cleaned_like_parsed_ones() {
+        // `DocLine::body` and `DocLine::meta` hold the invariant, so a
+        // pane the app writes itself can never budget a width it will not
+        // spend.
+        assert_eq!(DocLine::body("a\tb\x1b[31m").text(), "a   b\u{FFFD}[31m");
+        assert_eq!(DocLine::meta("note\x07").text(), "note\u{FFFD}");
     }
 
     #[test]

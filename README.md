@@ -110,7 +110,7 @@ listing: closing it lands on exactly the row it was opened from.
 | --- | --- |
 | `j` / `k`, Down / Up | scroll one line |
 | `d` / `u` | scroll half a page |
-| PgUp / PgDn | scroll a page |
+| `f` / `b`, PgDn / PgUp | scroll a page |
 | `g` / `G`, Home / End | top / bottom |
 | `/` | find in this file (type, then Enter) |
 | `n` / `N` | next / previous match |

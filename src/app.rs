@@ -359,6 +359,23 @@ impl App {
         }
     }
 
+    /// Mirror the terminal's geometry into the state key handling and
+    /// the reader compute against, and re-establish the reader's one
+    /// invariant against it: the offset never points past the last page.
+    ///
+    /// Every surface that drives the app - the event loop, the golden
+    /// frame tests - goes through here, so a resize can never leave
+    /// `top_line`, the position footer, and `n`/`N` reading a stale
+    /// offset while the screen shows the real last page.
+    pub fn set_viewport(&mut self, rows: usize, cols: usize) {
+        self.viewport_rows = rows.max(1);
+        self.viewport_cols = cols;
+        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        if let Mode::Pager(pager) = &mut self.mode {
+            pager.clamp(width, view, &glyphs);
+        }
+    }
+
     /// Columns of text the reader has, mirrored from the terminal the
     /// same way the ladder's width is: the frame it draws sits inside the
     /// listing area, so scrolling and drawing agree on what a row is.
@@ -933,7 +950,7 @@ pub fn help_lines() -> Vec<String> {
         "KEYS (reader - l on a text or Markdown file)",
         "  j / k, Down / Up     scroll one line",
         "  d / u                scroll half a page",
-        "  PgUp / PgDn          scroll a page",
+        "  f / b, PgDn / PgUp   scroll a page",
         "  g / G, Home / End    top / bottom",
         "  /                    find in this file (Enter searches)",
         "  n / N                next / previous match",
@@ -1329,7 +1346,7 @@ mod tests {
 
         let pager = reader(&app);
         assert_eq!(pager.title, "notes.md");
-        let kinds: Vec<markdown::Kind> = pager.doc.iter().map(|l| l.kind).collect();
+        let kinds: Vec<markdown::Kind> = pager.doc().iter().map(|l| l.kind).collect();
         assert!(kinds.contains(&markdown::Kind::Heading(1)));
         assert!(kinds.contains(&markdown::Kind::Bullet));
         assert!(kinds.contains(&markdown::Kind::Quote));
@@ -1350,7 +1367,7 @@ mod tests {
         select(&mut app, "plain.txt");
         app.handle_key(KeyInput::Char('l'));
         let pager = reader(&app);
-        assert!(pager.doc.iter().all(|l| l.kind == markdown::Kind::Body));
+        assert!(pager.doc().iter().all(|l| l.kind == markdown::Kind::Body));
         assert_eq!(pager.text(), "# not a heading\n- not a bullet");
     }
 
@@ -1446,6 +1463,50 @@ mod tests {
         assert_eq!(reader(&app).scroll, last_page);
         app.handle_key(KeyInput::Char('g'));
         assert_eq!(reader(&app).scroll, 0);
+    }
+
+    #[test]
+    fn widening_the_terminal_reclamps_the_reader_and_keeps_the_position_honest() {
+        // Lines that wrap at 40 columns fit on one row at 200, so the
+        // bottom of the document moves up under the offset.
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (1..=100)
+            .map(|i| format!("line {i} with enough words to wrap more than once here\n"))
+            .collect();
+        fs::write(tmp.path().join("wrap.txt"), body).unwrap();
+        let mut app = app_in(&tmp);
+        app.set_viewport(12, 40);
+        select(&mut app, "wrap.txt");
+        app.handle_key(KeyInput::Char('l'));
+        app.handle_key(KeyInput::Char('G'));
+        let narrow_scroll = reader(&app).scroll;
+        assert!(narrow_scroll > 100);
+
+        app.set_viewport(12, 200);
+        let (width, view, glyphs) = (app.pager_cols(), app.pager_rows(), app.glyphs);
+        let pager = reader(&app);
+        assert_eq!(pager.scroll, Pager::max_scroll(100, view));
+        // The footer reports the last page, not line 1 of the file.
+        assert_eq!(pager.top_line(width, &glyphs), 100 - view);
+        assert!(pager.position(width, view, &glyphs).ends_with("100%"));
+
+        // A search resumes from the visible position: "line 9" also
+        // matches source line 9, and a stale offset would have landed
+        // there instead of on the first match below the top of the view.
+        app.handle_key(KeyInput::Char('/'));
+        for c in "line 9".chars() {
+            app.handle_key(KeyInput::Char(c));
+        }
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(reader(&app).top_line(width, &glyphs), 100 - view);
+    }
+
+    #[test]
+    fn the_help_documents_every_reader_key_that_is_bound() {
+        let help = help_lines().join("\n");
+        for key in ["j / k", "d / u", "f / b", "PgDn / PgUp", "g / G", "n / N"] {
+            assert!(help.contains(key), "help never mentions {key}");
+        }
     }
 
     #[test]
@@ -1548,7 +1609,7 @@ mod tests {
         select(&mut app, "huge.txt");
         app.handle_key(KeyInput::Char('l'));
         let pager = reader(&app);
-        assert_eq!(pager.doc.len(), preview::MAX_VIEW_LINES + 1);
+        assert_eq!(pager.doc().len(), preview::MAX_VIEW_LINES + 1);
         assert!(pager.text().contains("truncated"));
     }
 

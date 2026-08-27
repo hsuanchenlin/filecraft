@@ -91,10 +91,17 @@ impl Glyphs {
     }
 }
 
+/// Display columns one character occupies. Wide (CJK) characters count
+/// as two. This is the per-cell primitive every width budget is built
+/// from, so measuring a character never allocates a `String` for it.
+pub fn char_width(c: char) -> usize {
+    c.width().unwrap_or(0)
+}
+
 /// Display columns `text` occupies. Wide (CJK) characters count as two,
 /// so every column budget in this module is in real cells.
 pub fn display_width(text: &str) -> usize {
-    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+    text.chars().map(char_width).sum()
 }
 
 /// Replace control characters with `U+FFFD` so filesystem-derived names,
@@ -135,7 +142,7 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        let w = char_width(c);
         if used + w > width - mark_width {
             break;
         }

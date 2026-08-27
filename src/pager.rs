@@ -7,6 +7,9 @@
 //! caller supplies the width and height the screen actually has, exactly
 //! as the ladder is fitted to the width the row actually has.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::bearings::Glyphs;
 use crate::markdown::{self, DocLine, Row};
 
@@ -17,19 +20,45 @@ pub const FRAME_ROWS: usize = 2;
 /// blockquote bar is never mistaken for the frame.
 pub const FRAME_COLS: usize = 4;
 
+/// The document laid out to one geometry, kept so a drawn frame and a
+/// keypress each lay the document out at most once. `Pager::doc` is
+/// immutable after construction, so the geometry is the whole key.
+#[derive(Debug, Clone)]
+struct Laid {
+    width: usize,
+    glyphs: Glyphs,
+    rows: Rc<Vec<Row>>,
+}
+
 /// A scrollable full-screen pane: help, the message ring, the agent
 /// explanation, and the file reader all use it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Pager {
     pub title: String,
-    pub doc: Vec<DocLine>,
+    doc: Vec<DocLine>,
     /// First drawn row on screen.
     pub scroll: usize,
     /// Live `/` input, present only while a query is being typed.
     pub find: Option<String>,
     /// The committed query; empty when no search is in force.
     pub query: String,
+    laid: RefCell<Option<Laid>>,
 }
+
+/// The cache is not part of what a pane *is*: two panes over the same
+/// document at the same offset are equal whether or not either has been
+/// drawn yet.
+impl PartialEq for Pager {
+    fn eq(&self, other: &Self) -> bool {
+        self.title == other.title
+            && self.doc == other.doc
+            && self.scroll == other.scroll
+            && self.find == other.find
+            && self.query == other.query
+    }
+}
+
+impl Eq for Pager {}
 
 impl Pager {
     /// A pane of plain lines, for text the app itself wrote.
@@ -45,7 +74,13 @@ impl Pager {
             scroll: 0,
             find: None,
             query: String::new(),
+            laid: RefCell::new(None),
         }
+    }
+
+    /// The parsed document behind this pane.
+    pub fn doc(&self) -> &[DocLine] {
+        &self.doc
     }
 
     /// Every source line as plain text.
@@ -59,8 +94,25 @@ impl Pager {
     }
 
     /// The rows to draw in `width` columns.
-    pub fn rows(&self, width: usize, glyphs: &Glyphs) -> Vec<Row> {
-        markdown::layout(&self.doc, width, glyphs)
+    ///
+    /// Memoized on the geometry it was laid out for: a frame asks for the
+    /// row count, the top line, and the rows themselves, and every scroll
+    /// key asks again, so laying the document out once per geometry is
+    /// what keeps a held `j` responsive on a file at the reader's cap.
+    pub fn rows(&self, width: usize, glyphs: &Glyphs) -> Rc<Vec<Row>> {
+        let width = width.max(1);
+        if let Some(laid) = self.laid.borrow().as_ref() {
+            if laid.width == width && laid.glyphs == *glyphs {
+                return Rc::clone(&laid.rows);
+            }
+        }
+        let rows = Rc::new(markdown::layout(&self.doc, width, glyphs));
+        *self.laid.borrow_mut() = Some(Laid {
+            width,
+            glyphs: *glyphs,
+            rows: Rc::clone(&rows),
+        });
+        rows
     }
 
     /// Largest scroll offset that still fills the view - the last page
@@ -99,9 +151,14 @@ impl Pager {
     }
 
     /// The source line currently at the top of the view.
+    ///
+    /// An offset past the end reads as the last line rather than the
+    /// first: a stale offset must never claim the reader is at the top of
+    /// a document whose bottom is on screen.
     pub fn top_line(&self, width: usize, glyphs: &Glyphs) -> usize {
-        self.rows(width, glyphs)
-            .get(self.scroll)
+        let rows = self.rows(width, glyphs);
+        rows.get(self.scroll)
+            .or_else(|| rows.last())
             .map(|row| row.line)
             .unwrap_or(0)
     }
@@ -260,6 +317,43 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_is_computed_once_per_geometry() {
+        // A frame asks for the row count, the top line, and the rows;
+        // every one of those must reuse the same laid-out document.
+        let pager = numbered(200);
+        let first = pager.rows(W, &Glyphs::UNICODE);
+        assert!(Rc::ptr_eq(&first, &pager.rows(W, &Glyphs::UNICODE)));
+        pager.position(W, H, &Glyphs::UNICODE);
+        pager.top_line(W, &Glyphs::UNICODE);
+        assert!(Rc::ptr_eq(&first, &pager.rows(W, &Glyphs::UNICODE)));
+        // A new width or character set is a new geometry, so it re-lays.
+        assert!(!Rc::ptr_eq(&first, &pager.rows(W + 1, &Glyphs::UNICODE)));
+        assert!(!Rc::ptr_eq(&first, &pager.rows(W, &Glyphs::ASCII)));
+    }
+
+    #[test]
+    fn a_plain_pane_is_cleaned_like_a_parsed_one() {
+        // Text the app itself wrote goes through the same cleaning, so
+        // the width the wrap budgets is the width the screen spends.
+        let pager = Pager::plain("built-in", vec!["\t\t\tdeeply indented".to_string()]);
+        let line = &pager.lines()[0];
+        assert!(!line.contains('\t'));
+        assert!(line.starts_with("            deeply"));
+        for row in pager.rows(20, &Glyphs::UNICODE).iter() {
+            assert!(crate::bearings::display_width(&row.text()) <= 20);
+        }
+    }
+
+    #[test]
+    fn a_stale_offset_reads_as_the_last_line_not_the_first() {
+        // Nothing should be able to set this, but if it ever is, the
+        // footer and `n`/`N` must not claim the reader is at the top.
+        let mut pager = numbered(30);
+        pager.scroll = 9_999;
+        assert_eq!(pager.top_line(W, &Glyphs::UNICODE), 29);
+    }
+
+    #[test]
     fn a_narrower_screen_reclamps_the_offset() {
         let mut pager = numbered(30);
         pager.scroll_to_end(W, H, &Glyphs::UNICODE);
@@ -267,5 +361,23 @@ mod tests {
         // A taller view shows more at once, so the last page starts higher.
         pager.clamp(W, 25, &Glyphs::UNICODE);
         assert_eq!(pager.scroll, 5);
+    }
+
+    #[test]
+    fn a_wider_screen_unwraps_the_document_and_reclamps_the_offset() {
+        // Lines that wrap 3:1 at 12 columns fit on one row at 60, so the
+        // bottom of the document moves a long way up.
+        let doc = markdown::parse_plain(&"alpha beta gamma delta\n".repeat(30));
+        let mut pager = Pager::document("wrapped", doc);
+        pager.scroll_to_end(12, H, &Glyphs::UNICODE);
+        assert!(pager.scroll > 20);
+        pager.clamp(60, H, &Glyphs::UNICODE);
+        assert_eq!(pager.scroll, Pager::max_scroll(30, H));
+        // The position is honest against the wider screen, not stuck at
+        // the top of the file.
+        assert_eq!(
+            pager.position(60, H, &Glyphs::UNICODE),
+            "line 21 of 30 · 100%"
+        );
     }
 }

@@ -701,9 +701,11 @@ mod tests {
     /// Render with an explicit theme and geometry, exactly as `main`
     /// drives it: the app is told the same width the frame has.
     fn render_themed(app: &mut App, width: u16, height: u16, theme: &Theme) -> String {
-        app.viewport_rows = height.saturating_sub(CHROME_ROWS).max(1) as usize;
-        app.viewport_cols = width.saturating_sub(BORDER_COLS) as usize;
         app.glyphs = theme.glyphs();
+        app.set_viewport(
+            height.saturating_sub(CHROME_ROWS) as usize,
+            width.saturating_sub(BORDER_COLS) as usize,
+        );
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         // An hour after the newest entry: every fixture then reads as
@@ -1172,8 +1174,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             fs::write(tmp.path().join("wide.log"), "x".repeat(200)).unwrap();
             let mut app = app_at(tmp.path());
-            app.viewport_rows = 24usize - CHROME_ROWS as usize;
-            app.viewport_cols = 80usize - BORDER_COLS as usize;
+            app.set_viewport(
+                24usize - CHROME_ROWS as usize,
+                80usize - BORDER_COLS as usize,
+            );
             let visible = app.nav.visible();
             app.nav.cursor = visible
                 .iter()

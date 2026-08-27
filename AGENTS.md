@@ -31,6 +31,15 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - `App::viewport_rows`/`viewport_cols`/`glyphs` are mirrored from the
   terminal by `main.rs` every frame. Key handling fits the ladder to those
   same numbers, which is what makes every digit drawn a key that works.
+  Mirror geometry through `App::set_viewport`, never by assigning the
+  fields: it is also where an open reader's offset is re-clamped, so a
+  resize cannot leave `top_line`, the position footer, and `n`/`N`
+  reading an offset the screen no longer has.
+- `Pager::rows` memoizes the laid-out document on `(width, glyphs)`; a
+  frame and a keypress each ask for it several times. Text the app itself
+  writes reaches the reader through `markdown::DocLine::body`/`meta`,
+  which is where tabs and control characters are cleaned - every column
+  budget downstream assumes that has already happened.
 - v0 has no delete command. Do not add recursive (or any) deletion without an explicit product decision.
 - One operating locus: the listing. Chrome above it is read-only and must
   never become a second selectable/operable pane - that ambiguity is what
