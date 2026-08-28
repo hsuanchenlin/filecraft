@@ -223,6 +223,32 @@ check_eq "600" "$(stat -f '%Lp' "$TMP/profile-target")" "profile permissions are
 check_eq "0" "$(find "$TMP" -maxdepth 1 -name 'profile-target.filecraft.*' | wc -l | tr -d ' ')" \
     "symlink replacement leaves no temporary file"
 
+printf 'prefix\n%s\nold\n%s\nsuffix' "$BEGIN_MARKER" "$END_MARKER" > "$TMP/no-final-newline"
+printf 'prefix\n%s\nexport PATH="/newline/root/bin:$PATH"\n%s\nsuffix' \
+    "$BEGIN_MARKER" "$END_MARKER" > "$TMP/no-final-newline.expected"
+check_true "a profile without a final newline is reconciled" \
+    add_to_profile "$TMP/no-final-newline" zsh /newline/root/bin
+check_true "reconciliation preserves a missing final newline exactly" \
+    cmp -s "$TMP/no-final-newline.expected" "$TMP/no-final-newline"
+
+printf 'prefix\n%s\nold\n%s\nsuffix\n' "$BEGIN_MARKER" "$END_MARKER" > "$TMP/one-final-newline"
+printf 'prefix\n%s\nexport PATH="/newline/root/bin:$PATH"\n%s\nsuffix\n' \
+    "$BEGIN_MARKER" "$END_MARKER" > "$TMP/one-final-newline.expected"
+check_true "a profile with one final newline is reconciled" \
+    add_to_profile "$TMP/one-final-newline" zsh /newline/root/bin
+check_true "reconciliation preserves one final newline exactly" \
+    cmp -s "$TMP/one-final-newline.expected" "$TMP/one-final-newline"
+
+printf 'prefix\n%s\nold\n%s\nsuffix\n\n\n' "$BEGIN_MARKER" "$END_MARKER" > "$TMP/blank-final-lines"
+printf 'prefix\n%s\nexport PATH="/newline/root/bin:$PATH"\n%s\nsuffix\n\n\n' \
+    "$BEGIN_MARKER" "$END_MARKER" > "$TMP/blank-final-lines.expected"
+check_true "a profile with final blank lines is reconciled" \
+    add_to_profile "$TMP/blank-final-lines" zsh /newline/root/bin
+check_true "reconciliation preserves every final blank line" \
+    cmp -s "$TMP/blank-final-lines.expected" "$TMP/blank-final-lines"
+check_eq "0" "$(find "$TMP" -maxdepth 1 -name '*.filecraft.*' | wc -l | tr -d ' ')" \
+    "newline reconciliation leaves no temporary files"
+
 # A missing fish config directory is created rather than failing.
 check_true "fish config is created" \
     add_to_profile "$TMP/fish/config.fish" fish /home/tester/.cargo/bin

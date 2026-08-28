@@ -259,7 +259,11 @@ add_to_profile() {
             note "    $line"
             return 0
         fi
-        local temp=''
+        local temp='' final_newline
+        if ! final_newline="$(tail -c 1 "$file" | wc -l | tr -d ' ')"; then
+            warn "could not inspect $requested; left it unchanged"
+            return 2
+        fi
         if ! temp="$(mktemp "${file}.filecraft.XXXXXX")"; then
             warn "could not create a temporary file beside $requested; left it unchanged"
             return 2
@@ -278,6 +282,28 @@ add_to_profile() {
             rm -f -- "$temp"
             warn "could not prepare the update for $requested; left it unchanged"
             return 2
+        fi
+        if [ "$final_newline" -eq 0 ]; then
+            local trimmed='' size keep
+            size="$(wc -c < "$temp" | tr -d ' ')" || {
+                rm -f -- "$temp"
+                warn "could not inspect the update for $requested; left it unchanged"
+                return 2
+            }
+            keep=$((size - 1))
+            if ! trimmed="$(mktemp "${file}.filecraft.XXXXXX")"; then
+                rm -f -- "$temp"
+                warn "could not create a temporary file beside $requested; left it unchanged"
+                return 2
+            fi
+            if ! cp -p -- "$temp" "$trimmed" ||
+                ! dd if="$temp" of="$trimmed" bs=1 count="$keep" 2>/dev/null; then
+                rm -f -- "$temp" "$trimmed"
+                warn "could not preserve the final newline state of $requested; left it unchanged"
+                return 2
+            fi
+            rm -f -- "$temp"
+            temp="$trimmed"
         fi
         if ! mv -- "$temp" "$file"; then
             rm -f -- "$temp"
