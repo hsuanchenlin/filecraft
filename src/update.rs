@@ -296,7 +296,16 @@ pub fn run_with<H: Host>(check: bool, host: &H) -> Result<UpdateReport, UpdateEr
     }
 
     apply_update(host, &kind)?;
-    Ok(report(UpdateStatus::Updated))
+    let installed = installed_clone_info(host, &kind)?;
+    Ok(UpdateReport {
+        current_version: display_current(&current, local_commit.as_deref()),
+        target_version: installed
+            .as_ref()
+            .map(display_target)
+            .unwrap_or(target_version),
+        source: kind.source_label(),
+        status: UpdateStatus::Updated,
+    })
 }
 
 struct RemoteInfo {
@@ -411,6 +420,33 @@ fn apply_update<H: Host>(host: &H, kind: &InstallKind) -> Result<(), UpdateError
         classify_command(&step, &result)?;
     }
     Ok(())
+}
+
+fn installed_clone_info<H: Host>(
+    host: &H,
+    kind: &InstallKind,
+) -> Result<Option<RemoteInfo>, UpdateError> {
+    let InstallKind::GitClone { root } = kind else {
+        return Ok(None);
+    };
+    let manifest = host
+        .read_to_string(&root.join("Cargo.toml"))
+        .map_err(|message| UpdateError::Failed {
+            step: "verify installed clone".to_string(),
+            message,
+        })?;
+    let version = parse_package_field(&manifest, "version").ok_or_else(|| UpdateError::Failed {
+        step: "verify installed clone".to_string(),
+        message: "clone Cargo.toml has no package version".to_string(),
+    })?;
+    let commit = local_commit(host, kind).ok_or_else(|| UpdateError::Failed {
+        step: "verify installed clone".to_string(),
+        message: "could not determine the installed clone commit".to_string(),
+    })?;
+    Ok(Some(RemoteInfo {
+        version: Some(version),
+        commit: Some(commit),
+    }))
 }
 
 /// Commands that apply an update for `kind`, in order.
@@ -666,7 +702,10 @@ fn parse_crates_filecraft(text: &str) -> Option<CargoSource> {
 
 fn parse_cargo_source(source: &str) -> CargoSource {
     if let Some(path) = source.strip_prefix("path+file://") {
-        CargoSource::Path(PathBuf::from(path))
+        percent_decode(path)
+            .map(PathBuf::from)
+            .map(CargoSource::Path)
+            .unwrap_or(CargoSource::Registry)
     } else if let Some(git) = source.strip_prefix("git+") {
         match git.rsplit_once('#') {
             Some((url, commit)) => CargoSource::Git {
@@ -680,6 +719,33 @@ fn parse_cargo_source(source: &str) -> CargoSource {
         }
     } else {
         CargoSource::Registry
+    }
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -919,6 +985,13 @@ mod tests {
             path,
             Some(CargoSource::Path(PathBuf::from("/Users/me/filecraft")))
         );
+        let escaped_path = parse_crates_filecraft(
+            r#""filecraft 0.1.0 (path+file:///Users/me/File%20Craft%23one)" = ["filecraft"]"#,
+        );
+        assert_eq!(
+            escaped_path,
+            Some(CargoSource::Path(PathBuf::from("/Users/me/File Craft#one")))
+        );
         let git = parse_crates_filecraft(
             r#""filecraft 0.1.0 (git+https://github.com/hsuanchenlin/filecraft.git#abc123)" = ["filecraft"]"#,
         );
@@ -1094,6 +1167,8 @@ mod tests {
         host.curl = CommandResult::success(cargo_toml("0.2.0"));
         let report = run_with(false, &host).unwrap();
         assert_eq!(report.status, UpdateStatus::Updated);
+        assert_eq!(report.target_version, "0.1.0 (aaaaaaa)");
+        assert!(!report.target_version.starts_with("0.2.0"));
         let programs = programs_ran(&host);
         assert!(programs.contains(&"git".to_string()));
         assert!(programs.contains(&"cargo".to_string()));
@@ -1105,6 +1180,13 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(cargo.args.contains(&"--path".to_string()));
+        let ran = host.ran.borrow();
+        let install_index = ran.iter().position(|spec| spec.program == "cargo").unwrap();
+        let verification_index = ran
+            .iter()
+            .rposition(|spec| spec.args.iter().any(|arg| arg == "rev-parse"))
+            .unwrap();
+        assert!(verification_index > install_index);
     }
 
     #[test]
