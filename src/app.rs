@@ -6,7 +6,7 @@
 //! terminal, so every interaction - including move/rename confirmation -
 //! is deterministically testable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{self, Agent, AgentRequest};
 use crate::bearings::{self, Glyphs, Ladder};
@@ -18,6 +18,7 @@ use crate::nav::NavState;
 use crate::pager::{self, Pager};
 use crate::picker::{self, FolderPicker};
 use crate::preview::{self, PreviewData, ViewSource};
+use crate::trash::{self, Trasher};
 
 /// Abstract key input, decoupled from any terminal backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +69,23 @@ pub enum Mode {
     Pager(Pager),
 }
 
-/// A move or rename waiting for explicit confirmation.
+/// A move, rename, or trash waiting for explicit confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingOp {
-    Move { src: PathBuf, dst: PathBuf },
-    Rename { src: PathBuf, dst: PathBuf },
+    Move {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    Rename {
+        src: PathBuf,
+        dst: PathBuf,
+    },
+    /// Move `src` to the system Trash. `name` is what the prompt says,
+    /// because the listing already says which directory it is in.
+    Trash {
+        src: PathBuf,
+        name: String,
+    },
 }
 
 impl PendingOp {
@@ -88,6 +101,7 @@ impl PendingOp {
                 src.file_name().unwrap_or_default().to_string_lossy(),
                 dst.file_name().unwrap_or_default().to_string_lossy()
             ),
+            PendingOp::Trash { name, .. } => format!("trash '{name}'"),
         }
     }
 }
@@ -145,6 +159,9 @@ pub struct App {
     /// Drawing characters in force, so key handling and rendering fit the
     /// ladder to identical widths.
     pub glyphs: Glyphs,
+    /// Where `delete` sends an entry. The system Trash in the shipped
+    /// binary; a directory under a fixture in tests.
+    pub trasher: Box<dyn Trasher>,
 }
 
 impl App {
@@ -165,6 +182,7 @@ impl App {
             viewport_rows: 20,
             viewport_cols: 80,
             glyphs: Glyphs::UNICODE,
+            trasher: trash::system(),
         };
         app.push_msg(
             Level::Info,
@@ -232,6 +250,10 @@ impl App {
             KeyInput::Right | KeyInput::Char('l') => self.open_selected(),
             // Digits address the ancestor ladder; `0` is always the anchor.
             KeyInput::Char(c) if c.is_ascii_digit() => self.jump_to_rung(c as u8 - b'0'),
+            // The one browse key that arms an operation. It changes
+            // nothing by itself: it raises the same y/n prompt `:delete`
+            // does, and only `y` moves anything.
+            KeyInput::Char('d') => self.cmd_trash(),
             KeyInput::Char('M') => self.show_messages(),
             KeyInput::Char('/') => {
                 self.mode = Mode::Filter {
@@ -348,7 +370,9 @@ impl App {
     fn handle_confirm_key(&mut self, key: KeyInput) -> Effect {
         match key {
             KeyInput::Char('y') | KeyInput::Char('Y') | KeyInput::Enter => self.perform_pending(),
-            KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Esc => {
+            // `q` cancels here, as it does in the reader and the folder
+            // picker: the back-out key never means "go ahead".
+            KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Char('q') | KeyInput::Esc => {
                 let description = self
                     .pending
                     .take()
@@ -359,7 +383,10 @@ impl App {
                 Effect::None
             }
             _ => {
-                self.push_msg(Level::Info, "press y to confirm or n to cancel".to_string());
+                self.push_msg(
+                    Level::Info,
+                    "press y to confirm, or n / q / Esc to cancel".to_string(),
+                );
                 Effect::None
             }
         }
@@ -706,6 +733,7 @@ impl App {
                 destination: Some(destination),
             } => self.cmd_move(&destination),
             Command::Rename { name } => self.cmd_rename(&name),
+            Command::Trash => self.cmd_trash(),
             Command::Open => self.cmd_open(),
             Command::Edit => self.cmd_edit(),
             Command::Preview => self.cmd_preview(),
@@ -887,6 +915,55 @@ impl App {
         Effect::None
     }
 
+    /// `:delete` / `:trash` / `d` - arm a recoverable move to the system
+    /// Trash. Nothing leaves the directory until the prompt is answered
+    /// with `y`.
+    fn cmd_trash(&mut self) -> Effect {
+        let (name, src) = match self.selected_operand() {
+            Ok(v) => v,
+            Err(e) => return self.err(format!("delete: {e}")),
+        };
+        if let Err(e) = trash::check_trashable(&src) {
+            return self.err(format!("delete: {e}"));
+        }
+        if let Err(e) = std::fs::symlink_metadata(&src) {
+            return self.err(format!("delete: {}", fsops::io_error(&src, &e)));
+        }
+        let op = PendingOp::Trash { src, name };
+        self.push_msg(Level::Info, format!("confirm: {} (y/n)", op.describe()));
+        self.pending = Some(op);
+        self.mode = Mode::ConfirmOp;
+        Effect::None
+    }
+
+    /// Run the armed trash, then re-read the listing. Split out of
+    /// [`App::perform_pending`] because it is the one confirmed operation
+    /// that is not a rename underneath.
+    fn perform_trash(&mut self, src: &Path, name: &str) -> Effect {
+        // Re-checked at the moment of execution, not only when armed:
+        // between the two the listing may have been refreshed.
+        if let Err(e) = trash::check_trashable(src) {
+            return self.err(format!("delete: {e}"));
+        }
+        match self.trasher.trash(src) {
+            Ok(()) => {
+                let where_to = self.trasher.destination();
+                self.push_msg(
+                    Level::Ok,
+                    format!("trashed '{name}' -> {where_to} (recoverable in Finder)"),
+                );
+                if let Err(e) = self.nav.refresh() {
+                    return self.err(e.to_string());
+                }
+                Effect::None
+            }
+            Err(e) => {
+                let _ = self.nav.refresh();
+                self.err(format!("delete: {e}"))
+            }
+        }
+    }
+
     fn perform_pending(&mut self) -> Effect {
         self.mode = Mode::Browse;
         let Some(op) = self.pending.take() else {
@@ -895,6 +972,10 @@ impl App {
         let (src, dst, verb) = match &op {
             PendingOp::Move { src, dst } => (src.clone(), dst.clone(), "moved"),
             PendingOp::Rename { src, dst } => (src.clone(), dst.clone(), "renamed"),
+            PendingOp::Trash { src, name } => {
+                let (src, name) = (src.clone(), name.clone());
+                return self.perform_trash(&src, &name);
+            }
         };
         match fsops::safe_move(&src, &dst) {
             Ok(()) => {
@@ -1030,6 +1111,7 @@ pub fn help_lines() -> Vec<String> {
         "  l, Right             enter directory, or read the selected file",
         "  h, Left, Backspace   go to parent directory",
         "  0-9                  jump to that ancestor on the ladder",
+        "  d                    move selected entry to the Trash (asks y/n)",
         "  /                    filter the listing (Esc clears)",
         "  :                    command prompt",
         "  .                    show/hide dotfiles",
@@ -1048,6 +1130,10 @@ pub fn help_lines() -> Vec<String> {
         "  n / N                next / previous match",
         "  h, q, Esc            back to the listing, on the same row",
         "",
+        "KEYS (confirmation prompt)",
+        "  y, Enter             go ahead",
+        "  n, q, Esc            cancel - nothing is touched",
+        "",
         "KEYS (folder picker - :move with no path)",
         "  j / k, Down / Up     move focus",
         "  PgUp / PgDn          move focus a page",
@@ -1061,6 +1147,7 @@ pub fn help_lines() -> Vec<String> {
         "  cd [path]            change directory (~ ok; quote spaces)",
         "  move [destination]   folder picker, or a path (asks y/n first)",
         "  rename <new-name>    rename selected entry (asks y/n first)",
+        "  delete, trash        move selected entry to the Trash (asks y/n)",
         "  open                 open selected entry with macOS 'open'",
         "  edit                 edit selected file in $EDITOR (or nvim)",
         "  preview              read-only preview (nvim -R, or built-in)",
@@ -1071,7 +1158,8 @@ pub fn help_lines() -> Vec<String> {
         "SAFETY",
         "  - the reader is read-only: no key in it can change a file",
         "  - moves and renames never overwrite and always ask first",
-        "  - there is no delete command in v0",
+        "  - delete is a move to the Trash: recoverable, never an unlink",
+        "  - nothing is ever removed permanently, recursively or otherwise",
         "  - commands are parsed directly; nothing touches a shell",
         "  - everything stays on this machine: no network, no telemetry",
         "",
@@ -1097,6 +1185,19 @@ mod tests {
     fn app_in(tmp: &tempfile::TempDir) -> App {
         let nav = NavState::new(tmp.path()).unwrap();
         App::new(nav, None, false, None)
+    }
+
+    /// An app whose Trash is a directory under a fixture, so `delete`
+    /// runs for real without touching the user's `~/.Trash`.
+    fn app_with_can(tmp: &tempfile::TempDir, can: &tempfile::TempDir) -> App {
+        let mut app = app_in(tmp);
+        app.trasher = Box::new(trash::DirTrasher::new(can.path()));
+        app
+    }
+
+    /// What is in a fixture Trash right now.
+    fn can_contents(can: &tempfile::TempDir) -> Vec<String> {
+        trash::DirTrasher::new(can.path()).contents()
     }
 
     fn select(app: &mut App, name: &str) {
@@ -1499,6 +1600,229 @@ mod tests {
     }
 
     #[test]
+    fn delete_asks_before_it_trashes_and_y_moves_the_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "keep me").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "notes.md");
+
+        app.execute_line("delete");
+        assert_eq!(app.mode, Mode::ConfirmOp);
+        assert!(tmp.path().join("notes.md").exists(), "armed is not done");
+        assert_eq!(
+            app.pending.as_ref().unwrap().describe(),
+            "trash 'notes.md'",
+            "the prompt names the entry the listing names"
+        );
+
+        app.handle_key(KeyInput::Char('y'));
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.pending.is_none());
+        assert!(!tmp.path().join("notes.md").exists(), "entry must be gone");
+        assert_eq!(can_contents(&can), vec!["notes.md".to_string()]);
+        assert_eq!(
+            fs::read_to_string(can.path().join("notes.md")).unwrap(),
+            "keep me",
+            "trashing is a move: the bytes must survive"
+        );
+        assert_eq!(last_msg(&app).level, Level::Ok);
+        assert!(
+            last_msg(&app).text.contains("recoverable"),
+            "{:?}",
+            last_msg(&app)
+        );
+    }
+
+    #[test]
+    fn trash_is_the_same_command_under_another_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "a.txt");
+
+        app.execute_line("trash");
+        assert_eq!(app.pending.as_ref().unwrap().describe(), "trash 'a.txt'");
+    }
+
+    #[test]
+    fn d_arms_the_same_prompt_the_command_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "a.txt");
+
+        app.handle_key(KeyInput::Char('d'));
+        assert_eq!(app.mode, Mode::ConfirmOp);
+        assert_eq!(app.pending.as_ref().unwrap().describe(), "trash 'a.txt'");
+        assert!(
+            tmp.path().join("a.txt").exists(),
+            "d alone must touch nothing"
+        );
+        assert!(can_contents(&can).is_empty());
+    }
+
+    #[test]
+    fn every_cancel_key_leaves_the_entry_exactly_where_it_was() {
+        for key in [
+            KeyInput::Char('n'),
+            KeyInput::Char('N'),
+            KeyInput::Char('q'),
+            KeyInput::Esc,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let can = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("a.txt"), "a").unwrap();
+            let before = snapshot(tmp.path());
+            let mut app = app_with_can(&tmp, &can);
+            select(&mut app, "a.txt");
+
+            app.handle_key(KeyInput::Char('d'));
+            assert_eq!(app.mode, Mode::ConfirmOp, "{key:?}");
+            app.handle_key(key);
+
+            assert_eq!(app.mode, Mode::Browse, "{key:?} left the prompt up");
+            assert!(app.pending.is_none(), "{key:?}");
+            assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
+            assert!(can_contents(&can).is_empty(), "{key:?} trashed the entry");
+            assert!(last_msg(&app).text.starts_with("cancelled:"), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_key_at_the_delete_prompt_neither_trashes_nor_cancels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "a.txt");
+        app.handle_key(KeyInput::Char('d'));
+
+        app.handle_key(KeyInput::Char('x'));
+        assert_eq!(app.mode, Mode::ConfirmOp);
+        assert!(app.pending.is_some());
+        assert!(tmp.path().join("a.txt").exists());
+        assert!(can_contents(&can).is_empty());
+    }
+
+    #[test]
+    fn delete_refuses_the_parent_row_in_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/inner.txt"), "inner").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        let sub = app.nav.cwd.join("sub");
+        app.nav.change_dir(sub, None).unwrap();
+        let before = snapshot(tmp.path());
+
+        for open_it in ["delete", "trash"] {
+            select(&mut app, "..");
+            app.execute_line(open_it);
+            assert_eq!(last_msg(&app).level, Level::Error, "{open_it}");
+            assert!(last_msg(&app).text.contains("'..'"), "{:?}", last_msg(&app));
+            assert_eq!(app.mode, Mode::Browse, "{open_it} armed a prompt on '..'");
+            assert!(app.pending.is_none(), "{open_it}");
+        }
+
+        // And the key, which never reaches the command parser.
+        select(&mut app, "..");
+        app.handle_key(KeyInput::Char('d'));
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(app.pending.is_none());
+
+        assert_eq!(snapshot(tmp.path()), before);
+        assert!(can_contents(&can).is_empty());
+    }
+
+    #[test]
+    fn delete_trashes_a_directory_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/inner.txt"), "inner").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "sub");
+
+        app.handle_key(KeyInput::Char('d'));
+        app.handle_key(KeyInput::Char('y'));
+
+        assert!(!tmp.path().join("sub").exists());
+        assert_eq!(
+            fs::read_to_string(can.path().join("sub/inner.txt")).unwrap(),
+            "inner",
+            "a trashed directory keeps its contents - this is a move, not a walk"
+        );
+    }
+
+    #[test]
+    fn delete_reports_an_entry_that_vanished_before_confirmation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "a.txt");
+        app.handle_key(KeyInput::Char('d'));
+
+        // Something else removed it while the prompt was up.
+        fs::rename(tmp.path().join("a.txt"), can.path().join("a.txt")).unwrap();
+        app.handle_key(KeyInput::Char('y'));
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(
+            last_msg(&app).text.starts_with("delete: "),
+            "{:?}",
+            last_msg(&app)
+        );
+    }
+
+    #[test]
+    fn delete_on_an_empty_listing_says_so_instead_of_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        let mut app = app_with_can(&tmp, &can);
+
+        app.handle_key(KeyInput::Char('d'));
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn the_selection_lands_on_a_real_row_after_the_last_entry_is_trashed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "b.txt");
+
+        app.handle_key(KeyInput::Char('d'));
+        app.handle_key(KeyInput::Char('y'));
+
+        let selected = app.nav.selected().expect("a row must still be focused");
+        assert_eq!(selected.name, "a.txt");
+    }
+
+    #[test]
+    fn the_help_documents_delete_everywhere_it_is_bound() {
+        let help = help_lines().join("\n");
+        assert!(help.contains("  d  "), "the browse key is missing:\n{help}");
+        assert!(help.contains("delete, trash"), "the commands are missing");
+        assert!(
+            help.contains("Trash"),
+            "the help must say where a deleted entry goes"
+        );
+        assert!(
+            help.contains("n, q, Esc"),
+            "the confirmation's cancel keys are missing"
+        );
+    }
+
+    #[test]
     fn confirm_ignores_other_keys() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a.txt"), "a").unwrap();
@@ -1604,7 +1928,9 @@ mod tests {
         app.nav.change_dir(sub, None).unwrap();
         select(&mut app, "..");
 
-        for line in ["move", "move x", "rename x", "edit", "preview", "open"] {
+        for line in [
+            "move", "move x", "rename x", "edit", "preview", "open", "delete", "trash",
+        ] {
             app.execute_line(line);
             assert_eq!(last_msg(&app).level, Level::Error, "'{line}' on '..'");
             assert!(last_msg(&app).text.contains("'..'"));
@@ -2256,12 +2582,15 @@ mod tests {
     #[test]
     fn no_browse_key_ever_mutates_the_filesystem() {
         // Grammar rule: motion never mutates, and mutation is always
-        // select -> `:` command -> `y`. This is the mechanical enforcement.
+        // select -> arm -> `y`. `d` is the one browse key allowed to
+        // arm; arming still changes nothing. This is the mechanical
+        // enforcement of both halves.
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::write(tmp.path().join("sub/inner.txt"), "inner").unwrap();
         fs::write(tmp.path().join("a.txt"), "a").unwrap();
         fs::write(tmp.path().join(".dot"), "d").unwrap();
+        let can = tempfile::tempdir().unwrap();
 
         let before = snapshot(tmp.path());
         let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
@@ -2279,9 +2608,10 @@ mod tests {
             KeyInput::End,
         ]);
         for key in keys {
-            let mut app = app_in(&tmp);
+            let mut app = app_with_can(&tmp, &can);
             for row in 0..app.nav.visible().len() {
                 app.nav.cursor = row;
+                app.pending = None;
                 if !matches!(app.mode, Mode::Browse) {
                     app.mode = Mode::Browse;
                 }
@@ -2290,9 +2620,16 @@ mod tests {
                     !matches!(effect, Effect::SpawnDetached { .. }),
                     "{key:?} spawned a process from browse mode"
                 );
-                assert!(app.pending.is_none(), "{key:?} armed an operation");
+                assert!(
+                    app.pending.is_none() || key == KeyInput::Char('d'),
+                    "{key:?} armed an operation"
+                );
             }
             assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
+            assert!(
+                can_contents(&can).is_empty(),
+                "{key:?} trashed something without a confirmation"
+            );
         }
     }
 

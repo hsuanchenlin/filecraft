@@ -712,7 +712,7 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             "try: help, cd, move, rename, preview",
         ],
         Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
-        Mode::ConfirmOp => &["y confirm", "n cancel", "nothing happens without y"],
+        Mode::ConfirmOp => &["y confirm", "n/q/Esc cancel", "nothing happens without y"],
         Mode::FolderPicker(_) => &[
             "j/k focus",
             "l in",
@@ -1184,6 +1184,28 @@ mod tests {
         }
         let screen = render(&app);
         assert!(screen.contains("cmd> move dst"));
+    }
+
+    #[test]
+    fn the_delete_prompt_names_the_entry_and_the_two_answers() {
+        let (tmp, mut app) = fixture_app();
+        let visible = app.nav.visible();
+        let pos = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == "readme.md")
+            .unwrap();
+        app.nav.cursor = pos;
+        app.execute_line("delete");
+        let screen = render(&app);
+        assert!(
+            screen.contains("confirm [y]es / [n]o  trash 'readme.md'"),
+            "the confirmation must read as one sentence:\n{screen}"
+        );
+        assert!(
+            screen.contains("nothing happens without y"),
+            "the hint row must say what inaction does:\n{screen}"
+        );
+        drop(tmp);
     }
 
     #[test]

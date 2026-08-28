@@ -47,14 +47,26 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   writes reaches the reader through `markdown::DocLine::body`/`meta`,
   which is where tabs and control characters are cleaned - every column
   budget downstream assumes that has already happened.
-- v0 has no delete command. Do not add recursive (or any) deletion without an explicit product decision.
+- Removal is `src/trash.rs` and only that: `d` / `:delete` / `:trash`
+  move the selected entry into the macOS Trash through `NSFileManager`
+  behind the `Trasher` seam, so the confirmation flow is tested against a
+  fixture directory, never the real `~/.Trash`. Unrecoverable deletion
+  stays forbidden - no `remove_file`, `remove_dir`, `remove_dir_all`, or
+  `unlink` in shipped code, and `filecraft_never_calls_a_permanent_removal`
+  in `src/trash.rs` scans the source for exactly that. `rm`/`del`/`rmdir`
+  stay unknown commands on purpose. Widening removal past move-to-Trash
+  needs an explicit product decision.
 - One operating locus: the listing. Chrome above it is read-only and must
   never become a second selectable/operable pane - that ambiguity is what
   the confirmation flow's safety argument rests on.
-- Every browse key must stay read-only; `no_browse_key_ever_mutates_the_filesystem`
-  in `src/app.rs` enforces it mechanically. `?` help, the README keyboard
-  table, and `help_lines()` ship in the same change as any key change -
-  the reader's and folder picker's keys included.
+- Every browse key must stay read-only, and `d` is the one that is
+  allowed to *arm* an operation without performing it;
+  `no_browse_key_ever_mutates_the_filesystem` in `src/app.rs` enforces
+  both halves mechanically - the tree is unchanged after every key, the
+  fixture Trash stays empty, and only `d` may leave `pending` set. `?`
+  help, the README keyboard table, and `help_lines()` ship in the same
+  change as any key change - the reader's, folder picker's, and
+  confirmation prompt's keys included.
 - `agent` is a disabled seam (`src/agent.rs`, contract in `docs/agent-seam.md`). Do not invoke an LLM, scan a tree for an agent, or enable autonomous changes.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
