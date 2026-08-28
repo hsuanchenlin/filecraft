@@ -24,6 +24,17 @@ fn help_prints_usage_and_exits_zero() {
     assert!(stdout.contains("filecraft"));
     assert!(stdout.contains("--list"));
     assert!(stdout.contains("real TTY"));
+    assert!(stdout.contains("update [--check]"));
+}
+
+#[test]
+fn update_help_prints_update_usage() {
+    let output = output_with_piped_stdio(bin().arg("update").arg("--help"));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("filecraft update"));
+    assert!(stdout.contains("--check"));
+    assert!(stdout.contains("cargo install --git"));
 }
 
 #[test]
@@ -40,6 +51,22 @@ fn unknown_option_exits_two() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown option"));
+}
+
+#[test]
+fn update_unknown_option_exits_two() {
+    let output = output_with_piped_stdio(bin().arg("update").arg("--not-a-flag"));
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown option"));
+}
+
+#[test]
+fn update_extra_argument_exits_two() {
+    let output = output_with_piped_stdio(bin().arg("update").arg("extra"));
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unexpected argument"));
 }
 
 #[test]

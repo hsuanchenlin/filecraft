@@ -20,10 +20,12 @@
 //! - [`agent`] is the disabled-by-default future AI-agent seam.
 //! - [`app`] is the state machine: keys in, [`app::Effect`]s out.
 //! - [`cli`] parses argv for the binary.
+//! - [`update`] is `filecraft update` / `filecraft update --check`.
 //! - [`ui`] renders the ratatui screen; `main.rs` owns the event loop.
 //!
 //! Everything above `ui` is free of terminal I/O so behavior is testable
-//! without a TTY.
+//! without a TTY. [`update`] talks to `git`/`cargo`/`curl` through a
+//! [`update::Host`] seam so those paths are tested without the network.
 
 pub mod agent;
 pub mod app;
@@ -38,3 +40,4 @@ pub mod pager;
 pub mod picker;
 pub mod preview;
 pub mod ui;
+pub mod update;
