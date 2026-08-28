@@ -7,7 +7,8 @@
 //! - moves and renames never overwrite an existing entry (the only
 //!   exception is a pure case-change of the same file on a
 //!   case-insensitive filesystem);
-//! - there is no delete operation of any kind in v0;
+//! - nothing here unlinks or removes anything. Removal is
+//!   move-to-Trash, and it lives in [`crate::trash`];
 //! - cross-volume moves are refused rather than emulated with
 //!   copy+delete.
 
@@ -23,9 +24,23 @@ pub enum FsError {
     PermissionDenied(PathBuf),
     AlreadyExists(PathBuf),
     CrossDevice,
-    InvalidName { name: String, reason: &'static str },
+    InvalidName {
+        name: String,
+        reason: &'static str,
+    },
+    /// The operation is refused on this path as a matter of policy, not
+    /// because the filesystem said no.
+    Refused {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    /// The operation has no implementation on this platform.
+    Unsupported(&'static str),
     HomeNotFound,
-    Io { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for FsError {
@@ -52,6 +67,10 @@ impl std::fmt::Display for FsError {
             FsError::InvalidName { name, reason } => {
                 write!(f, "invalid name '{name}': {reason}")
             }
+            FsError::Refused { path, reason } => {
+                write!(f, "refused {}: {reason}", path.display())
+            }
+            FsError::Unsupported(what) => write!(f, "{what}"),
             FsError::HomeNotFound => {
                 write!(f, "cannot expand '~': home directory unknown")
             }

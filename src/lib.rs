@@ -7,6 +7,8 @@
 //!   speakable status, relative time) from state already in memory.
 //! - [`command`] parses BBS command lines (never shell-evaluated).
 //! - [`fsops`] canonicalizes/validates paths and performs safe move/rename.
+//! - [`trash`] is the only removal Filecraft has: a recoverable move into
+//!   the system Trash, behind a seam so the flow is testable.
 //! - [`nav`] models directory listings and cursor/filter state.
 //! - [`editor`] constructs editor/preview invocations (`$EDITOR`, `nvim`).
 //! - [`preview`] builds the built-in metadata/text preview and reads
@@ -39,5 +41,6 @@ pub mod nav;
 pub mod pager;
 pub mod picker;
 pub mod preview;
+pub mod trash;
 pub mod ui;
 pub mod update;

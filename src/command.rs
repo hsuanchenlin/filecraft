@@ -15,6 +15,9 @@ pub enum Command {
     Move { destination: Option<String> },
     /// `rename <name>` - rename the selected entry (asks for confirmation).
     Rename { name: String },
+    /// `delete` / `trash` - move the selected entry to the system Trash
+    /// (asks for confirmation). Never an unrecoverable removal.
+    Trash,
     /// `open` - open the selected entry with macOS `open`.
     Open,
     /// `edit` - edit the selected file in `$EDITOR` (fallback: `nvim`).
@@ -172,7 +175,7 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
                 destination: Some(destination.clone()),
             }),
             _ => Err(ParseError::Usage {
-                command: "move",
+                command: typed(&head_lower, &["move", "mv"]),
                 usage: "[destination]   (no path opens the folder picker; quote spaces)",
             }),
         },
@@ -183,16 +186,41 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
                 usage: "<new-name>   (renames the selected entry; quote spaces)",
             }),
         },
+        // Both names mean the same recoverable move-to-Trash. `rm`,
+        // `del`, and `rmdir` stay unknown on purpose: they promise POSIX
+        // removal, and Filecraft never removes anything.
+        "delete" | "trash" => no_args(
+            args,
+            Command::Trash,
+            typed(&head_lower, &["delete", "trash"]),
+            "  (moves the selected entry to the Trash; there is no path form)",
+        ),
         "open" => no_args(args, Command::Open, "open", ""),
         "edit" => no_args(args, Command::Edit, "edit", ""),
         "preview" => no_args(args, Command::Preview, "preview", ""),
-        "help" | "?" => no_args(args, Command::Help, "help", ""),
-        "quit" | "q" | "exit" => no_args(args, Command::Quit, "quit", ""),
+        "help" | "?" => no_args(args, Command::Help, typed(&head_lower, &["help", "?"]), ""),
+        "quit" | "q" | "exit" => no_args(
+            args,
+            Command::Quit,
+            typed(&head_lower, &["quit", "q", "exit"]),
+            "",
+        ),
         "agent" => Ok(Command::Agent {
             args: args.to_vec(),
         }),
         _ => Err(ParseError::Unknown(head.clone())),
     }
+}
+
+/// The spelling the user actually typed, so a usage line never names a
+/// command they did not type. Falls back to the canonical name, which is
+/// the first alias.
+fn typed(head: &str, aliases: &[&'static str]) -> &'static str {
+    aliases
+        .iter()
+        .copied()
+        .find(|alias| *alias == head)
+        .unwrap_or(aliases[0])
 }
 
 fn no_args(
@@ -286,7 +314,10 @@ mod tests {
 
     #[test]
     fn parse_unknown_command() {
-        assert_eq!(parse("delete x"), Err(ParseError::Unknown("delete".into())));
+        assert_eq!(
+            parse("frobnicate x"),
+            Err(ParseError::Unknown("frobnicate".into()))
+        );
     }
 
     #[test]
@@ -378,13 +409,58 @@ mod tests {
     }
 
     #[test]
-    fn no_recursive_delete_exists() {
-        // v0 must not ship any deletion. Guard against regression: the words
-        // are not commands.
-        for word in ["rm", "delete", "del", "rmdir", "trash"] {
+    fn parse_trash_aliases() {
+        assert_eq!(parse("delete").unwrap(), Command::Trash);
+        assert_eq!(parse("trash").unwrap(), Command::Trash);
+        assert_eq!(parse("DELETE").unwrap(), Command::Trash);
+    }
+
+    #[test]
+    fn parse_trash_takes_no_argument() {
+        // `delete` acts on the *selected* entry; a path argument would
+        // read like `rm <path>` and mean something Filecraft never does.
+        assert!(matches!(
+            parse("delete a.txt"),
+            Err(ParseError::Usage {
+                command: "delete",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("trash a.txt"),
+            Err(ParseError::Usage {
+                command: "trash",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_usage_line_names_the_alias_the_user_typed() {
+        for (line, expected) in [
+            ("delete a.txt", "usage: delete"),
+            ("trash a.txt", "usage: trash"),
+            ("move a b", "usage: move"),
+            ("mv a b", "usage: mv"),
+            ("q now", "usage: q"),
+        ] {
+            let err = parse(line).unwrap_err();
+            assert!(
+                err.to_string().starts_with(expected),
+                "'{line}' reported '{err}', which names a command nobody typed"
+            );
+        }
+    }
+
+    #[test]
+    fn no_permanent_delete_command_exists() {
+        // Removal is move-to-Trash and nothing else. The POSIX removal
+        // words stay unknown so no one can type one and be surprised
+        // either way - by a deletion, or by a trash they meant as a rm.
+        for word in ["rm", "del", "rmdir", "unlink", "shred"] {
             assert!(
                 matches!(parse(word), Err(ParseError::Unknown(_))),
-                "'{word}' must not parse as a command in v0"
+                "'{word}' must not parse as a command"
             );
         }
     }

@@ -11,7 +11,7 @@ iCloud, or default file handling.
 
 ## Install
 
-Requires a Rust toolchain (1.83 or newer) and a UTF-8 macOS terminal.
+Requires a Rust toolchain (1.85 or newer) and a UTF-8 macOS terminal.
 
 From source:
 
@@ -66,7 +66,10 @@ reported and do not crash.
 
 - **OS:** macOS first. The interactive navigator, `cd`/`move`/`rename`,
   `edit`, and `preview` are local-filesystem only and also run on other
-  Unix systems. The `open` command uses `/usr/bin/open` and is macOS-only.
+  Unix systems. The `open` command uses `/usr/bin/open` and is macOS-only,
+  and so is `delete`, which moves the entry to the macOS Trash through
+  `NSFileManager`. On other platforms `delete` reports that and does
+  nothing.
 - **Terminal:** Terminal.app, iTerm2, Ghostty, kitty, WezTerm, or
   Alacritty. Needs a real TTY, UTF-8 locale, and at least 80x24 cells.
   Color uses the terminal's ANSI palette. Set `NO_COLOR` to any non-empty
@@ -107,6 +110,7 @@ In browse mode:
 | `l`, Right | enter the selected directory, or read the selected file |
 | `h`, Left, Backspace | parent directory |
 | `0`-`9` | jump to that ancestor on the ladder |
+| `d` | move the selected entry to the Trash (asks `y/n`) |
 | `/` | filter the listing (Esc clears) |
 | `:` | command prompt |
 | `.` | show/hide dotfiles |
@@ -119,9 +123,12 @@ In browse mode:
 Files are never opened automatically. Enter on a file, or the `edit`
 command, is the only way into an editor.
 
-Every navigation and orientation key is read-only. Filesystem commands
-still go through select -> `:` command -> `y`; opening a file in the
-configured editor remains the explicit path for editing file contents.
+Every navigation and orientation key is read-only. `d` is the only browse
+key that can lead to a filesystem change, and it changes nothing by
+itself: it raises the same `y/n` prompt `:delete` does, and only `y`
+moves anything. Every other filesystem operation goes through select ->
+`:` command -> `y`; opening a file in the configured editor remains the
+explicit path for editing file contents.
 
 **Changed in this slice:** `l` on a text or Markdown file now opens the
 built-in reader (below) instead of refusing. On a directory it still
@@ -226,6 +233,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `cd [path]` | change directory (`~` is home; no argument also goes home) |
 | `move [destination]` | move the selected entry (asks `y/n`, never overwrites). No path opens a folder picker; a typed path still goes straight to confirm |
 | `rename <new-name>` | rename the selected entry (asks `y/n`, never overwrites) |
+| `delete`, `trash` | move the selected entry to the macOS Trash (asks `y/n`; recoverable) |
 | `open` | hand the selected entry to macOS `open` |
 | `edit` | edit the selected regular file in `$EDITOR` or `nvim` |
 | `preview` | read-only preview (Neovim if available, else built-in) |
@@ -233,12 +241,43 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `help` | help screen |
 | `quit` | leave Filecraft |
 
-There is no delete command in v0, recursive or otherwise.
+Move, rename, and delete always show what they are about to do and
+require an explicit `y`; Enter also answers a move or a rename, but never
+a delete. `n`, `q`, or Esc cancels and nothing is touched. Permission
+errors, missing files, broken symlinks, unreadable directories, spaces,
+and Unicode names are reported in the message log and do not abort the
+session.
 
-Move and rename always show the canonical target and require an explicit
-`y` (or Enter). `n` or Esc cancels. Permission errors, missing files,
-broken symlinks, unreadable directories, spaces, and Unicode names are
-reported in the message log and do not abort the session.
+## Deleting
+
+`d`, `:delete`, and `:trash` are the same operation: the selected entry
+is **moved to the macOS Trash**, whole, to be recovered from there.
+Filecraft never unlinks a file and never removes a directory tree - there
+is no unrecoverable deletion anywhere in it, and a test asserts that
+mechanically over the source (`filecraft_never_calls_a_permanent_removal`).
+
+```
+ confirm [y]es / [n]o  trash 'notes.md'
+```
+
+- `y` moves it to the Trash and re-reads the listing. Enter does **not**:
+  `d` is a page-scroll in the reader and Enter activates a row in browse,
+  so a delete is answered with the letter and nothing else.
+- `n`, `q`, or Esc cancels; nothing is changed.
+- Any other key leaves the prompt up and says which keys answer it.
+- `../` is refused with an error before any prompt is raised - it names
+  the directory you are standing under, not an entry.
+- A directory goes to the Trash whole, contents intact. Filecraft does not
+  walk it, so there is nothing to half-finish.
+- The move goes through `NSFileManager`'s `trashItemAtURL:`, not Finder
+  scripting: it needs no Automation permission and cannot silently fail
+  for the want of one. Items trashed this way are not always offered
+  Finder's "Put Back"; the entry is intact in the Trash either way, and
+  dragging it out restores it.
+
+`rm`, `del`, and `rmdir` are deliberately **not** commands. They promise
+POSIX removal, and answering them with a trash would be as surprising as
+answering them with a deletion.
 
 ## Safety
 
@@ -249,12 +288,15 @@ reported in the message log and do not abort the session.
 - Commands are never evaluated by a shell.
 - Moves never overwrite an existing entry and never copy+delete across
   volumes.
+- Deletion is a move to the system Trash and is always recoverable. No
+  code path in the shipped binary calls `remove_file`, `remove_dir`, or
+  `remove_dir_all`.
 - The Filecraft screen is restored after the editor exits.
 
 ## Developer setup
 
 ```sh
-rustc --version   # 1.83+
+rustc --version   # 1.85+
 cargo test
 cargo run -- --list .
 cargo fmt
@@ -269,14 +311,17 @@ cargo build --release
 
 The library under `src/` is terminal-free and is the home for
 deterministic tests (navigation, parsing, path safety, confirmation,
-editor argv, agent boundary, bearings, reader, folder picker).
+editor argv, agent boundary, bearings, reader, folder picker,
+move-to-Trash).
 `src/bearings.rs` holds the pure orientation arithmetic - ladder, rail,
 scroll margin, relative time, speakable status - so all of it is tested
 without a TTY; `src/markdown.rs` holds the reader's line classification,
 inline emphasis, and width-aware wrapping, and `src/pager.rs` its
 scroll, search, and position. `src/picker.rs` holds the move folder
-picker's listing, cursor, and destination path. `src/update.rs` holds
-`filecraft update`. `src/ui.rs` adds
+picker's listing, cursor, and destination path. `src/trash.rs` holds the
+move-to-Trash operation behind a `Trasher` seam, so the confirmation flow
+is tested against a fixture directory instead of the real `~/.Trash`.
+`src/update.rs` holds `filecraft update`. `src/ui.rs` adds
 golden-frame tests at 80x24, 100x30, 132x40, and 60x20. `tests/cli.rs`
 drives the binary for `--help`/`--list`/`update`/non-TTY behavior.
 
