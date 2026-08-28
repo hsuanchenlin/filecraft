@@ -156,6 +156,12 @@ check_false "cargo env does not configure a custom install root" \
 printf '# export PATH="$HOME/.cargo/bin:$PATH"\n' > "$TMP/commented"
 check_false "a commented line does not count" \
     profile_has_dir "$TMP/commented" /home/tester/.cargo/bin
+printf 'export OTHER=value # export PATH="$HOME/.cargo/bin:$PATH"\n' > "$TMP/inline-comment"
+check_false "a PATH fragment in an inline comment does not count" \
+    profile_has_dir "$TMP/inline-comment" /home/tester/.cargo/bin
+printf 'export PATH="$HOME/.cargo/bin:$PATH" # Cargo binaries\n' > "$TMP/trailing-comment"
+check_true "a real export with a trailing comment counts" \
+    profile_has_dir "$TMP/trailing-comment" /home/tester/.cargo/bin
 
 # Appending is idempotent: the second run finds its own marker and stops.
 DRY_RUN=no
@@ -170,6 +176,18 @@ check_true "the block is marked so it can be found again" \
     grep -qF '# >>> filecraft install >>>' "$TMP/zshrc"
 check_true "and the appended block reads as configured" \
     profile_has_dir "$TMP/zshrc" /home/tester/.cargo/bin
+check_true "a changed install root replaces the block" \
+    add_to_profile "$TMP/zshrc" zsh /custom/root/bin
+check_true "the replacement contains the new PATH line" \
+    grep -qF 'export PATH="/custom/root/bin:$PATH"' "$TMP/zshrc"
+check_false "the replacement removes the old PATH line" \
+    grep -qF 'export PATH="$HOME/.cargo/bin:$PATH"' "$TMP/zshrc"
+check_eq "1" "$(grep -c 'export PATH=' "$TMP/zshrc")" "one replaced PATH line"
+check_eq "1" "$(grep -cF "$BEGIN_MARKER" "$TMP/zshrc")" "one begin marker"
+check_eq "1" "$(grep -cF "$END_MARKER" "$TMP/zshrc")" "one end marker"
+check_false "the replaced block remains idempotent" \
+    add_to_profile "$TMP/zshrc" zsh /custom/root/bin
+check_eq "1" "$(grep -c 'export PATH=' "$TMP/zshrc")" "one PATH line after rerun"
 
 # A missing fish config directory is created rather than failing.
 check_true "fish config is created" \
@@ -183,6 +201,13 @@ DRY_RUN=yes
 add_to_profile "$TMP/dry" zsh /home/tester/.cargo/bin > "$TMP/dry.out"
 check_eq "0" "$(wc -c < "$TMP/dry" | tr -d ' ')" "dry run wrote nothing"
 check_true "dry run said what it would do" grep -q 'would append' "$TMP/dry.out"
+cp "$TMP/zshrc" "$TMP/dry-replace"
+cp "$TMP/dry-replace" "$TMP/dry-replace.before"
+add_to_profile "$TMP/dry-replace" zsh /another/root/bin > "$TMP/dry-replace.out"
+check_true "replacement dry run writes nothing" \
+    cmp -s "$TMP/dry-replace.before" "$TMP/dry-replace"
+check_true "replacement dry run describes the replacement" \
+    grep -q 'would replace' "$TMP/dry-replace.out"
 DRY_RUN=no
 
 # --------------------------------------------------- the script as a whole

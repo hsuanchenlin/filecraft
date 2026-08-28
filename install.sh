@@ -165,10 +165,11 @@ profile_has_dir() {
     portable="$(portable_dir "$dir")"
     dir="$(normalize_dir "$dir")"
     stripped="${dir#"$(normalize_dir "$HOME")"/}"
-    local line
+    local line content
     while IFS= read -r line; do
-        case "${line%%#*}" in *[![:space:]]*) ;; *) continue ;; esac
-        case "$line" in
+        content="${line%%#*}"
+        case "$content" in *[![:space:]]*) ;; *) continue ;; esac
+        case "$content" in
             *"$dir"*|*"$portable"*|*"~/$stripped"*) return 0 ;;
             *cargo/env*)
                 [ "$dir" = "$(normalize_dir "$HOME/.cargo/bin")" ] && return 0
@@ -197,15 +198,49 @@ run() {
     "$@"
 }
 
-# Append the PATH line under markers, creating the file if needed. Two
-# runs leave one block: an existing block means there is nothing to do.
+# Add the PATH line under markers, creating the file if needed. Two runs
+# leave one block, and a changed install directory updates that block.
 add_to_profile() {
     local file="$1" kind="$2" dir="$3"
-    if [ -f "$file" ] && grep -qF "$BEGIN_MARKER" "$file"; then
-        return 1
-    fi
     local line
     line="$(export_line_for "$kind" "$dir")"
+    if [ -f "$file" ] && grep -qF "$BEGIN_MARKER" "$file"; then
+        if awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+            $0 == begin { inside = 1; next }
+            inside && $0 == end { complete = 1; exit found ? 0 : 1 }
+            inside && $0 == line { found = 1 }
+            END { if (!complete) exit 1 }
+        ' "$file"; then
+            return 1
+        fi
+        if [ "$DRY_RUN" = yes ]; then
+            note "would replace the filecraft block in $file with:"
+            note "    $line"
+            return 0
+        fi
+        local temp
+        temp="$(mktemp "${file}.filecraft.XXXXXX")" || return 1
+        cp -p -- "$file" "$temp" || { rm -f -- "$temp"; return 1; }
+        if ! awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+            $0 == begin {
+                if (!written) {
+                    print begin
+                    print line
+                    print end
+                    written = 1
+                }
+                inside = 1
+                next
+            }
+            inside && $0 == end { inside = 0; next }
+            !inside { print }
+        ' "$file" > "$temp"; then
+            rm -f -- "$temp"
+            return 1
+        fi
+        mv -- "$temp" "$file"
+        return 0
+    fi
     if [ "$DRY_RUN" = yes ]; then
         note "would append to $file:"
         note "    $line"
@@ -320,7 +355,7 @@ main() {
         if ask_yes "Add it now?"; then
             if add_to_profile "$profile" "$kind" "$bin_dir"; then
                 if [ "$DRY_RUN" = no ]; then
-                    good "added to $profile"
+                    good "updated $profile"
                     info "run: source $profile     (or just open a new terminal)"
                 fi
             else
