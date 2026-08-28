@@ -22,6 +22,8 @@
 //! - [`agent`] is the disabled-by-default future AI-agent seam.
 //! - [`app`] is the state machine: keys in, [`app::Effect`]s out.
 //! - [`cli`] parses argv for the binary.
+//! - [`pathcheck`] decides whether a shell can find the binary at all,
+//!   and what to add to which startup file when it cannot.
 //! - [`update`] is `filecraft update` / `filecraft update --check`.
 //! - [`ui`] renders the ratatui screen; `main.rs` owns the event loop.
 //!
@@ -39,6 +41,7 @@ pub mod fsops;
 pub mod markdown;
 pub mod nav;
 pub mod pager;
+pub mod pathcheck;
 pub mod picker;
 pub mod preview;
 pub mod trash;

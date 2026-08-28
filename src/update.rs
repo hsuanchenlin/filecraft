@@ -7,6 +7,12 @@
 //! installing. Nothing here panics on I/O: missing `cargo`, network
 //! failures, and permission errors become [`UpdateError`]s.
 //!
+//! Every report also carries a `PATH` self-check: an install that lands
+//! in `~/.cargo/bin` is useless if the shell never looks there, which is
+//! exactly how `zsh: command not found: filecraft` happens after a
+//! successful install. [`crate::pathcheck`] decides that; this module only
+//! supplies it the environment.
+//!
 //! [`Host`] is the seam tests inject so this module never needs a TTY
 //! or the network.
 
@@ -15,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::editor;
+use crate::pathcheck::{self, PathAdvice};
 
 /// Canonical source used for a global cargo git install.
 pub const GIT_URL: &str = "https://github.com/hsuanchenlin/filecraft.git";
@@ -52,6 +59,8 @@ pub struct UpdateReport {
     pub target_version: String,
     pub source: String,
     pub status: UpdateStatus,
+    /// Set when the shell cannot reach the binary this update installs.
+    pub path_advice: Option<PathAdvice>,
 }
 
 /// Whether an update was needed, available, or applied.
@@ -77,6 +86,10 @@ impl std::fmt::Display for UpdateReport {
             UpdateStatus::Updated => {
                 writeln!(f, "ok: updated to {}", self.target_version)
             }
+        }?;
+        match &self.path_advice {
+            Some(advice) => write!(f, "\n{advice}"),
+            None => Ok(()),
         }
     }
 }
@@ -120,8 +133,12 @@ impl std::error::Error for UpdateError {}
 /// Filesystem and process access used by [`run_with`].
 pub trait Host {
     fn current_exe(&self) -> Option<PathBuf>;
-    fn cargo_home(&self) -> Option<PathBuf>;
+    /// Where `cargo install` writes: `$CARGO_INSTALL_ROOT`, else
+    /// `$CARGO_HOME`, else `~/.cargo`. It holds `bin/` and `.crates.toml`.
+    fn install_root(&self) -> Option<PathBuf>;
     fn path_env(&self) -> Option<String>;
+    fn home(&self) -> Option<PathBuf>;
+    fn shell(&self) -> Option<String>;
     fn current_version(&self) -> &str;
     fn is_dir(&self, path: &Path) -> bool;
     fn is_file(&self, path: &Path) -> bool;
@@ -181,15 +198,25 @@ impl Host for RealHost {
         Some(exe.canonicalize().unwrap_or(exe))
     }
 
-    fn cargo_home(&self) -> Option<PathBuf> {
-        if let Some(home) = std::env::var_os("CARGO_HOME") {
-            return Some(PathBuf::from(home));
+    fn install_root(&self) -> Option<PathBuf> {
+        for key in ["CARGO_INSTALL_ROOT", "CARGO_HOME"] {
+            if let Some(root) = std::env::var_os(key) {
+                return Some(PathBuf::from(root));
+            }
         }
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo"))
     }
 
     fn path_env(&self) -> Option<String> {
         std::env::var("PATH").ok()
+    }
+
+    fn home(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    fn shell(&self) -> Option<String> {
+        std::env::var("SHELL").ok()
     }
 
     fn current_version(&self) -> &str {
@@ -276,11 +303,13 @@ pub fn run_with<H: Host>(check: bool, host: &H) -> Result<UpdateReport, UpdateEr
     let available = update_available(&current, &remote, local_commit.as_deref());
     let target_version = display_target(&remote);
 
+    let advice = path_advice(host);
     let report = |status: UpdateStatus| UpdateReport {
         current_version: display_current(&current, local_commit.as_deref()),
         target_version: target_version.clone(),
         source: kind.source_label(),
         status,
+        path_advice: advice.clone(),
     };
 
     if check {
@@ -305,7 +334,26 @@ pub fn run_with<H: Host>(check: bool, host: &H) -> Result<UpdateReport, UpdateEr
             .unwrap_or(target_version),
         source: kind.source_label(),
         status: UpdateStatus::Updated,
+        path_advice: advice,
     })
+}
+
+/// The `PATH` self-check every report carries: can a shell find the
+/// binary this update just installed, or the one it is running as?
+///
+/// A binary in a `target/` build tree is judged by `$CARGO_HOME/bin`,
+/// because that is where the install writes it.
+fn path_advice<H: Host>(host: &H) -> Option<PathAdvice> {
+    let exe = host.current_exe();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    let cargo_bin = host.install_root().map(|root| root.join("bin"));
+    pathcheck::advise(
+        exe_dir,
+        cargo_bin.as_deref(),
+        host.path_env().as_deref(),
+        host.home().as_deref(),
+        host.shell().as_deref(),
+    )
 }
 
 struct RemoteInfo {
@@ -623,8 +671,8 @@ fn detect_install<H: Host>(host: &H) -> InstallKind {
             return InstallKind::GitClone { root };
         }
     }
-    if let Some(home) = host.cargo_home() {
-        let crates = home.join(".crates.toml");
+    if let Some(root) = host.install_root() {
+        let crates = root.join(".crates.toml");
         if let Ok(text) = host.read_to_string(&crates) {
             if let Some(source) = parse_crates_filecraft(&text) {
                 match source {
@@ -838,8 +886,10 @@ mod tests {
     struct FakeHost {
         version: String,
         exe: Option<PathBuf>,
-        cargo_home: Option<PathBuf>,
+        install_root: Option<PathBuf>,
         path_env: Option<String>,
+        home: Option<PathBuf>,
+        shell: Option<String>,
         files: HashMap<PathBuf, String>,
         dirs: HashSet<PathBuf>,
         programs: HashSet<String>,
@@ -856,8 +906,10 @@ mod tests {
             Self {
                 version: "0.1.0".to_string(),
                 exe: Some(PathBuf::from("/cargo/bin/filecraft")),
-                cargo_home: Some(PathBuf::from("/cargo")),
+                install_root: Some(PathBuf::from("/cargo")),
                 path_env: Some("/cargo/bin".to_string()),
+                home: Some(PathBuf::from("/home/tester")),
+                shell: Some("/bin/zsh".to_string()),
                 files: HashMap::new(),
                 dirs: HashSet::new(),
                 programs: ["cargo", "git", "curl"]
@@ -900,11 +952,17 @@ mod tests {
         fn current_exe(&self) -> Option<PathBuf> {
             self.exe.clone()
         }
-        fn cargo_home(&self) -> Option<PathBuf> {
-            self.cargo_home.clone()
+        fn install_root(&self) -> Option<PathBuf> {
+            self.install_root.clone()
         }
         fn path_env(&self) -> Option<String> {
             self.path_env.clone()
+        }
+        fn home(&self) -> Option<PathBuf> {
+            self.home.clone()
+        }
+        fn shell(&self) -> Option<String> {
+            self.shell.clone()
         }
         fn current_version(&self) -> &str {
             &self.version
@@ -1271,6 +1329,51 @@ mod tests {
         assert!(matches!(err, UpdateError::Permission(_)));
     }
 
+    /// The reported bug, from the updater's side: the install succeeds
+    /// and the shell still cannot find the binary. Every report says so.
+    #[test]
+    fn a_report_warns_when_the_install_directory_is_not_on_path() {
+        let mut host = FakeHost::new();
+        host.path_env = Some("/opt/homebrew/bin:/usr/bin:/bin".to_string());
+
+        let report = run_with(true, &host).unwrap();
+        let advice = report
+            .path_advice
+            .as_ref()
+            .expect("cargo bin is not on PATH");
+        assert_eq!(advice.dir, PathBuf::from("/cargo/bin"));
+
+        let text = report.to_string();
+        assert!(text.contains("/cargo/bin is not on your PATH"), "{text}");
+        assert!(text.contains("~/.zshrc"), "{text}");
+        assert!(text.contains("./install.sh"), "{text}");
+    }
+
+    /// ...and stays quiet when it can, so the advice keeps its meaning.
+    #[test]
+    fn a_report_says_nothing_about_path_when_the_shell_can_find_the_binary() {
+        let report = run_with(true, &FakeHost::new()).unwrap();
+        assert_eq!(report.path_advice, None);
+        assert!(!report.to_string().contains("PATH"));
+    }
+
+    /// `cargo install` writes to CARGO_INSTALL_ROOT when it is set, so the
+    /// advice has to name that directory rather than CARGO_HOME's.
+    #[test]
+    fn the_install_root_is_the_directory_the_advice_talks_about() {
+        let mut host = FakeHost::new();
+        host.install_root = Some(PathBuf::from("/elsewhere"));
+        host.exe = Some(PathBuf::from("/work/filecraft/target/debug/filecraft"));
+        host.path_env = Some("/usr/bin".to_string());
+
+        let advice = run_with(true, &host)
+            .unwrap()
+            .path_advice
+            .expect("/elsewhere/bin is not on PATH");
+        assert_eq!(advice.dir, PathBuf::from("/elsewhere/bin"));
+        assert!(advice.from_build_tree);
+    }
+
     #[test]
     fn report_lists_current_and_target_versions() {
         let report = UpdateReport {
@@ -1278,6 +1381,7 @@ mod tests {
             target_version: "0.2.0".into(),
             source: "cargo install --git https://example".into(),
             status: UpdateStatus::Updated,
+            path_advice: None,
         };
         let text = report.to_string();
         assert!(text.contains("current version: 0.1.0"));
