@@ -42,6 +42,14 @@ check_false() {
     if "${@:2}"; then bad "$1: expected failure"; else ok; fi
 }
 
+file_mode() {
+    if stat -c '%a' "$1" >/dev/null 2>&1; then
+        stat -c '%a' "$1"
+    else
+        stat -f '%Lp' "$1"
+    fi
+}
+
 # ------------------------------------------------------- normalize_dir
 
 check_eq "/home/tester/.cargo/bin" "$(normalize_dir '~/.cargo/bin')" "tilde"
@@ -219,7 +227,7 @@ check_true "the symlink target receives the new line" \
 chmod 600 "$TMP/profile-target"
 check_true "a mode-preserving reconciliation succeeds" \
     add_to_profile "$TMP/profile-link" zsh /mode/root/bin
-check_eq "600" "$(stat -f '%Lp' "$TMP/profile-target")" "profile permissions are preserved"
+check_eq "600" "$(file_mode "$TMP/profile-target")" "profile permissions are preserved"
 check_eq "0" "$(find "$TMP" -maxdepth 1 -name 'profile-target.filecraft.*' | wc -l | tr -d ' ')" \
     "symlink replacement leaves no temporary file"
 
