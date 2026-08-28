@@ -7,13 +7,16 @@
 //!   in the product;
 //! - on macOS the move goes through `NSFileManager`'s
 //!   `trashItemAtURL:resultingItemURL:error:`, so the item lands in
-//!   `~/.Trash` (or the volume's `.Trashes`) and Finder can put it back.
-//!   The Finder-scripting route is deliberately not used: it needs an
-//!   Automation permission prompt and fails silently without one;
+//!   `~/.Trash` (or the volume's `.Trashes`) intact, to be recovered from
+//!   there. The Finder-scripting route is deliberately not used: it needs
+//!   an Automation permission prompt and fails silently without one.
+//!   Trashing this way does not always offer Finder's "Put Back" entry;
+//!   the entry itself is whole either way and can be dragged back out;
 //! - [`check_trashable`] refuses the paths that must never be trashable -
 //!   `..`, `.`, and the filesystem root - before any confirmation prompt
 //!   is raised, so the user is never asked to confirm something Filecraft
-//!   would then refuse.
+//!   would then refuse. [`Trasher::trash`] applies it again at the seam
+//!   itself, so no implementation and no future call site can skip it.
 //!
 //! The system Trash sits behind the [`Trasher`] seam for the same reason
 //! `update::Host` exists: every caller above it - the state machine, the
@@ -30,7 +33,19 @@ use crate::fsops::FsError;
 /// the trash, recoverably.
 pub trait Trasher {
     /// Move `path` to the trash. `path` must already exist.
-    fn trash(&self, path: &Path) -> Result<(), FsError>;
+    ///
+    /// The refusal lives here rather than only in the callers because the
+    /// destructive call lives below this line: a path whose last segment
+    /// is `..` names the directory the user is standing under, and the
+    /// system Trash would happily take it.
+    fn trash(&self, path: &Path) -> Result<(), FsError> {
+        check_trashable(path)?;
+        self.trash_guarded(path)
+    }
+
+    /// Move `path` to the trash. Implemented instead of [`Trasher::trash`]:
+    /// `path` has already passed [`check_trashable`].
+    fn trash_guarded(&self, path: &Path) -> Result<(), FsError>;
 
     /// Where trashed entries land, in words, for messages and help.
     fn destination(&self) -> &str;
@@ -47,7 +62,7 @@ pub fn system() -> Box<dyn Trasher> {
 
 impl Trasher for SystemTrasher {
     #[cfg(target_os = "macos")]
-    fn trash(&self, path: &Path) -> Result<(), FsError> {
+    fn trash_guarded(&self, path: &Path) -> Result<(), FsError> {
         use ::trash::macos::{DeleteMethod, TrashContextExtMacos};
 
         let mut context = ::trash::TrashContext::default();
@@ -56,7 +71,7 @@ impl Trasher for SystemTrasher {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn trash(&self, _path: &Path) -> Result<(), FsError> {
+    fn trash_guarded(&self, _path: &Path) -> Result<(), FsError> {
         Err(FsError::Unsupported(
             "moving to the Trash is only supported on macOS",
         ))
@@ -160,7 +175,7 @@ impl DirTrasher {
 
 #[cfg(test)]
 impl Trasher for DirTrasher {
-    fn trash(&self, path: &Path) -> Result<(), FsError> {
+    fn trash_guarded(&self, path: &Path) -> Result<(), FsError> {
         let name = path.file_name().ok_or_else(|| FsError::Refused {
             path: path.to_path_buf(),
             reason: "the filesystem root cannot be trashed",
@@ -276,6 +291,25 @@ mod tests {
     }
 
     #[test]
+    fn the_seam_refuses_the_parent_row_before_any_implementation_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.txt"), "inner").unwrap();
+
+        let trasher = DirTrasher::new(can.path());
+        let err = trasher.trash(&sub.join("..")).unwrap_err();
+
+        assert!(matches!(err, FsError::Refused { .. }), "{err:?}");
+        assert!(sub.exists(), "the directory being stood in must survive");
+        assert!(
+            trasher.contents().is_empty(),
+            "nothing may reach the can through a '..' path"
+        );
+    }
+
+    #[test]
     fn dir_trasher_reports_a_missing_entry_instead_of_succeeding() {
         let can = tempfile::tempdir().unwrap();
         let trasher = DirTrasher::new(can.path());
@@ -285,29 +319,81 @@ mod tests {
         assert!(matches!(err, FsError::NotFound(_)), "{err:?}");
     }
 
-    /// The product half of every source file, with its `mod tests` cut
-    /// off. Guard tests below assert about what Filecraft *ships*, not
-    /// about what its fixtures do.
+    /// The product half of every `.rs` file under `root`, at any depth,
+    /// with its `mod tests` cut off. Guard tests below assert about what
+    /// Filecraft *ships*, not about what its fixtures do.
+    ///
+    /// The walk descends because a module can become a directory: a guard
+    /// that only reads the top level would be outgrown silently by the
+    /// first `src/thing/mod.rs`.
+    fn product_source_under(root: &Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).unwrap();
+                let shipped = match body.find("#[cfg(test)]\nmod tests {") {
+                    Some(cut) => body[..cut].to_string(),
+                    None => body,
+                };
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((name, shipped));
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn shipped_source() -> Vec<(String, String)> {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&src).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let body = std::fs::read_to_string(&path).unwrap();
-            let shipped = match body.find("#[cfg(test)]\nmod tests {") {
-                Some(cut) => body[..cut].to_string(),
-                None => body,
-            };
-            out.push((
-                path.file_name().unwrap().to_string_lossy().into_owned(),
-                shipped,
-            ));
-        }
+        let out = product_source_under(&src);
         assert!(out.len() > 5, "expected to find the source tree");
+        assert!(
+            out.iter().any(|(name, _)| name == "trash.rs"),
+            "the scan missed this very file: {:?}",
+            out.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
         out
+    }
+
+    /// The guard above is only worth its assertions if the walk actually
+    /// reaches a module that lives in a subdirectory.
+    #[test]
+    fn the_source_scan_reads_nested_modules_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("top.rs"), "fn a() {}\n").unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        std::fs::write(
+            tmp.path().join("nested/deep.rs"),
+            "fn b() {}\n#[cfg(test)]\nmod tests {\n    fn c() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("notes.md"), "not source").unwrap();
+
+        let found = product_source_under(tmp.path());
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        let nested = format!("nested{}deep.rs", std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            names,
+            vec![nested.as_str(), "top.rs"],
+            "the walk must reach a module in a subdirectory, and read only .rs files"
+        );
+
+        let deep = found.iter().find(|(n, _)| n == &nested).unwrap();
+        assert!(deep.1.contains("fn b"), "the product half must survive");
+        assert!(!deep.1.contains("fn c"), "the test half must be cut off");
     }
 
     /// The invariant the whole feature rests on: there is no code path in
@@ -353,7 +439,13 @@ mod tests {
             return;
         }
 
-        let tmp = tempfile::tempdir().unwrap();
+        // On the home volume, not in $TMPDIR: macOS trashes to the trash
+        // of the volume the entry lives on, so a $TMPDIR on another disk
+        // would land the entry in that volume's `.Trashes` instead.
+        let tmp = tempfile::Builder::new()
+            .prefix("filecraft-trash-test-")
+            .tempdir_in(&home)
+            .unwrap();
         // Unique, so the landing name in ~/.Trash is not uniquified and a
         // concurrent run cannot collide with this one.
         let name = format!(

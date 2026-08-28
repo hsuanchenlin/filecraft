@@ -104,6 +104,18 @@ impl PendingOp {
             PendingOp::Trash { name, .. } => format!("trash '{name}'"),
         }
     }
+
+    /// Whether Enter may stand in for `y`.
+    ///
+    /// It may not for a trash: `d` in browse is a page-scroll in the
+    /// reader and Enter in browse activates the selection, so the two
+    /// keys are reachable in a row from muscle memory. An operation that
+    /// takes an entry out of its directory is answered with the letter
+    /// and nothing else. A move or a rename keeps the older contract -
+    /// both are reversible in place, and both are typed on purpose.
+    pub fn needs_explicit_yes(&self) -> bool {
+        matches!(self, PendingOp::Trash { .. })
+    }
 }
 
 /// Severity of a BBS message line. Levels also carry a textual prefix in
@@ -368,8 +380,13 @@ impl App {
     }
 
     fn handle_confirm_key(&mut self, key: KeyInput) -> Effect {
+        let enter_confirms = self
+            .pending
+            .as_ref()
+            .is_some_and(|op| !op.needs_explicit_yes());
         match key {
-            KeyInput::Char('y') | KeyInput::Char('Y') | KeyInput::Enter => self.perform_pending(),
+            KeyInput::Char('y') | KeyInput::Char('Y') => self.perform_pending(),
+            KeyInput::Enter if enter_confirms => self.perform_pending(),
             // `q` cancels here, as it does in the reader and the folder
             // picker: the back-out key never means "go ahead".
             KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Char('q') | KeyInput::Esc => {
@@ -950,7 +967,7 @@ impl App {
                 let where_to = self.trasher.destination();
                 self.push_msg(
                     Level::Ok,
-                    format!("trashed '{name}' -> {where_to} (recoverable in Finder)"),
+                    format!("trashed '{name}' -> {where_to} (recoverable from there)"),
                 );
                 if let Err(e) = self.nav.refresh() {
                     return self.err(e.to_string());
@@ -1131,7 +1148,8 @@ pub fn help_lines() -> Vec<String> {
         "  h, q, Esc            back to the listing, on the same row",
         "",
         "KEYS (confirmation prompt)",
-        "  y, Enter             go ahead",
+        "  y                    go ahead",
+        "  Enter                go ahead - move and rename only, not trash",
         "  n, q, Esc            cancel - nothing is touched",
         "",
         "KEYS (folder picker - :move with no path)",
@@ -1692,6 +1710,50 @@ mod tests {
     }
 
     #[test]
+    fn enter_never_stands_in_for_y_at_the_delete_prompt() {
+        // `d` is half-page-down in the reader and Enter activates a row
+        // in browse: the pair is one muscle-memory slip apart, so the
+        // trash is answered with the letter and nothing else.
+        let tmp = tempfile::tempdir().unwrap();
+        let can = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let before = snapshot(tmp.path());
+        let mut app = app_with_can(&tmp, &can);
+        select(&mut app, "a.txt");
+
+        app.handle_key(KeyInput::Char('d'));
+        app.handle_key(KeyInput::Enter);
+
+        assert_eq!(app.mode, Mode::ConfirmOp, "the prompt must stay up");
+        assert!(app.pending.is_some(), "the operation must stay armed");
+        assert_eq!(snapshot(tmp.path()), before, "Enter trashed the entry");
+        assert!(can_contents(&can).is_empty(), "Enter trashed the entry");
+        assert!(
+            last_msg(&app).text.contains("press y"),
+            "{:?}",
+            last_msg(&app)
+        );
+
+        // And the key that does mean yes still does.
+        app.handle_key(KeyInput::Char('y'));
+        assert_eq!(can_contents(&can), vec!["a.txt".to_string()]);
+    }
+
+    #[test]
+    fn enter_still_confirms_a_move_or_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, "a.txt");
+
+        app.execute_line("move sub");
+        app.handle_key(KeyInput::Enter);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(tmp.path().join("sub/a.txt").exists(), "Enter must confirm");
+    }
+
+    #[test]
     fn an_unrelated_key_at_the_delete_prompt_neither_trashes_nor_cancels() {
         let tmp = tempfile::tempdir().unwrap();
         let can = tempfile::tempdir().unwrap();
@@ -1819,6 +1881,10 @@ mod tests {
         assert!(
             help.contains("n, q, Esc"),
             "the confirmation's cancel keys are missing"
+        );
+        assert!(
+            help.contains("not trash"),
+            "the help must say Enter does not answer a trash prompt:\n{help}"
         );
     }
 

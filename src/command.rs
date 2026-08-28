@@ -175,7 +175,7 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
                 destination: Some(destination.clone()),
             }),
             _ => Err(ParseError::Usage {
-                command: "move",
+                command: typed(&head_lower, &["move", "mv"]),
                 usage: "[destination]   (no path opens the folder picker; quote spaces)",
             }),
         },
@@ -192,19 +192,35 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "delete" | "trash" => no_args(
             args,
             Command::Trash,
-            "delete",
+            typed(&head_lower, &["delete", "trash"]),
             "  (moves the selected entry to the Trash; there is no path form)",
         ),
         "open" => no_args(args, Command::Open, "open", ""),
         "edit" => no_args(args, Command::Edit, "edit", ""),
         "preview" => no_args(args, Command::Preview, "preview", ""),
-        "help" | "?" => no_args(args, Command::Help, "help", ""),
-        "quit" | "q" | "exit" => no_args(args, Command::Quit, "quit", ""),
+        "help" | "?" => no_args(args, Command::Help, typed(&head_lower, &["help", "?"]), ""),
+        "quit" | "q" | "exit" => no_args(
+            args,
+            Command::Quit,
+            typed(&head_lower, &["quit", "q", "exit"]),
+            "",
+        ),
         "agent" => Ok(Command::Agent {
             args: args.to_vec(),
         }),
         _ => Err(ParseError::Unknown(head.clone())),
     }
+}
+
+/// The spelling the user actually typed, so a usage line never names a
+/// command they did not type. Falls back to the canonical name, which is
+/// the first alias.
+fn typed(head: &str, aliases: &[&'static str]) -> &'static str {
+    aliases
+        .iter()
+        .copied()
+        .find(|alias| *alias == head)
+        .unwrap_or(aliases[0])
 }
 
 fn no_args(
@@ -412,8 +428,28 @@ mod tests {
         ));
         assert!(matches!(
             parse("trash a.txt"),
-            Err(ParseError::Usage { .. })
+            Err(ParseError::Usage {
+                command: "trash",
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn a_usage_line_names_the_alias_the_user_typed() {
+        for (line, expected) in [
+            ("delete a.txt", "usage: delete"),
+            ("trash a.txt", "usage: trash"),
+            ("move a b", "usage: move"),
+            ("mv a b", "usage: mv"),
+            ("q now", "usage: q"),
+        ] {
+            let err = parse(line).unwrap_err();
+            assert!(
+                err.to_string().starts_with(expected),
+                "'{line}' reported '{err}', which names a command nobody typed"
+            );
+        }
     }
 
     #[test]

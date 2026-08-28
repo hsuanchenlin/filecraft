@@ -242,15 +242,15 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `quit` | leave Filecraft |
 
 Move, rename, and delete always show what they are about to do and
-require an explicit `y` (or Enter). `n`, `q`, or Esc cancels and nothing
-is touched. Permission errors, missing files, broken symlinks, unreadable
+require an explicit `y`; Enter also answers a move or a rename, but never
+a delete. `n`, `q`, or Esc cancels and nothing is touched. Permission errors, missing files, broken symlinks, unreadable
 directories, spaces, and Unicode names are reported in the message log
 and do not abort the session.
 
 ## Deleting
 
 `d`, `:delete`, and `:trash` are the same operation: the selected entry is
-**moved to the macOS Trash**, where Finder can put it back. Filecraft never
+**moved to the macOS Trash**, whole, to be recovered from there. Filecraft never
 unlinks a file and never removes a directory tree - there is no
 unrecoverable deletion anywhere in it, and a test asserts that mechanically
 over the source (`filecraft_never_calls_a_permanent_removal`).
@@ -259,7 +259,9 @@ over the source (`filecraft_never_calls_a_permanent_removal`).
  confirm [y]es / [n]o  trash 'notes.md'
 ```
 
-- `y` or Enter moves it to the Trash and re-reads the listing.
+- `y` moves it to the Trash and re-reads the listing. Enter does **not**:
+  `d` is a page-scroll in the reader and Enter activates a row in browse,
+  so a delete is answered with the letter and nothing else.
 - `n`, `q`, or Esc cancels; nothing is changed.
 - Any other key leaves the prompt up and says which keys answer it.
 - `../` is refused with an error before any prompt is raised - it names
@@ -268,7 +270,9 @@ over the source (`filecraft_never_calls_a_permanent_removal`).
   walk it, so there is nothing to half-finish.
 - The move goes through `NSFileManager`'s `trashItemAtURL:`, not Finder
   scripting: it needs no Automation permission and cannot silently fail
-  for the want of one.
+  for the want of one. Items trashed this way are not always offered
+  Finder's "Put Back"; the entry is intact in the Trash either way, and
+  dragging it out restores it.
 
 `rm`, `del`, and `rmdir` are deliberately **not** commands. They promise
 POSIX removal, and answering them with a trash would be as surprising as

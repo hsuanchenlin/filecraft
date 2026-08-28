@@ -53,9 +53,15 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   fixture directory, never the real `~/.Trash`. Unrecoverable deletion
   stays forbidden - no `remove_file`, `remove_dir`, `remove_dir_all`, or
   `unlink` in shipped code, and `filecraft_never_calls_a_permanent_removal`
-  in `src/trash.rs` scans the source for exactly that. `rm`/`del`/`rmdir`
-  stay unknown commands on purpose. Widening removal past move-to-Trash
-  needs an explicit product decision.
+  in `src/trash.rs` scans the source (recursively) for exactly that.
+  `check_trashable` runs inside `Trasher::trash` itself, so the `..`
+  refusal cannot be skipped by a new implementation or call site.
+  `rm`/`del`/`rmdir` stay unknown commands on purpose. Widening removal
+  past move-to-Trash needs an explicit product decision.
+- A trash is confirmed by `y`/`Y` only. Enter still answers a move or a
+  rename, and `PendingOp::needs_explicit_yes` is what draws the line -
+  `d` is a page-scroll in the reader and Enter activates a row in browse,
+  so the two are one slip apart.
 - One operating locus: the listing. Chrome above it is read-only and must
   never become a second selectable/operable pane - that ambiguity is what
   the confirmation flow's safety argument rests on.
