@@ -19,10 +19,11 @@ cd filecraft
 ./install.sh
 ```
 
-That is the whole install. `install.sh` runs `cargo install --path .`,
-then checks that the directory it installed into is on your `PATH` and
-offers to add it to your shell's startup file if it is not. Re-running it
-is safe: the edit is fenced by markers and made only once.
+That is the whole install. `install.sh` runs
+`cargo install --path . --locked --force`, then checks that the directory
+it installed into is on your `PATH` and offers to add it to your shell's
+startup file if it is not. Re-running it is safe: the edit is fenced by
+markers and made only once.
 
 ```
 ./install.sh            # install, then ask before editing your startup file

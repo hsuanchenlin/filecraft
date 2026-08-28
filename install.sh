@@ -2,12 +2,12 @@
 #
 # install.sh - build filecraft, then make sure your shell can find it.
 #
-# `cargo install` puts the binary in $CARGO_HOME/bin (normally
-# ~/.cargo/bin), which a macOS zsh does not search unless something put it
-# on PATH. The install then looks like it worked and the next `filecraft`
-# is `zsh: command not found`. This script closes that gap: it installs,
-# checks PATH and your shell's startup file, and offers to add the one
-# line that fixes it.
+# `cargo install` puts the binary in the install root's bin directory
+# (normally ~/.cargo/bin), which a macOS zsh does not search unless
+# something put it on PATH. The install then looks like it worked and the
+# next `filecraft` is `zsh: command not found`. This script closes that
+# gap: it installs, checks PATH and your shell's startup file, and offers
+# to add the one line that fixes it.
 #
 # Every edit is guarded by markers, so re-running changes nothing twice.
 #

@@ -1,10 +1,10 @@
 //! Whether a shell can actually find `filecraft`, and what to say when it
 //! cannot.
 //!
-//! A `cargo install` puts the binary in `$CARGO_HOME/bin` (normally
-//! `~/.cargo/bin`), which a macOS zsh does not have on `PATH` unless
-//! something put it there. The install then looks like it worked and the
-//! next `filecraft` is `zsh: command not found`. This module is the pure
+//! A `cargo install` puts the binary in the install root's `bin` directory
+//! (normally `~/.cargo/bin`), which a macOS zsh does not have on `PATH`
+//! unless something put it there. The install then looks like it worked and
+//! the next `filecraft` is `zsh: command not found`. This module is the pure
 //! half of the answer: given a `PATH` value and where the binary lives, it
 //! decides whether the shell can reach it and builds the exact line to add
 //! to the right startup file. `install.sh` does the same job at install
@@ -127,10 +127,11 @@ impl fmt::Display for PathAdvice {
 
 /// Decide whether anything needs saying about `PATH`.
 ///
-/// `exe_dir` is the directory of the running binary and `cargo_bin` is
-/// `$CARGO_HOME/bin`. A binary running out of a `target/` build tree is
-/// judged by `cargo_bin`, because that is where installing it would put
-/// it - telling someone to add `target/debug` to `PATH` would be wrong.
+/// `exe_dir` is the directory of the running binary and `cargo_bin` is the
+/// Cargo install root's `bin` directory. A binary running out of a `target/`
+/// build tree is judged by `cargo_bin`, because that is where installing it
+/// would put it - telling someone to add `target/debug` to `PATH` would be
+/// wrong.
 /// Returns `None` when the shell can already find the binary.
 pub fn advise(
     exe_dir: Option<&Path>,
