@@ -58,8 +58,9 @@ install it runs:
 cargo install --git https://github.com/hsuanchenlin/filecraft.git --locked --force
 ```
 
-Requires `cargo` (and `git` for a clone). Network failures, a missing
-toolchain, and permission errors are reported and do not crash.
+Checking requires `curl`; installing requires `cargo` and, for a local
+clone, `git`. Network failures, missing tools, and permission errors are
+reported and do not crash.
 
 ## Supported environment
 
