@@ -3,8 +3,8 @@
 //! [`App::handle_key`] consumes abstract [`KeyInput`]s and returns
 //! [`Effect`]s; the terminal event loop in `main.rs` translates real key
 //! events in and interprets effects out. The app itself never touches the
-//! terminal, so every interaction - including move/rename confirmation -
-//! is deterministically testable.
+//! terminal, so every interaction - including the move, rename, and
+//! trash confirmations - is deterministically testable.
 
 use std::path::{Path, PathBuf};
 

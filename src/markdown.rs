@@ -129,7 +129,7 @@ impl DocLine {
 
     /// A plain body line.
     ///
-    /// The text is [`clean`]ed here rather than at the call site, so
+    /// The text is `clean`ed here rather than at the call site, so
     /// every line the reader holds - parsed from a file or written by the
     /// app itself - satisfies the same invariant: no tabs, no control
     /// characters, and a display width the screen will actually spend.

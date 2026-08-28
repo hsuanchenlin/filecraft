@@ -124,10 +124,10 @@ Files are never opened automatically. Enter on a file, or the `edit`
 command, is the only way into an editor.
 
 Every navigation and orientation key is read-only. `d` is the only browse
-key that touches the filesystem at all, and it does not touch it either:
-it raises the same `y/n` prompt `:delete` does, and only `y` moves
-anything. Every other filesystem operation goes through select -> `:`
-command -> `y`; opening a file in the configured editor remains the
+key that can lead to a filesystem change, and it changes nothing by
+itself: it raises the same `y/n` prompt `:delete` does, and only `y`
+moves anything. Every other filesystem operation goes through select ->
+`:` command -> `y`; opening a file in the configured editor remains the
 explicit path for editing file contents.
 
 **Changed in this slice:** `l` on a text or Markdown file now opens the
@@ -243,17 +243,18 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 
 Move, rename, and delete always show what they are about to do and
 require an explicit `y`; Enter also answers a move or a rename, but never
-a delete. `n`, `q`, or Esc cancels and nothing is touched. Permission errors, missing files, broken symlinks, unreadable
-directories, spaces, and Unicode names are reported in the message log
-and do not abort the session.
+a delete. `n`, `q`, or Esc cancels and nothing is touched. Permission
+errors, missing files, broken symlinks, unreadable directories, spaces,
+and Unicode names are reported in the message log and do not abort the
+session.
 
 ## Deleting
 
-`d`, `:delete`, and `:trash` are the same operation: the selected entry is
-**moved to the macOS Trash**, whole, to be recovered from there. Filecraft never
-unlinks a file and never removes a directory tree - there is no
-unrecoverable deletion anywhere in it, and a test asserts that mechanically
-over the source (`filecraft_never_calls_a_permanent_removal`).
+`d`, `:delete`, and `:trash` are the same operation: the selected entry
+is **moved to the macOS Trash**, whole, to be recovered from there.
+Filecraft never unlinks a file and never removes a directory tree - there
+is no unrecoverable deletion anywhere in it, and a test asserts that
+mechanically over the source (`filecraft_never_calls_a_permanent_removal`).
 
 ```
  confirm [y]es / [n]o  trash 'notes.md'
