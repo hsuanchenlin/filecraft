@@ -78,6 +78,21 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping
   run without the network. A folder named `update` is `./update`.
+  `Host::install_root` is where `cargo install` writes -
+  `$CARGO_INSTALL_ROOT`, else `$CARGO_HOME`, else `~/.cargo` - and it
+  holds both `bin/` and `.crates.toml`; reading it as plain `CARGO_HOME`
+  points the PATH advice at a directory the binary never lands in.
+- Installing to `~/.cargo/bin` is only half an install: a macOS zsh does
+  not search there, so a success is followed by `command not found`.
+  `src/pathcheck.rs` is the pure decision (is this directory on `PATH`,
+  which startup file, which line) and `install.sh` is the same decision
+  in bash at install time; `filecraft update` reports it through
+  `UpdateReport::path_advice`. The two must agree on the line they
+  print - `install_script_and_update_advice_agree_on_the_path_line` in
+  `tests/cli.rs` is what holds them together. `install.sh` sourced with
+  `FILECRAFT_INSTALL_LIB=1` defines its functions and installs nothing,
+  which is how `scripts/install_test.sh` unit-tests it; that script runs
+  inside `cargo test`, so CI covers the shell half too.
 
 ## Maintaining this file
 

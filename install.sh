@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+#
+# install.sh - build filecraft, then make sure your shell can find it.
+#
+# `cargo install` puts the binary in the install root's bin directory
+# (normally ~/.cargo/bin), which a macOS zsh does not search unless
+# something put it on PATH. The install then looks like it worked and the
+# next `filecraft` is `zsh: command not found`. This script closes that
+# gap: it installs, checks PATH and your shell's startup file, and offers
+# to add the one line that fixes it.
+#
+# Every edit is guarded by markers, so re-running changes nothing twice.
+#
+# Usage:  ./install.sh [--yes] [--dry-run] [--no-path] [--link[-dir DIR]]
+# Tests:  scripts/install_test.sh sources this file with
+#         FILECRAFT_INSTALL_LIB=1, which defines the functions below and
+#         returns without installing anything.
+
+set -euo pipefail
+
+BEGIN_MARKER='# >>> filecraft install >>>'
+END_MARKER='# <<< filecraft install <<<'
+
+# ---------------------------------------------------------------- output
+
+is_tty() { [ -t 1 ]; }
+
+if is_tty && [ -z "${NO_COLOR:-}" ]; then
+    C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_WARN=$'\033[33m'
+    C_OK=$'\033[32m'; C_ERR=$'\033[31m'; C_OFF=$'\033[0m'
+else
+    C_BOLD=''; C_DIM=''; C_WARN=''; C_OK=''; C_ERR=''; C_OFF=''
+fi
+
+step() { printf '%s==>%s %s\n' "$C_BOLD" "$C_OFF" "$*"; }
+info() { printf '    %s\n' "$*"; }
+note() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+good() { printf '%sok%s  %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ pure logic
+#
+# The functions in this section touch nothing but their arguments (and
+# $HOME), which is what makes scripts/install_test.sh able to assert on
+# them. src/pathcheck.rs is the same decision in Rust, for `filecraft
+# update`; the two must agree on what "on PATH" means.
+
+# Splitting on IFS is how both functions below read a path apart, and
+# unquoted expansion also globs - which would turn an entry like /opt/*
+# into whatever happens to be on disk. Each turns globbing off around its
+# split and back on only if it was on to begin with. The `set -f` has to
+# happen in the function's own shell, so this cannot be factored into a
+# helper called through $( ): that runs in a subshell and changes nothing.
+
+# Expand a leading ~, $HOME or ${HOME}, then drop empty and "." path
+# components so two spellings of one directory compare equal. Written
+# without ${var//x/y} because bash 3.2 - the bash macOS ships - does not
+# unescape a slash in the replacement.
+normalize_dir() {
+    local dir="$1"
+    case "$dir" in
+        '~')            dir="$HOME" ;;
+        '~/'*)          dir="$HOME/${dir#\~/}" ;;
+        '$HOME')        dir="$HOME" ;;
+        '$HOME/'*)      dir="$HOME/${dir#\$HOME/}" ;;
+        '${HOME}')      dir="$HOME" ;;
+        '${HOME}/'*)    dir="$HOME/${dir#\$\{HOME\}/}" ;;
+    esac
+
+    local absolute=no
+    case "$dir" in /*) absolute=yes ;; esac
+
+    local out='' part reglob=''
+    case "$-" in *f*) ;; *) reglob=yes; set -f ;; esac
+    local IFS=/
+    for part in $dir; do
+        case "$part" in ''|.) continue ;; esac
+        if [ -z "$out" ]; then out="$part"; else out="$out/$part"; fi
+    done
+    unset IFS
+    if [ -n "$reglob" ]; then set +f; fi
+
+    if [ "$absolute" = yes ]; then
+        printf '/%s' "$out"
+    elif [ -z "$out" ]; then
+        printf '.'
+    else
+        printf '%s' "$out"
+    fi
+}
+
+# Does this PATH value tell a shell to search DIR? Entry-by-entry and
+# exact: "~/.cargo" must not count as "~/.cargo/bin".
+path_contains_dir() {
+    local want entry found=1 reglob=''
+    want="$(normalize_dir "$1")"
+    case "$-" in *f*) ;; *) reglob=yes; set -f ;; esac
+    local IFS=:
+    for entry in $2; do
+        [ -n "$entry" ] || continue
+        if [ "$(normalize_dir "$entry")" = "$want" ]; then
+            found=0
+            break
+        fi
+    done
+    unset IFS
+    if [ -n "$reglob" ]; then set +f; fi
+    return "$found"
+}
+
+# Classify $SHELL (a path such as /bin/zsh, or a login shell's "-zsh").
+shell_kind() {
+    local name="${1##*/}"
+    case "${name#-}" in
+        zsh)      printf 'zsh' ;;
+        bash|sh)  printf 'bash' ;;
+        fish)     printf 'fish' ;;
+        *)        printf 'other' ;;
+    esac
+}
+
+# The startup file that shell reads for interactive sessions.
+profile_for() {
+    case "$1" in
+        zsh)  printf '%s/.zshrc' "$HOME" ;;
+        bash) printf '%s/.bashrc' "$HOME" ;;
+        fish) printf '%s/.config/fish/config.fish' "$HOME" ;;
+        *)    printf '%s/.profile' "$HOME" ;;
+    esac
+}
+
+# Write a directory the way it should appear in a startup file: under the
+# home directory it becomes $HOME/..., so the line survives being copied
+# to another machine or another user.
+portable_dir() {
+    local dir
+    dir="$(normalize_dir "$1")"
+    local home
+    home="$(normalize_dir "$HOME")"
+    case "$dir" in
+        "$home")    printf '$HOME' ;;
+        "$home"/*)  printf '$HOME/%s' "${dir#"$home"/}" ;;
+        *)          printf '%s' "$dir" ;;
+    esac
+}
+
+# The line that puts DIR on PATH, in that shell's syntax.
+export_line_for() {
+    local kind="$1" dir
+    dir="$(portable_dir "$2")"
+    case "$kind" in
+        fish) printf 'fish_add_path %s' "$dir" ;;
+        *)    printf 'export PATH="%s:$PATH"' "$dir" ;;
+    esac
+}
+
+# Does this startup file already put DIR on PATH? Matches our own marked
+# block, a hand-written export, and rustup's `. "$HOME/.cargo/env"` when
+# DIR is $HOME/.cargo/bin - any of which means there is nothing to add.
+profile_has_dir() {
+    local file="$1" dir="$2"
+    [ -f "$file" ] || return 1
+    local portable stripped
+    portable="$(portable_dir "$dir")"
+    dir="$(normalize_dir "$dir")"
+    stripped="${dir#"$(normalize_dir "$HOME")"/}"
+    local line content
+    while IFS= read -r line; do
+        content="${line%%#*}"
+        case "$content" in *[![:space:]]*) ;; *) continue ;; esac
+        case "$content" in
+            *"$dir"*|*"$portable"*|*"~/$stripped"*) return 0 ;;
+            *cargo/env*)
+                [ "$dir" = "$(normalize_dir "$HOME/.cargo/bin")" ] && return 0
+                ;;
+        esac
+    done < "$file"
+    return 1
+}
+
+# ------------------------------------------------------------- installing
+
+repo_root() { cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P; }
+
+# Where `cargo install` writes. CARGO_INSTALL_ROOT wins over CARGO_HOME,
+# which is the order cargo itself uses; getting it wrong would send the
+# advice at a directory the binary never lands in.
+cargo_bin_dir() {
+    printf '%s/bin' "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+}
+
+run() {
+    if [ "$DRY_RUN" = yes ]; then
+        note "would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+resolve_profile() {
+    local path="$1" target parent followed=no hops=0
+    while [ -L "$path" ]; do
+        followed=yes
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        target="$(readlink "$path")" || return 1
+        case "$target" in
+            /*) path="$target" ;;
+            *)
+                parent="$(cd -P -- "$(dirname -- "$path")" && pwd)" || return 1
+                path="$parent/$target"
+                ;;
+        esac
+    done
+    if [ "$followed" = yes ] && [ ! -e "$path" ]; then
+        return 1
+    fi
+    if [ -e "$path" ]; then
+        parent="$(cd -P -- "$(dirname -- "$path")" && pwd)" || return 1
+        path="$parent/$(basename -- "$path")"
+    fi
+    printf '%s' "$path"
+}
+
+# Add the PATH line under markers, creating the file if needed. Two runs
+# leave one block, and a changed install directory updates that block.
+add_to_profile() {
+    local requested="$1" kind="$2" dir="$3" file line
+    line="$(export_line_for "$kind" "$dir")"
+    if ! file="$(resolve_profile "$requested")"; then
+        warn "$requested is a dangling or looping symlink; left it unchanged"
+        info "add this line by hand after fixing the profile: $line"
+        return 2
+    fi
+
+    local block_info='' state='' begin_line='' end_line=''
+    if [ -f "$file" ] && { grep -qFx "$BEGIN_MARKER" "$file" || grep -qFx "$END_MARKER" "$file"; }; then
+        if ! block_info="$(awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+            $0 == begin { begins++; begin_line = NR; inside = 1; next }
+            $0 == end { ends++; end_line = NR; inside = 0; next }
+            inside && $0 == line { found = 1 }
+            END {
+                if (begins != 1 || ends != 1 || end_line <= begin_line) exit 1
+                print (found ? "same" : "different"), begin_line, end_line
+            }
+        ' "$file")"; then
+            warn "$requested has a hand-edited or truncated filecraft block; left it unchanged"
+            info "fix or remove that block, re-run, or add this line by hand: $line"
+            return 2
+        fi
+        set -- $block_info
+        state="$1"; begin_line="$2"; end_line="$3"
+        if [ "$state" = same ]; then
+            return 1
+        fi
+        if [ "$DRY_RUN" = yes ]; then
+            note "would replace the filecraft block in $requested with:"
+            note "    $line"
+            return 0
+        fi
+        local temp='' final_newline
+        if ! final_newline="$(tail -c 1 "$file" | wc -l | tr -d ' ')"; then
+            warn "could not inspect $requested; left it unchanged"
+            return 2
+        fi
+        if ! temp="$(mktemp "${file}.filecraft.XXXXXX")"; then
+            warn "could not create a temporary file beside $requested; left it unchanged"
+            return 2
+        fi
+        if ! cp -p -- "$file" "$temp"; then
+            rm -f -- "$temp"
+            warn "could not preserve $requested for editing; left it unchanged"
+            return 2
+        fi
+        if ! awk -v first="$begin_line" -v last="$end_line" \
+            -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+                NR < first { print; next }
+                NR == first { print begin; print line; print end; next }
+                NR > last { print }
+            ' "$file" > "$temp"; then
+            rm -f -- "$temp"
+            warn "could not prepare the update for $requested; left it unchanged"
+            return 2
+        fi
+        if [ "$final_newline" -eq 0 ]; then
+            local trimmed='' size keep
+            size="$(wc -c < "$temp" | tr -d ' ')" || {
+                rm -f -- "$temp"
+                warn "could not inspect the update for $requested; left it unchanged"
+                return 2
+            }
+            keep=$((size - 1))
+            if ! trimmed="$(mktemp "${file}.filecraft.XXXXXX")"; then
+                rm -f -- "$temp"
+                warn "could not create a temporary file beside $requested; left it unchanged"
+                return 2
+            fi
+            if ! cp -p -- "$temp" "$trimmed" ||
+                ! dd if="$temp" of="$trimmed" bs=1 count="$keep" 2>/dev/null; then
+                rm -f -- "$temp" "$trimmed"
+                warn "could not preserve the final newline state of $requested; left it unchanged"
+                return 2
+            fi
+            rm -f -- "$temp"
+            temp="$trimmed"
+        fi
+        if ! mv -- "$temp" "$file"; then
+            rm -f -- "$temp"
+            warn "could not replace $requested; left it unchanged"
+            return 2
+        fi
+        return 0
+    fi
+    if [ "$DRY_RUN" = yes ]; then
+        note "would append to $requested:"
+        note "    $line"
+        return 0
+    fi
+    if ! mkdir -p -- "$(dirname -- "$file")"; then
+        warn "could not create the directory for $requested; left it unchanged"
+        return 2
+    fi
+    local temp=''
+    if ! temp="$(mktemp "${file}.filecraft.XXXXXX")"; then
+        warn "could not create a temporary file beside $requested; left it unchanged"
+        return 2
+    fi
+    if [ -f "$file" ] && ! cp -p -- "$file" "$temp"; then
+        rm -f -- "$temp"
+        warn "could not preserve $requested for editing; left it unchanged"
+        return 2
+    fi
+    if ! {
+        printf '\n%s\n' "$BEGIN_MARKER"
+        printf '%s\n' "$line"
+        printf '%s\n' "$END_MARKER"
+    } >> "$temp"; then
+        rm -f -- "$temp"
+        warn "could not prepare the update for $requested; left it unchanged"
+        return 2
+    fi
+    if ! mv -- "$temp" "$file"; then
+        rm -f -- "$temp"
+        warn "could not replace $requested; left it unchanged"
+        return 2
+    fi
+    return 0
+}
+
+ask_yes() {
+    [ "$ASSUME_YES" = yes ] && return 0
+    [ -t 0 ] || return 1
+    local reply
+    printf '    %s [y/N] ' "$1"
+    read -r reply || return 1
+    case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+usage() {
+    cat <<'EOF'
+install.sh - build filecraft and make sure your shell can find it
+
+USAGE:
+  ./install.sh [OPTIONS]
+
+OPTIONS:
+  -y, --yes         edit the shell startup file without asking
+  -n, --dry-run     print every change without making one
+      --no-path     install only; never touch a startup file
+      --link        also symlink the binary into ~/.local/bin
+      --link-dir D  also symlink the binary into D
+      --no-build    skip the build; only check and fix PATH
+  -h, --help        show this help
+
+It runs `cargo install --path . --locked --force`, which puts `filecraft`
+in $CARGO_INSTALL_ROOT or $CARGO_HOME (normally ~/.cargo/bin). If it is not on
+your PATH and your shell's startup file does not add it, this offers to
+append:
+
+  export PATH="$HOME/.cargo/bin:$PATH"
+
+Re-running is safe: the edit is fenced by markers and made only once.
+EOF
+}
+
+main() {
+    DRY_RUN=no
+    ASSUME_YES=no
+    EDIT_PATH=yes
+    DO_BUILD=yes
+    LINK_DIR=''
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -y|--yes)     ASSUME_YES=yes ;;
+            -n|--dry-run) DRY_RUN=yes ;;
+            --no-path)    EDIT_PATH=no ;;
+            --no-build)   DO_BUILD=no ;;
+            --link)       LINK_DIR="$HOME/.local/bin" ;;
+            --link-dir)
+                shift
+                [ $# -gt 0 ] || die "--link-dir needs a directory"
+                LINK_DIR="$1"
+                ;;
+            --link-dir=*) LINK_DIR="${1#--link-dir=}" ;;
+            -h|--help)    usage; return 0 ;;
+            *)            die "unknown option '$1'; try ./install.sh --help" ;;
+        esac
+        shift
+    done
+
+    local root bin_dir binary
+    root="$(repo_root)"
+    bin_dir="$(cargo_bin_dir)"
+    binary="$bin_dir/filecraft"
+
+    if [ "$DO_BUILD" = yes ]; then
+        command -v cargo >/dev/null 2>&1 ||
+            die "cargo is not installed; get a Rust toolchain from https://rustup.rs"
+        [ -f "$root/Cargo.toml" ] ||
+            die "no Cargo.toml next to install.sh; run it from a filecraft clone"
+        step "Building and installing filecraft"
+        run cargo install --path "$root" --locked --force
+    fi
+
+    if [ "$DRY_RUN" = no ] && [ "$DO_BUILD" = yes ] && [ ! -x "$binary" ]; then
+        die "cargo reported success but $binary is not there"
+    fi
+
+    step "Checking PATH"
+    local kind profile line
+    kind="$(shell_kind "${SHELL:-}")"
+    profile="$(profile_for "$kind")"
+    line="$(export_line_for "$kind" "$bin_dir")"
+
+    if path_contains_dir "$bin_dir" "${PATH:-}"; then
+        good "$bin_dir is on your PATH"
+    elif [ "$EDIT_PATH" = no ]; then
+        warn "$bin_dir is not on your PATH; add this to $profile yourself:"
+        info "$line"
+    elif profile_has_dir "$profile" "$bin_dir"; then
+        good "$profile already adds $bin_dir; open a new terminal to pick it up"
+    else
+        info "$bin_dir is not on your PATH, so \`filecraft\` will not run by name."
+        info "Fix it by adding this line to $profile:"
+        info "  $line"
+        if ask_yes "Add it now?"; then
+            if add_to_profile "$profile" "$kind" "$bin_dir"; then
+                if [ "$DRY_RUN" = no ]; then
+                    good "updated $profile"
+                    info "run: source $profile     (or just open a new terminal)"
+                fi
+            else
+                local edit_status=$?
+                if [ "$edit_status" -eq 1 ]; then
+                    good "$profile already has a filecraft block; nothing to add"
+                else
+                    warn "could not update $profile; add this line yourself:"
+                    info "$line"
+                fi
+            fi
+        else
+            warn "left $profile alone; add the line above yourself, or re-run with --yes"
+        fi
+    fi
+
+    if [ -n "$LINK_DIR" ]; then
+        step "Linking into $LINK_DIR"
+        run mkdir -p -- "$LINK_DIR"
+        run ln -sf -- "$binary" "$LINK_DIR/filecraft"
+        if path_contains_dir "$LINK_DIR" "${PATH:-}"; then
+            good "$LINK_DIR/filecraft -> $binary (and $LINK_DIR is on your PATH)"
+        else
+            warn "$LINK_DIR is not on your PATH either; add it the same way"
+        fi
+    fi
+
+    step "Done"
+    if [ "$DRY_RUN" = yes ]; then
+        note "dry run: nothing was installed or edited"
+    elif [ -x "$binary" ]; then
+        info "$("$binary" --version 2>/dev/null || printf 'filecraft')  ($binary)"
+        info "try: filecraft            # open the current directory"
+        info "     filecraft --help"
+    fi
+}
+
+# Sourced by scripts/install_test.sh: define the functions, install nothing.
+if [ -n "${FILECRAFT_INSTALL_LIB:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+main "$@"

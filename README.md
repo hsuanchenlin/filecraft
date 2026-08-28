@@ -13,23 +13,52 @@ iCloud, or default file handling.
 
 Requires a Rust toolchain (1.85 or newer) and a UTF-8 macOS terminal.
 
-From source:
-
 ```sh
 git clone https://github.com/hsuanchenlin/filecraft.git
 cd filecraft
-cargo install --path .
+./install.sh
 ```
 
-From git without a local clone:
+That is the whole install. `install.sh` runs
+`cargo install --path . --locked --force`, then checks that the directory
+it installed into is on your `PATH` and offers to add it to your shell's
+startup file if it is not. Re-running it is safe: the edit is fenced by
+markers and made only once.
+
+```
+./install.sh            # install, then ask before editing your startup file
+./install.sh --yes      # install and edit it without asking
+./install.sh --dry-run  # print every change without making one
+./install.sh --no-path  # install only; never touch a startup file
+./install.sh --link     # also symlink the binary into ~/.local/bin
+./install.sh --help
+```
+
+### Installing by hand
 
 ```sh
-cargo install --git https://github.com/hsuanchenlin/filecraft --locked
+cargo install --path .                                             # from a clone
+cargo install --git https://github.com/hsuanchenlin/filecraft --locked  # without one
 ```
 
-The binary is named `filecraft`. Put Cargo's bin directory on your
-`PATH` (typically `~/.cargo/bin`). After that, `filecraft` works from
-any directory:
+Either way the binary lands in Cargo's bin directory, normally
+`~/.cargo/bin`. A macOS zsh does not search that directory unless
+something puts it there, so a successful install is still followed by:
+
+```
+zsh: command not found: filecraft
+```
+
+Add the directory to your `PATH` once and the problem is gone:
+
+```sh
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc   # zsh (macOS default)
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.bashrc  # bash
+echo 'fish_add_path $HOME/.cargo/bin' >> ~/.config/fish/config.fish  # fish
+```
+
+Then open a new terminal, or `source` the file you edited. `filecraft`
+now works from any directory:
 
 ```sh
 filecraft              # open the current working directory
@@ -57,6 +86,21 @@ install it runs:
 ```sh
 cargo install --git https://github.com/hsuanchenlin/filecraft.git --locked --force
 ```
+
+Both forms end with a `PATH` self-check. Installing a binary somewhere
+the shell never looks is a silent failure, so if the directory holding
+`filecraft` is not on your `PATH`, the report says so and prints the
+exact line to add and the file to add it to:
+
+```
+warning: /Users/you/.cargo/bin is not on your PATH
+  until it is, `filecraft` only runs by full path, not by name
+  add it:  echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+  then open a new terminal, or run ./install.sh from a filecraft clone to do this for you
+```
+
+Running out of a `target/` build tree is reported against the directory
+an install would write to, not the build directory.
 
 Checking requires `curl`; installing requires `cargo` and, for a local
 clone, `git`. Network failures, missing tools, and permission errors are
