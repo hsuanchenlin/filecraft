@@ -198,60 +198,127 @@ run() {
     "$@"
 }
 
+resolve_profile() {
+    local path="$1" target parent followed=no hops=0
+    while [ -L "$path" ]; do
+        followed=yes
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        target="$(readlink "$path")" || return 1
+        case "$target" in
+            /*) path="$target" ;;
+            *)
+                parent="$(cd -P -- "$(dirname -- "$path")" && pwd)" || return 1
+                path="$parent/$target"
+                ;;
+        esac
+    done
+    if [ "$followed" = yes ] && [ ! -e "$path" ]; then
+        return 1
+    fi
+    if [ -e "$path" ]; then
+        parent="$(cd -P -- "$(dirname -- "$path")" && pwd)" || return 1
+        path="$parent/$(basename -- "$path")"
+    fi
+    printf '%s' "$path"
+}
+
 # Add the PATH line under markers, creating the file if needed. Two runs
 # leave one block, and a changed install directory updates that block.
 add_to_profile() {
-    local file="$1" kind="$2" dir="$3"
-    local line
+    local requested="$1" kind="$2" dir="$3" file line
     line="$(export_line_for "$kind" "$dir")"
-    if [ -f "$file" ] && grep -qF "$BEGIN_MARKER" "$file"; then
-        if awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
-            $0 == begin { inside = 1; next }
-            inside && $0 == end { complete = 1; exit found ? 0 : 1 }
+    if ! file="$(resolve_profile "$requested")"; then
+        warn "$requested is a dangling or looping symlink; left it unchanged"
+        info "add this line by hand after fixing the profile: $line"
+        return 2
+    fi
+
+    local block_info='' state='' begin_line='' end_line=''
+    if [ -f "$file" ] && { grep -qFx "$BEGIN_MARKER" "$file" || grep -qFx "$END_MARKER" "$file"; }; then
+        if ! block_info="$(awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+            $0 == begin { begins++; begin_line = NR; inside = 1; next }
+            $0 == end { ends++; end_line = NR; inside = 0; next }
             inside && $0 == line { found = 1 }
-            END { if (!complete) exit 1 }
-        ' "$file"; then
+            END {
+                if (begins != 1 || ends != 1 || end_line <= begin_line) exit 1
+                print (found ? "same" : "different"), begin_line, end_line
+            }
+        ' "$file")"; then
+            warn "$requested has a hand-edited or truncated filecraft block; left it unchanged"
+            info "fix or remove that block, re-run, or add this line by hand: $line"
+            return 2
+        fi
+        set -- $block_info
+        state="$1"; begin_line="$2"; end_line="$3"
+        if [ "$state" = same ]; then
             return 1
         fi
         if [ "$DRY_RUN" = yes ]; then
-            note "would replace the filecraft block in $file with:"
+            note "would replace the filecraft block in $requested with:"
             note "    $line"
             return 0
         fi
-        local temp
-        temp="$(mktemp "${file}.filecraft.XXXXXX")" || return 1
-        cp -p -- "$file" "$temp" || { rm -f -- "$temp"; return 1; }
-        if ! awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
-            $0 == begin {
-                if (!written) {
-                    print begin
-                    print line
-                    print end
-                    written = 1
-                }
-                inside = 1
-                next
-            }
-            inside && $0 == end { inside = 0; next }
-            !inside { print }
-        ' "$file" > "$temp"; then
-            rm -f -- "$temp"
-            return 1
+        local temp=''
+        if ! temp="$(mktemp "${file}.filecraft.XXXXXX")"; then
+            warn "could not create a temporary file beside $requested; left it unchanged"
+            return 2
         fi
-        mv -- "$temp" "$file"
+        if ! cp -p -- "$file" "$temp"; then
+            rm -f -- "$temp"
+            warn "could not preserve $requested for editing; left it unchanged"
+            return 2
+        fi
+        if ! awk -v first="$begin_line" -v last="$end_line" \
+            -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v line="$line" '
+                NR < first { print; next }
+                NR == first { print begin; print line; print end; next }
+                NR > last { print }
+            ' "$file" > "$temp"; then
+            rm -f -- "$temp"
+            warn "could not prepare the update for $requested; left it unchanged"
+            return 2
+        fi
+        if ! mv -- "$temp" "$file"; then
+            rm -f -- "$temp"
+            warn "could not replace $requested; left it unchanged"
+            return 2
+        fi
         return 0
     fi
     if [ "$DRY_RUN" = yes ]; then
-        note "would append to $file:"
+        note "would append to $requested:"
         note "    $line"
         return 0
     fi
-    mkdir -p -- "$(dirname -- "$file")"
-    {
+    if ! mkdir -p -- "$(dirname -- "$file")"; then
+        warn "could not create the directory for $requested; left it unchanged"
+        return 2
+    fi
+    local temp=''
+    if ! temp="$(mktemp "${file}.filecraft.XXXXXX")"; then
+        warn "could not create a temporary file beside $requested; left it unchanged"
+        return 2
+    fi
+    if [ -f "$file" ] && ! cp -p -- "$file" "$temp"; then
+        rm -f -- "$temp"
+        warn "could not preserve $requested for editing; left it unchanged"
+        return 2
+    fi
+    if ! {
         printf '\n%s\n' "$BEGIN_MARKER"
         printf '%s\n' "$line"
         printf '%s\n' "$END_MARKER"
-    } >> "$file"
+    } >> "$temp"; then
+        rm -f -- "$temp"
+        warn "could not prepare the update for $requested; left it unchanged"
+        return 2
+    fi
+    if ! mv -- "$temp" "$file"; then
+        rm -f -- "$temp"
+        warn "could not replace $requested; left it unchanged"
+        return 2
+    fi
     return 0
 }
 
@@ -359,7 +426,13 @@ main() {
                     info "run: source $profile     (or just open a new terminal)"
                 fi
             else
-                good "$profile already has a filecraft block; nothing to add"
+                local edit_status=$?
+                if [ "$edit_status" -eq 1 ]; then
+                    good "$profile already has a filecraft block; nothing to add"
+                else
+                    warn "could not update $profile; add this line yourself:"
+                    info "$line"
+                fi
             fi
         else
             warn "left $profile alone; add the line above yourself, or re-run with --yes"

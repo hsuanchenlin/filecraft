@@ -188,6 +188,40 @@ check_eq "1" "$(grep -cF "$END_MARKER" "$TMP/zshrc")" "one end marker"
 check_false "the replaced block remains idempotent" \
     add_to_profile "$TMP/zshrc" zsh /custom/root/bin
 check_eq "1" "$(grep -c 'export PATH=' "$TMP/zshrc")" "one PATH line after rerun"
+check_eq "0" "$(find "$TMP" -maxdepth 1 -name 'zshrc.filecraft.*' | wc -l | tr -d ' ')" \
+    "successful replacement leaves no temporary file"
+
+for malformed in missing-end end-first duplicate; do
+    case "$malformed" in
+        missing-end) printf 'before\n%s\nafter\n' "$BEGIN_MARKER" > "$TMP/$malformed" ;;
+        end-first) printf 'before\n%s\n%s\nafter\n' "$END_MARKER" "$BEGIN_MARKER" > "$TMP/$malformed" ;;
+        duplicate) printf '%s\nold\n%s\n%s\nold\n%s\n' \
+            "$BEGIN_MARKER" "$END_MARKER" "$BEGIN_MARKER" "$END_MARKER" > "$TMP/$malformed" ;;
+    esac
+    cp "$TMP/$malformed" "$TMP/$malformed.before"
+    check_false "$malformed markers are refused" \
+        add_to_profile "$TMP/$malformed" zsh /custom/root/bin
+    check_true "$malformed markers leave the profile byte-identical" \
+        cmp -s "$TMP/$malformed.before" "$TMP/$malformed"
+    check_eq "0" "$(find "$TMP" -maxdepth 1 -name "$malformed.filecraft.*" | wc -l | tr -d ' ')" \
+        "$malformed failure leaves no temporary file"
+done
+
+cp "$TMP/zshrc" "$TMP/profile-target"
+ln -s profile-target "$TMP/profile-link"
+check_true "a symlinked profile is reconciled" \
+    add_to_profile "$TMP/profile-link" zsh /symlink/root/bin
+check_true "the profile path remains a symlink" test -L "$TMP/profile-link"
+check_eq "profile-target" "$(readlink "$TMP/profile-link")" "the profile symlink target is unchanged"
+check_true "the symlink target receives the new line" \
+    grep -qF 'export PATH="/symlink/root/bin:$PATH"' "$TMP/profile-target"
+
+chmod 600 "$TMP/profile-target"
+check_true "a mode-preserving reconciliation succeeds" \
+    add_to_profile "$TMP/profile-link" zsh /mode/root/bin
+check_eq "600" "$(stat -f '%Lp' "$TMP/profile-target")" "profile permissions are preserved"
+check_eq "0" "$(find "$TMP" -maxdepth 1 -name 'profile-target.filecraft.*' | wc -l | tr -d ' ')" \
+    "symlink replacement leaves no temporary file"
 
 # A missing fish config directory is created rather than failing.
 check_true "fish config is created" \
