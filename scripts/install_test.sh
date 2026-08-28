@@ -146,6 +146,12 @@ for existing in 'export PATH="$HOME/.cargo/bin:$PATH"' \
         profile_has_dir "$TMP/existing" /home/tester/.cargo/bin
 done
 
+printf '. "$HOME/.cargo/env"\n' > "$TMP/cargo-env"
+check_true "cargo env configures the default Cargo bin" \
+    profile_has_dir "$TMP/cargo-env" /home/tester/.cargo/bin
+check_false "cargo env does not configure a custom install root" \
+    profile_has_dir "$TMP/cargo-env" /custom/root/bin
+
 # A commented-out line is not configuration.
 printf '# export PATH="$HOME/.cargo/bin:$PATH"\n' > "$TMP/commented"
 check_false "a commented line does not count" \

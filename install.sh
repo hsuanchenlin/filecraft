@@ -156,8 +156,8 @@ export_line_for() {
 }
 
 # Does this startup file already put DIR on PATH? Matches our own marked
-# block, a hand-written export, and rustup's `. "$HOME/.cargo/env"` -
-# any of which means there is nothing to add.
+# block, a hand-written export, and rustup's `. "$HOME/.cargo/env"` when
+# DIR is $HOME/.cargo/bin - any of which means there is nothing to add.
 profile_has_dir() {
     local file="$1" dir="$2"
     [ -f "$file" ] || return 1
@@ -170,7 +170,9 @@ profile_has_dir() {
         case "${line%%#*}" in *[![:space:]]*) ;; *) continue ;; esac
         case "$line" in
             *"$dir"*|*"$portable"*|*"~/$stripped"*) return 0 ;;
-            *cargo/env*) [ "${dir##*/}" = bin ] && return 0 ;;
+            *cargo/env*)
+                [ "$dir" = "$(normalize_dir "$HOME/.cargo/bin")" ] && return 0
+                ;;
         esac
     done < "$file"
     return 1
