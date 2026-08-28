@@ -28,7 +28,38 @@ cargo install --git https://github.com/hsuanchenlin/filecraft --locked
 ```
 
 The binary is named `filecraft`. Put Cargo's bin directory on your
-`PATH` (typically `~/.cargo/bin`).
+`PATH` (typically `~/.cargo/bin`). After that, `filecraft` works from
+any directory:
+
+```sh
+filecraft              # open the current working directory
+filecraft ~/Documents  # open that directory
+filecraft --list ~     # static listing (no TUI)
+```
+
+A folder named `update` is opened as `filecraft ./update`.
+
+## Update
+
+`filecraft update` installs the latest version. It detects a local git
+clone vs a global `cargo install` so you do not have to remember `git
+pull` or the install flags.
+
+```sh
+filecraft update --check   # current vs latest, no install
+filecraft update           # install the latest
+```
+
+From a git clone it runs `git pull --ff-only` in that tree and
+`cargo install --path <clone> --locked --force`. From a global cargo
+install it runs:
+
+```sh
+cargo install --git https://github.com/hsuanchenlin/filecraft.git --locked --force
+```
+
+Requires `cargo` (and `git` for a clone). Network failures, a missing
+toolchain, and permission errors are reported and do not crash.
 
 ## Supported environment
 
@@ -59,6 +90,7 @@ Without a TTY, Filecraft prints a static listing of the given directory
 filecraft --help
 filecraft --list ~/Documents
 filecraft ~/Documents
+filecraft update --check
 ```
 
 ## Keyboard
@@ -209,8 +241,10 @@ reported in the message log and do not abort the session.
 
 ## Safety
 
-- Operations stay on the local filesystem. No network, telemetry,
-  background daemon, or hidden file index.
+- Operations stay on the local filesystem. No telemetry, background
+  daemon, or hidden file index. The TUI never opens a network
+  connection; `filecraft update` is the only command that does, and
+  only to fetch and install this repository.
 - Commands are never evaluated by a shell.
 - Moves never overwrite an existing entry and never copy+delete across
   volumes.
@@ -240,9 +274,10 @@ scroll margin, relative time, speakable status - so all of it is tested
 without a TTY; `src/markdown.rs` holds the reader's line classification,
 inline emphasis, and width-aware wrapping, and `src/pager.rs` its
 scroll, search, and position. `src/picker.rs` holds the move folder
-picker's listing, cursor, and destination path. `src/ui.rs` adds
+picker's listing, cursor, and destination path. `src/update.rs` holds
+`filecraft update`. `src/ui.rs` adds
 golden-frame tests at 80x24, 100x30, 132x40, and 60x20. `tests/cli.rs`
-drives the binary for `--help`/`--list`/non-TTY behavior.
+drives the binary for `--help`/`--list`/`update`/non-TTY behavior.
 
 ## License
 

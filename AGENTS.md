@@ -56,6 +56,10 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   table, and `help_lines()` ship in the same change as any key change -
   the reader's and folder picker's keys included.
 - `agent` is a disabled seam (`src/agent.rs`, contract in `docs/agent-seam.md`). Do not invoke an LLM, scan a tree for an agent, or enable autonomous changes.
+- `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
+  `update` / `--check`; `main.rs` prints the report. Tests inject a
+  fake `Host` so detection, command construction, and error mapping
+  run without the network. A folder named `update` is `./update`.
 
 ## Maintaining this file
 

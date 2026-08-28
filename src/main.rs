@@ -22,9 +22,25 @@ fn main() -> ExitCode {
             print!("{}", cli::USAGE);
             return ExitCode::SUCCESS;
         }
+        Ok(CliAction::HelpUpdate) => {
+            print!("{}", cli::UPDATE_USAGE);
+            return ExitCode::SUCCESS;
+        }
         Ok(CliAction::Version) => {
             println!("filecraft {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
+        }
+        Ok(CliAction::Update { check }) => {
+            return match filecraft::update::run(check) {
+                Ok(report) => {
+                    print!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("filecraft: {error}");
+                    ExitCode::FAILURE
+                }
+            };
         }
         Ok(CliAction::Run(cli)) => cli,
         Err(message) => {
