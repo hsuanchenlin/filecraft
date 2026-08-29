@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Level, Mode, QUIT_QUESTION};
@@ -673,15 +673,18 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    for row in bearings::wrap_hanging(
         "the provider runs locally and reads only these files",
-        theme.meta(),
-    )));
-    // Wrapped, not clipped: this dialog is the one screen whose rows are
-    // command lines, and half a command line read as a whole one is worse
-    // than a row that runs on. The words are chosen to fit the narrowest
-    // supported terminal on one line anyway.
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        inner.width as usize,
+        0,
+    ) {
+        lines.push(Line::from(Span::styled(row, theme.meta())));
+    }
+    // No `Paragraph::wrap` on top: `wrap_hanging` is the only thing that
+    // decides where a row of this dialog breaks, so a continuation always
+    // sits under its own command line rather than at the left edge where
+    // it would read as one more provider.
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// One drawn row of the reader, with the active search query picked out.
@@ -1142,6 +1145,31 @@ mod tests {
             );
             assert!(screen.contains("Enter default"), "{screen}");
         }
+    }
+
+    /// No row of this dialog may *begin* with a flag. A command line too
+    /// wide for the box continues under its own command, indented, so it
+    /// can never be read as one more provider - which is only true while
+    /// `wrap_hanging` is the single thing deciding where a row breaks.
+    /// Well below the documented 60x20 minimum, where every row wraps.
+    #[test]
+    fn no_dialog_row_ever_begins_with_a_flag() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        open_selector(&mut app, &["notes.md", "report.pdf"]);
+        app.handle_key(KeyInput::Enter);
+        let screen = render_size(&app, 40, 30);
+        assert!(
+            !screen.contains("\u{2502} -"),
+            "a row started with a flag instead of continuing under one:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!(
+                "\u{2502} {}--dangerously",
+                " ".repeat(summarize::MENU_INDENT)
+            )),
+            "the continuation lost its indent:\n{screen}"
+        );
     }
 
     #[test]

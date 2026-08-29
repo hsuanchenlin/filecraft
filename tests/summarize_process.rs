@@ -61,12 +61,19 @@ printf '# Summary\n\nwritten by the stub provider\n' > "$path"
         // A `.orphan` marker in the working directory asks for the other
         // shape, the one a real node CLI has: a grandchild that keeps the
         // inherited stdout and stderr open after the child is killed.
-        // `.orphaned` says it exists, so a test never races it.
+        // `.summary-first` asks it to write its summary before doing so,
+        // which is the run that looks stuck but is already finished.
+        // `.orphaned` says the grandchild exists, so a test never races
+        // either of them.
         write_stub(
             &dir,
             "grok",
             &format!(
-                "if [ -e {ORPHAN_REQUEST} ]; then\n  \
+                "if [ -e {SUMMARY_FIRST} ]; then\n  \
+                 path=$(grep -A1 'exact absolute path:' \"$PROMPT_FILE\" | tail -1)\n  \
+                 printf '# Summary\\n\\n{WRITTEN_FIRST}\\n' > \"$path\"\n\
+                 fi\n\
+                 if [ -e {ORPHAN_REQUEST} ]; then\n  \
                  sleep {} &\n  \
                  : > {ORPHANED}\n\
                  fi\n\
@@ -184,9 +191,14 @@ fi
 }
 
 /// How the `grok` stub is asked to leave a pipe holder behind, and how
-/// it says it has. Only the terminate test writes the request.
+/// it says it has. Only the terminate tests write the request.
 const ORPHAN_REQUEST: &str = ".orphan";
 const ORPHANED: &str = ".orphaned";
+
+/// How the same stub is asked to write a real summary before it orphans
+/// the pipe, and the line that proves the summary is the one it wrote.
+const SUMMARY_FIRST: &str = ".summary-first";
+const WRITTEN_FIRST: &str = "written before the stop";
 
 /// How long that grandchild holds the pipes. Long enough that a
 /// `terminate` which waited for it would be unmistakable, short enough
@@ -232,6 +244,20 @@ fn spec_in(tmp: &tempfile::TempDir, provider: Provider) -> JobSpec {
     std::fs::write(&second, "# notes").unwrap();
     let output = output_path_with(&first, "20260829-101500", &|p| p.exists());
     JobSpec::new(provider, vec![first, second], output).unwrap()
+}
+
+/// Wait until the stub says its grandchild is holding the pipes.
+/// Terminating before that exists would prove nothing.
+fn wait_for_orphan(cwd: &Path) {
+    let orphaned = cwd.join(ORPHANED);
+    let deadline = Instant::now() + PATIENCE;
+    while !orphaned.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the stub never left a grandchild holding the pipes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Poll until the run reports something, or the patience runs out.
@@ -452,16 +478,7 @@ fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
     std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
     let mut job = ProcessRunner.start(&spec).unwrap();
 
-    // Terminating before the grandchild exists would prove nothing.
-    let orphaned = spec.cwd.join(ORPHANED);
-    let deadline = Instant::now() + PATIENCE;
-    while !orphaned.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the stub never left a grandchild holding the pipes"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_orphan(&spec.cwd);
 
     let started = Instant::now();
     job.terminate();
@@ -483,6 +500,34 @@ fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
     assert!(artifact.contains("Summary failed"), "{artifact}");
     assert!(artifact.contains(STOPPED_REASON), "{artifact}");
+}
+
+/// The other half of the same stop: the provider already wrote a real
+/// summary - through the shell redirect the prompt itself offers as a
+/// fallback, which is also what leaves a grandchild on the pipe - so the
+/// run only *looks* stuck. Quitting must not replace that summary with a
+/// failure note. It is the same precedence `finish` states: the file the
+/// provider was asked to write wins.
+#[test]
+fn a_summary_already_written_survives_the_stop_that_finds_it() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Gk);
+    std::fs::write(spec.cwd.join(SUMMARY_FIRST), "").unwrap();
+    std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
+    let mut job = ProcessRunner.start(&spec).unwrap();
+    wait_for_orphan(&spec.cwd);
+
+    job.terminate();
+
+    assert_eq!(
+        job.poll(),
+        Some(Outcome::Written(spec.output.clone())),
+        "the summary the provider wrote is the outcome"
+    );
+    let written = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(written.contains(WRITTEN_FIRST), "{written}");
+    assert!(!written.contains("Summary failed"), "{written}");
 }
 
 #[test]

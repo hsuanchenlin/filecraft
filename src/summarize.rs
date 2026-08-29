@@ -635,17 +635,27 @@ struct ProcessJob {
 
 impl ProcessJob {
     /// The run is over as far as the app is concerned, but the worker is
-    /// still blocked on a pipe the killed child no longer owns. Fill the
-    /// reservation here: the app drops the job the moment `terminate`
-    /// returns, and a detached worker dies with the process.
+    /// still blocked on a pipe the killed child no longer owns. Finish
+    /// the job here: the app drops it the moment `terminate` returns, and
+    /// a detached worker dies with the process.
+    ///
+    /// Through [`finish`], because the precedence is the same one every
+    /// other ending obeys - the file the provider was asked to write
+    /// wins. A provider can have written its summary and still leave the
+    /// drain blocked, and the note would truncate what it wrote.
     fn record_stopped(&self) -> Outcome {
+        let reason = match finish(false, non_empty_file(&self.output), "", STOPPED_REASON) {
+            Finish::UseWrittenFile => return Outcome::Written(self.output.clone()),
+            Finish::WriteStdout => STOPPED_REASON.to_string(),
+            Finish::Failed(reason) => reason,
+        };
         match write_reserved(
             &mut hold(&self.reservation),
-            failure_note(STOPPED_REASON).as_bytes(),
+            failure_note(&reason).as_bytes(),
         ) {
-            Ok(()) => Outcome::Failed(STOPPED_REASON.to_string()),
+            Ok(()) => Outcome::Failed(reason),
             Err(e) => Outcome::Failed(format!(
-                "{STOPPED_REASON}; could not record failure in {}: {e}",
+                "{reason}; could not record failure in {}: {e}",
                 self.output.display()
             )),
         }
@@ -804,55 +814,97 @@ mod tests {
     ///
     /// A flag that takes a value is fine - `-s workspace-write` is a
     /// mode every install understands. What is refused is a value looked
-    /// up in the user's configuration, and a value that is a path.
+    /// up in the user's configuration, and *any* word that is a path,
+    /// wherever in the line it sits: the program, a subcommand, a flag's
+    /// value, or a bare trailing argument.
+    fn machine_local_words(argv: &[String]) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut expects_a_value: Option<&str> = None;
+        for word in argv {
+            if let Some((flag, value)) = word.split_once('=').filter(|_| word.starts_with('-')) {
+                expects_a_value = None;
+                if selects_a_configured_name(flag) || names_a_place(value) {
+                    found.push(word.clone());
+                }
+            } else if word.starts_with('-') {
+                expects_a_value = Some(word);
+            } else {
+                match expects_a_value.take() {
+                    Some(flag) if selects_a_configured_name(flag) => {
+                        found.push(format!("{flag} {word}"));
+                    }
+                    _ if names_a_place(word) => found.push(word.clone()),
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
     #[test]
     fn no_provider_line_carries_a_machine_local_value() {
         for provider in Provider::ALL {
-            let argv = provider.base_argv();
-            let code = provider.code();
-            let mut expects_a_value: Option<&str> = None;
-            for word in argv.iter().skip(1) {
-                if let Some((flag, value)) = word.split_once('=').filter(|_| word.starts_with('-'))
-                {
-                    assert!(
-                        !selects_a_configured_name(flag),
-                        "{code}: '{word}' selects a name from the user's own config"
-                    );
-                    assert!(!names_a_place(value), "{code}: '{word}' names a path");
-                    expects_a_value = None;
-                } else if word.starts_with('-') {
-                    expects_a_value = Some(word);
-                } else if let Some(flag) = expects_a_value.take() {
-                    assert!(
-                        !selects_a_configured_name(flag),
-                        "{code}: '{flag} {word}' selects a name from the user's own config"
-                    );
-                    assert!(!names_a_place(word), "{code}: '{word}' names a path");
-                }
-            }
+            let offenders = machine_local_words(&provider.base_argv());
+            assert!(
+                offenders.is_empty(),
+                "{}: {offenders:?} exist on one machine only",
+                provider.code()
+            );
         }
     }
 
     /// The guard has to be able to fail, and to fail only on the thing it
     /// is about: a name resolved out of the user's own configuration or a
-    /// path, never a portable mode word.
+    /// path, wherever it sits - never a portable mode word.
     #[test]
-    fn the_machine_local_guard_reads_flag_values_and_not_positions() {
-        assert!(selects_a_configured_name("-p"));
-        assert!(selects_a_configured_name("--profile"));
-        assert!(selects_a_configured_name("--config"));
-        assert!(!selects_a_configured_name("-s"));
-        assert!(!selects_a_configured_name("-m"));
-        assert!(!selects_a_configured_name("--sandbox"));
+    fn the_machine_local_guard_reads_words_and_not_positions() {
+        let line = |words: &[&str]| -> Vec<String> {
+            machine_local_words(&words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>())
+        };
 
-        for local in ["/Users/me/x.toml", "~/.codex/x.toml", "$HOME/x", "./x"] {
-            assert!(names_a_place(local), "{local} names a place");
-        }
-        for portable in ["workspace-write", "on-request", "gpt-5", "exec"] {
-            assert!(
-                !names_a_place(portable),
-                "{portable} is a mode, not a place"
-            );
+        // The bug this guard is named after, and the shapes around it.
+        assert_eq!(
+            line(&["codex", "exec", "-p", "lavish", "--skip-git-repo-check"]),
+            vec!["-p lavish".to_string()]
+        );
+        assert_eq!(
+            line(&["codex", "--config=/Users/me/x.toml"]),
+            vec!["--config=/Users/me/x.toml".to_string()]
+        );
+        // A path is refused wherever it sits, including where no flag is
+        // waiting for it: trailing, leading, or as the program itself.
+        assert_eq!(
+            line(&[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "/Users/me/notes.toml"
+            ]),
+            vec!["/Users/me/notes.toml".to_string()]
+        );
+        assert_eq!(
+            line(&["tool", "~/.config/tool.toml"]),
+            vec!["~/.config/tool.toml".to_string()]
+        );
+        assert_eq!(
+            line(&["/opt/homebrew/bin/codex", "exec"]),
+            vec!["/opt/homebrew/bin/codex".to_string()]
+        );
+
+        // Portable constants stay portable.
+        for portable in [
+            &[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "--skip-git-repo-check",
+            ][..],
+            &["agy", "--dangerously-skip-permissions"][..],
+            &["some-cli", "-m", "gpt-5", "--color=never"][..],
+        ] {
+            assert!(line(portable).is_empty(), "{portable:?} is portable");
         }
     }
 
