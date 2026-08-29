@@ -3,6 +3,14 @@
 Filecraft reserves an `agent` command so a future opt-in assistant has a
 stable place to live. v0 ships **no agent**.
 
+> **Not the summarizer.** `:summarize` / `S` (`src/summarize.rs`) is a
+> separate, shipped feature: the user marks a finite list of documents,
+> picks a provider from a fixed table, and Filecraft spawns that CLI to
+> write one new Markdown file. It has no autonomy - it does not choose
+> files, does not act again after it finishes, and cannot be started
+> without both explicit steps. The `agent` seam below stays disabled,
+> and the summarizer does not enable it.
+
 Typing `agent` (with or without extra words) prints a "not configured"
 explanation and returns to the navigator. Nothing is scanned, indexed,
 sent off the machine, or changed.

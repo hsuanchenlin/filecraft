@@ -7,6 +7,7 @@
 //! trash confirmations - is deterministically testable.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::agent::{self, Agent, AgentRequest};
 use crate::bearings::{self, Glyphs, Ladder};
@@ -14,10 +15,12 @@ use crate::command::{self, Command};
 use crate::editor;
 use crate::fsops::{self, FsError};
 use crate::markdown::{self, DocLine};
+use crate::multiselect::{self, FileSelector, ToggleError, Toggled};
 use crate::nav::NavState;
 use crate::pager::{self, Pager};
 use crate::picker::{self, FolderPicker};
 use crate::preview::{self, PreviewData, ViewSource};
+use crate::summarize::{self, Job, JobSpec, Outcome, Provider, Runner};
 use crate::trash::{self, Trasher};
 
 /// Abstract key input, decoupled from any terminal backend.
@@ -62,10 +65,22 @@ pub enum Effect {
 #[allow(clippy::large_enum_variant)]
 pub enum Mode {
     Browse,
-    Command { input: String },
-    Filter { input: String },
+    Command {
+        input: String,
+    },
+    Filter {
+        input: String,
+    },
     ConfirmOp,
+    /// `q` / Ctrl-C with a summary still running. Only `y` leaves.
+    ConfirmQuit,
     FolderPicker(FolderPicker),
+    /// Picking the files an AI summary will cover.
+    FileSelector(FileSelector),
+    /// Picking which AI CLI runs it, over the files already chosen.
+    ProviderMenu {
+        files: Vec<PathBuf>,
+    },
     Pager(Pager),
 }
 
@@ -150,6 +165,18 @@ pub struct Message {
 
 const MAX_MESSAGES: usize = 100;
 
+/// The question the quit confirmation asks. One string, shared by the
+/// prompt row and the message log, so the two cannot drift.
+pub const QUIT_QUESTION: &str = "task in progress: terminate AI summary and quit?";
+
+/// A path as the message log names it: the file name alone, because the
+/// selector header already says where the summary will land.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// Full application state.
 pub struct App {
     pub nav: NavState,
@@ -174,6 +201,33 @@ pub struct App {
     /// Where `delete` sends an entry. The system Trash in the shipped
     /// binary; a directory under a fixture in tests.
     pub trasher: Box<dyn Trasher>,
+    /// How an AI summary is run. A child process in the shipped binary;
+    /// a scripted stand-in in tests, so no provider is ever needed.
+    pub runner: Box<dyn Runner>,
+    /// The one summary that may be in flight. There is at most one, so
+    /// the status row, the quit confirmation, and the message it finally
+    /// logs all refer to the same unambiguous thing.
+    pub job: Option<ActiveJob>,
+}
+
+/// A summary run in flight, plus the spec that describes it in words.
+pub struct ActiveJob {
+    pub spec: JobSpec,
+    handle: Box<dyn Job>,
+}
+
+impl ActiveJob {
+    /// Adopt an already-started run. The state machine builds these
+    /// through [`App::start_summary`]; this is also how a test or another
+    /// front end hands in a job of its own.
+    pub fn new(spec: JobSpec, handle: Box<dyn Job>) -> Self {
+        ActiveJob { spec, handle }
+    }
+
+    /// The live status the screen shows while this runs.
+    pub fn status_line(&self) -> String {
+        self.spec.status_line()
+    }
 }
 
 impl App {
@@ -195,6 +249,8 @@ impl App {
             viewport_cols: 80,
             glyphs: Glyphs::UNICODE,
             trasher: trash::system(),
+            runner: summarize::process_runner(),
+            job: None,
         };
         app.push_msg(
             Level::Info,
@@ -219,14 +275,20 @@ impl App {
     /// Route a key according to the current mode.
     pub fn handle_key(&mut self, key: KeyInput) -> Effect {
         if key == KeyInput::CtrlC {
-            return Effect::Quit;
+            // Ctrl-C still leaves from anywhere, but a running summary is
+            // a child process someone started on purpose: it is killed
+            // deliberately or not at all.
+            return self.quit_or_confirm();
         }
         match &self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Command { .. } => self.handle_command_key(key),
             Mode::Filter { .. } => self.handle_filter_key(key),
             Mode::ConfirmOp => self.handle_confirm_key(key),
+            Mode::ConfirmQuit => self.handle_confirm_quit_key(key),
             Mode::FolderPicker(_) => self.handle_picker_key(key),
+            Mode::FileSelector(_) => self.handle_selector_key(key),
+            Mode::ProviderMenu { .. } => self.handle_provider_key(key),
             Mode::Pager(_) => self.handle_pager_key(key),
         }
     }
@@ -299,7 +361,11 @@ impl App {
                 self.push_msg(Level::Info, "refreshed".to_string());
                 Effect::None
             }
-            KeyInput::Char('q') => Effect::Quit,
+            // `S`, like `:summarize`, only opens the file selector.
+            // Nothing is read, sent, or run until files are picked and a
+            // provider is chosen.
+            KeyInput::Char('S') => self.cmd_summarize(),
+            KeyInput::Char('q') => self.quit_or_confirm(),
             // Esc backs out exactly one level; quitting is `q` or Ctrl-C.
             KeyInput::Esc => self.back_out(),
             _ => Effect::None,
@@ -405,6 +471,281 @@ impl App {
                     "press y to confirm, or n / q / Esc to cancel".to_string(),
                 );
                 Effect::None
+            }
+        }
+    }
+
+    /// `q` and Ctrl-C. With no summary running this is a plain quit; with
+    /// one running it raises the prompt instead, because leaving would
+    /// kill a child process the user started on purpose.
+    fn quit_or_confirm(&mut self) -> Effect {
+        let Some(job) = &self.job else {
+            return Effect::Quit;
+        };
+        let status = job.status_line();
+        if matches!(self.mode, Mode::ConfirmQuit) {
+            return Effect::None;
+        }
+        self.mode = Mode::ConfirmQuit;
+        // The prompt row asks the question; the log says which run it is
+        // about, which is the part the prompt has no room for.
+        self.push_msg(Level::Info, format!("confirm: quit and terminate {status}"));
+        Effect::None
+    }
+
+    fn handle_confirm_quit_key(&mut self, key: KeyInput) -> Effect {
+        match key {
+            KeyInput::Char('y') | KeyInput::Char('Y') => {
+                if let Some(mut job) = self.job.take() {
+                    job.handle.terminate();
+                }
+                Effect::Quit
+            }
+            // Enter is not an answer here, for the same reason it is not
+            // one for a trash: the key that raised the prompt sits one
+            // slip away, and terminating a run is not undone by retrying.
+            KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Esc => {
+                self.mode = Mode::Browse;
+                self.push_msg(
+                    Level::Info,
+                    "cancelled: the summary is still running".to_string(),
+                );
+                Effect::None
+            }
+            _ => {
+                self.push_msg(
+                    Level::Info,
+                    "press y to terminate the summary and quit, or n / Esc to stay".to_string(),
+                );
+                Effect::None
+            }
+        }
+    }
+
+    /// Rows of entries the file selector has, mirrored from the listing
+    /// area the same way the reader's and the picker's rows are.
+    pub fn selector_rows(&self) -> usize {
+        self.viewport_rows
+            .saturating_sub(multiselect::FRAME_ROWS)
+            .max(1)
+    }
+
+    /// `:summarize` / `:summary` / `S` - open the file selector. Nothing
+    /// is read or sent here; this only lists folders and documents.
+    fn cmd_summarize(&mut self) -> Effect {
+        if let Some(job) = &self.job {
+            let status = job.status_line();
+            return self.err(format!("summarize: already running {status}"));
+        }
+        match FileSelector::open(&self.nav.cwd, self.nav.show_hidden) {
+            Ok(selector) => {
+                self.push_msg(
+                    Level::Info,
+                    format!(
+                        "summarize: Space selects, Enter or c confirms, Esc cancels ({})",
+                        summarize::summarizable_note()
+                    ),
+                );
+                self.mode = Mode::FileSelector(selector);
+                Effect::None
+            }
+            Err(e) => self.err(format!("summarize: {e}")),
+        }
+    }
+
+    fn handle_selector_key(&mut self, key: KeyInput) -> Effect {
+        let rows = self.selector_rows();
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut err: Option<String> = None;
+        let mut info: Option<String> = None;
+        {
+            let Mode::FileSelector(selector) = &mut self.mode else {
+                return Effect::None;
+            };
+            match key {
+                KeyInput::Char('j') | KeyInput::Down => selector.move_cursor(1),
+                KeyInput::Char('k') | KeyInput::Up => selector.move_cursor(-1),
+                KeyInput::PageDown => selector.move_cursor(rows as isize),
+                KeyInput::PageUp => selector.move_cursor(-(rows as isize)),
+                KeyInput::Char('g') | KeyInput::Home => selector.cursor_to_start(),
+                KeyInput::Char('G') | KeyInput::End => selector.cursor_to_end(),
+                KeyInput::Char('l') | KeyInput::Right => {
+                    if let Err(e) = selector.enter_focused() {
+                        err = Some(format!("summarize: {e}"));
+                    }
+                }
+                KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => {
+                    match selector.go_up() {
+                        Ok(true) => {}
+                        Ok(false) => info = Some("already at the filesystem root".to_string()),
+                        Err(e) => err = Some(format!("summarize: {e}")),
+                    }
+                }
+                KeyInput::Char(' ') => match selector.toggle_focused() {
+                    Ok(Toggled::Added(path)) => {
+                        info = Some(format!(
+                            "selected '{}' ({} total)",
+                            display_name(&path),
+                            selector.count()
+                        ));
+                    }
+                    Ok(Toggled::Removed(path)) => {
+                        info = Some(format!(
+                            "unselected '{}' ({} total)",
+                            display_name(&path),
+                            selector.count()
+                        ));
+                    }
+                    Err(ToggleError::NothingFocused) => {
+                        err = Some("summarize: nothing focused".to_string())
+                    }
+                    Err(e @ ToggleError::NotAFile) => err = Some(format!("summarize: {e}")),
+                },
+                KeyInput::Enter | KeyInput::Char('c') => confirm = true,
+                KeyInput::Esc | KeyInput::Char('q') => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.mode = Mode::Browse;
+            self.push_msg(Level::Info, "cancelled: summarize".to_string());
+            return Effect::None;
+        }
+        if confirm {
+            return self.confirm_selection();
+        }
+        if let Some(text) = err {
+            return self.err(text);
+        }
+        if let Some(text) = info {
+            self.push_msg(Level::Info, text);
+        }
+        Effect::None
+    }
+
+    /// Enter / `c` in the selector: hand the chosen files to the provider
+    /// dialog. An empty selection is refused with the selector still up,
+    /// so nothing is lost by pressing Enter early.
+    fn confirm_selection(&mut self) -> Effect {
+        let files = match &self.mode {
+            Mode::FileSelector(selector) => selector.chosen.clone(),
+            _ => return Effect::None,
+        };
+        if files.is_empty() {
+            return self
+                .err("summarize: no files selected - press Space on a file first".to_string());
+        }
+        let count = files.len();
+        let unit = if count == 1 { "file" } else { "files" };
+        self.push_msg(
+            Level::Info,
+            format!("summarize: {count} {unit} - choose a provider (Enter takes the default)"),
+        );
+        self.mode = Mode::ProviderMenu { files };
+        Effect::None
+    }
+
+    fn handle_provider_key(&mut self, key: KeyInput) -> Effect {
+        let choice = match key {
+            // Enter alone is the default provider - the one choice that
+            // needs no reading.
+            KeyInput::Enter => summarize::resolve(None),
+            KeyInput::Char(c) if c.is_ascii_digit() => match summarize::resolve(Some(c)) {
+                Some(provider) => Some(provider),
+                None => {
+                    return self.err(format!("summarize: no provider '{c}' - press 1-5 or Enter"))
+                }
+            },
+            KeyInput::Esc | KeyInput::Char('q') => {
+                self.mode = Mode::Browse;
+                self.push_msg(Level::Info, "cancelled: summarize".to_string());
+                return Effect::None;
+            }
+            _ => return Effect::None,
+        };
+        let Some(provider) = choice else {
+            return Effect::None;
+        };
+        self.start_summary(provider)
+    }
+
+    /// Spawn the summary in the background. The screen stays live: the
+    /// only thing that changes here is that a job exists.
+    fn start_summary(&mut self, provider: Provider) -> Effect {
+        let files = match &self.mode {
+            Mode::ProviderMenu { files } => files.clone(),
+            _ => return Effect::None,
+        };
+        self.mode = Mode::Browse;
+        let Some(first) = files.first().cloned() else {
+            return self.err("summarize: no files selected".to_string());
+        };
+        let output = summarize::output_path(&first, &summarize::stamp(SystemTime::now()));
+        let spec = match JobSpec::new(provider, files, output) {
+            Ok(spec) => spec,
+            Err(e) => return self.err(format!("summarize: {e}")),
+        };
+        match self.runner.start(&spec) {
+            Ok(handle) => {
+                self.push_msg(Level::Ok, spec.status_line());
+                self.push_msg(
+                    Level::Info,
+                    format!("summarize: will write {}", spec.output.display()),
+                );
+                self.job = Some(ActiveJob { spec, handle });
+                Effect::None
+            }
+            Err(e) => self.err(format!("summarize: {e}")),
+        }
+    }
+
+    /// Whether a summary is in flight, for the status row and the event
+    /// loop's tick.
+    pub fn job_active(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// The live status the status row shows, if anything is running.
+    pub fn job_status(&self) -> Option<String> {
+        self.job.as_ref().map(ActiveJob::status_line)
+    }
+
+    /// Ask the running summary whether it is done, and report it if so.
+    /// Called from the event loop, never blocking.
+    pub fn poll_job(&mut self) {
+        let Some(job) = &mut self.job else {
+            return;
+        };
+        let Some(outcome) = job.handle.poll() else {
+            return;
+        };
+        self.job = None;
+        match outcome {
+            Outcome::Written(path) => {
+                self.push_msg(Level::Ok, format!("summary written to {}", path.display()));
+                // The summary is a new file in some directory; if it is
+                // this one, the listing should already show it.
+                if let Err(e) = self.nav.refresh() {
+                    self.push_msg(Level::Error, e.to_string());
+                    return;
+                }
+                if path.parent() == Some(self.nav.cwd.as_path()) {
+                    if let Some(name) = path.file_name() {
+                        let name = name.to_string_lossy().into_owned();
+                        let visible = self.nav.visible();
+                        if let Some(pos) = visible
+                            .iter()
+                            .position(|&i| self.nav.entries[i].name == name)
+                        {
+                            self.nav.cursor = pos;
+                            self.push_msg(Level::Info, "press l to read it".to_string());
+                        }
+                    }
+                }
+            }
+            Outcome::Failed(reason) => {
+                self.push_msg(Level::Error, format!("summarize: {reason}"));
             }
         }
     }
@@ -754,8 +1095,9 @@ impl App {
             Command::Open => self.cmd_open(),
             Command::Edit => self.cmd_edit(),
             Command::Preview => self.cmd_preview(),
+            Command::Summarize => self.cmd_summarize(),
             Command::Help => self.show_help(),
-            Command::Quit => Effect::Quit,
+            Command::Quit => self.quit_or_confirm(),
             Command::Agent { args } => self.cmd_agent(args),
         }
     }
@@ -1129,6 +1471,7 @@ pub fn help_lines() -> Vec<String> {
         "  h, Left, Backspace   go to parent directory",
         "  0-9                  jump to that ancestor on the ladder",
         "  d                    move selected entry to the Trash (asks y/n)",
+        "  S                    AI summary: pick files, then a provider",
         "  /                    filter the listing (Esc clears)",
         "  :                    command prompt",
         "  .                    show/hide dotfiles",
@@ -1152,6 +1495,26 @@ pub fn help_lines() -> Vec<String> {
         "  Enter                go ahead - move and rename only, not trash",
         "  n, q, Esc            cancel - nothing is touched",
         "",
+        "KEYS (file selector - S or :summarize)",
+        "  j / k, Down / Up     move focus",
+        "  PgUp / PgDn          move focus a page",
+        "  Space                select / unselect the focused file",
+        "  l, Right             enter the focused folder",
+        "  h, Left, Backspace   go to parent directory",
+        "  g / G                first / last row",
+        "  Enter, c             confirm the selection, then pick a provider",
+        "  q, Esc               cancel, back to the listing",
+        "  (.pdf .md .markdown .txt only; the selection spans folders)",
+        "",
+        "KEYS (provider dialog)",
+        "  1 - 5                run that provider",
+        "  Enter                run the default, ag (agy)",
+        "  q, Esc               cancel, nothing is run",
+        "",
+        "KEYS (quit with a summary running)",
+        "  y                    terminate the summary and quit",
+        "  n, Esc               keep it running, stay in filecraft",
+        "",
         "KEYS (folder picker - :move with no path)",
         "  j / k, Down / Up     move focus",
         "  PgUp / PgDn          move focus a page",
@@ -1169,6 +1532,7 @@ pub fn help_lines() -> Vec<String> {
         "  open                 open selected entry with macOS 'open'",
         "  edit                 edit selected file in $EDITOR (or nvim)",
         "  preview              read-only preview (nvim -R, or built-in)",
+        "  summarize, summary   AI summary of files you pick (same as S)",
         "  agent [...]          future AI seam - disabled in v0",
         "  help                 this help",
         "  quit                 leave filecraft",
@@ -1179,7 +1543,12 @@ pub fn help_lines() -> Vec<String> {
         "  - delete is a move to the Trash: recoverable, never an unlink",
         "  - nothing is ever removed permanently, recursively or otherwise",
         "  - commands are parsed directly; nothing touches a shell",
-        "  - everything stays on this machine: no network, no telemetry",
+        "  - filecraft itself opens no network connection and keeps no",
+        "    telemetry; 'summarize' runs an AI CLI you already have, on",
+        "    files you picked, and that program may use the network",
+        "  - a summary is never started, and no file is read for one,",
+        "    until you select files and choose a provider",
+        "  - the summary is a new .md file; it never overwrites one",
         "",
         "MARKERS   name/ directory   name@ symlink   name@! broken symlink",
         "",
@@ -1199,6 +1568,7 @@ pub fn help_lines() -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
 
     fn app_in(tmp: &tempfile::TempDir) -> App {
         let nav = NavState::new(tmp.path()).unwrap();
@@ -1255,6 +1625,439 @@ mod tests {
 
     fn last_msg(app: &App) -> &Message {
         app.messages.last().expect("expected a message")
+    }
+
+    /// A summary run that never spawns anything: it reports whatever the
+    /// test told it to, and records whether it was terminated.
+    #[derive(Clone, Default)]
+    struct ScriptedJob {
+        outcome: Option<Outcome>,
+        terminated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Job for ScriptedJob {
+        fn poll(&mut self) -> Option<Outcome> {
+            self.outcome.take()
+        }
+        fn terminate(&mut self) {
+            self.terminated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The [`Runner`] seam, scripted. It records every spec it was asked
+    /// to start, so the argv, the prompt, and the output path a real run
+    /// would have used are all assertable without an AI CLI installed.
+    #[derive(Clone, Default)]
+    struct FakeRunner {
+        started: std::sync::Arc<Mutex<Vec<JobSpec>>>,
+        terminated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        outcome: Option<Outcome>,
+        fail: Option<String>,
+    }
+
+    impl Runner for FakeRunner {
+        fn start(&self, spec: &JobSpec) -> Result<Box<dyn Job>, String> {
+            if let Some(reason) = &self.fail {
+                return Err(reason.clone());
+            }
+            self.started.lock().unwrap().push(spec.clone());
+            Ok(Box::new(ScriptedJob {
+                outcome: self.outcome.clone(),
+                terminated: std::sync::Arc::clone(&self.terminated),
+            }))
+        }
+    }
+
+    /// An app whose summary runner is scripted, so `:summarize` runs end
+    /// to end without an AI CLI on `$PATH` and without a network.
+    fn app_with_runner(tmp: &tempfile::TempDir, runner: FakeRunner) -> (App, FakeRunner) {
+        let mut app = app_in(tmp);
+        app.runner = Box::new(runner.clone());
+        (app, runner)
+    }
+
+    fn docs_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("deep")).unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.4").unwrap();
+        fs::write(tmp.path().join("notes.md"), "# notes").unwrap();
+        fs::write(tmp.path().join("log.txt"), "log").unwrap();
+        fs::write(tmp.path().join("photo.png"), "png").unwrap();
+        fs::write(tmp.path().join("deep/inner.markdown"), "# inner").unwrap();
+        tmp
+    }
+
+    /// Focus a row in the open file selector by name.
+    fn focus_row(app: &mut App, name: &str) {
+        let Mode::FileSelector(selector) = &mut app.mode else {
+            panic!("expected the file selector");
+        };
+        selector.cursor = selector
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap_or_else(|| panic!("row '{name}' not in the selector"));
+    }
+
+    fn selector(app: &App) -> &FileSelector {
+        let Mode::FileSelector(selector) = &app.mode else {
+            panic!("expected the file selector");
+        };
+        selector
+    }
+
+    #[test]
+    fn summarize_opens_the_selector_from_the_key_and_both_commands() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.handle_key(KeyInput::Char('S')), Effect::None);
+        assert!(matches!(app.mode, Mode::FileSelector(_)));
+
+        for line in ["summarize", "summary"] {
+            let mut app = app_in(&tmp);
+            assert_eq!(app.execute_line(line), Effect::None);
+            assert!(
+                matches!(app.mode, Mode::FileSelector(_)),
+                "'{line}' must open the selector"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selector_lists_documents_and_folders_only() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        app.handle_key(KeyInput::Char('S'));
+        let listed: Vec<String> = selector(&app)
+            .entries
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        for shown in ["report.pdf", "notes.md", "log.txt", "deep"] {
+            assert!(
+                listed.contains(&shown.to_string()),
+                "{shown} should be listed"
+            );
+        }
+        assert!(!listed.contains(&"photo.png".to_string()));
+    }
+
+    #[test]
+    fn space_marks_files_across_directories_and_the_count_is_shown() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        app.handle_key(KeyInput::Char('S'));
+
+        focus_row(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(selector(&app).count(), 1);
+        assert!(last_msg(&app).text.contains("selected 'notes.md'"));
+        assert_eq!(selector(&app).header_line(), "selected: 1 file");
+
+        focus_row(&mut app, "report.pdf");
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(selector(&app).header_line(), "selected: 2 files");
+
+        // Down into a folder, and the selection comes along.
+        focus_row(&mut app, "deep");
+        app.handle_key(KeyInput::Char('l'));
+        focus_row(&mut app, "inner.markdown");
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(selector(&app).count(), 3);
+
+        // Space again on the same row takes it back off.
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(selector(&app).count(), 2);
+        assert!(last_msg(&app).text.contains("unselected 'inner.markdown'"));
+    }
+
+    #[test]
+    fn space_on_a_folder_selects_nothing_and_says_which_files_qualify() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        app.handle_key(KeyInput::Char('S'));
+        focus_row(&mut app, "deep");
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(selector(&app).count(), 0);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains(".pdf"));
+    }
+
+    #[test]
+    fn confirming_an_empty_selection_is_refused_with_the_selector_still_up() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        app.handle_key(KeyInput::Char('S'));
+        assert_eq!(app.handle_key(KeyInput::Enter), Effect::None);
+        assert!(matches!(app.mode, Mode::FileSelector(_)));
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("no files selected"));
+    }
+
+    #[test]
+    fn esc_cancels_the_selector_and_starts_nothing() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        app.handle_key(KeyInput::Char('S'));
+        focus_row(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char(' '));
+        assert_eq!(app.handle_key(KeyInput::Esc), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.job.is_none());
+        assert!(runner.started.lock().unwrap().is_empty());
+    }
+
+    /// Walk the whole flow with the keys a user presses: `S`, Space,
+    /// confirm, then a provider.
+    fn run_summary(app: &mut App, files: &[&str], provider_key: KeyInput) {
+        app.handle_key(KeyInput::Char('S'));
+        for name in files {
+            focus_row(app, name);
+            app.handle_key(KeyInput::Char(' '));
+        }
+        app.handle_key(KeyInput::Enter);
+        assert!(matches!(app.mode, Mode::ProviderMenu { .. }));
+        app.handle_key(provider_key);
+    }
+
+    #[test]
+    fn enter_at_the_provider_dialog_runs_the_default_provider() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        run_summary(&mut app, &["report.pdf", "notes.md"], KeyInput::Enter);
+
+        let started = runner.started.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        let spec = &started[0];
+        assert_eq!(spec.provider, Provider::Ag);
+        assert_eq!(spec.argv()[0], "agy");
+        assert_eq!(spec.files.len(), 2);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.job_active());
+    }
+
+    #[test]
+    fn a_digit_at_the_provider_dialog_runs_that_provider() {
+        let tmp = docs_fixture();
+        for (key, expected) in [
+            ('1', Provider::Ag),
+            ('2', Provider::Cc),
+            ('3', Provider::Co),
+            ('4', Provider::Gk),
+            ('5', Provider::Ki),
+        ] {
+            let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+            run_summary(&mut app, &["notes.md"], KeyInput::Char(key));
+            let started = runner.started.lock().unwrap();
+            assert_eq!(started.len(), 1, "'{key}' must start exactly one run");
+            assert_eq!(started[0].provider, expected);
+        }
+    }
+
+    #[test]
+    fn an_unlisted_digit_starts_nothing_and_leaves_the_dialog_up() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        app.handle_key(KeyInput::Char('S'));
+        focus_row(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Enter);
+        app.handle_key(KeyInput::Char('9'));
+        assert!(matches!(app.mode, Mode::ProviderMenu { .. }));
+        assert!(runner.started.lock().unwrap().is_empty());
+        assert_eq!(last_msg(&app).level, Level::Error);
+    }
+
+    #[test]
+    fn the_summary_lands_beside_the_first_selected_file() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        // Picked in the deep folder first, so that is where it goes.
+        app.handle_key(KeyInput::Char('S'));
+        focus_row(&mut app, "deep");
+        app.handle_key(KeyInput::Char('l'));
+        focus_row(&mut app, "inner.markdown");
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Char('h'));
+        focus_row(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Enter);
+        app.handle_key(KeyInput::Enter);
+
+        let started = runner.started.lock().unwrap();
+        let spec = &started[0];
+        let deep = tmp.path().canonicalize().unwrap().join("deep");
+        assert_eq!(spec.output, deep.join("inner-summary.md"));
+        assert_eq!(spec.cwd, deep);
+    }
+
+    #[test]
+    fn a_finished_run_logs_the_summary_and_selects_it_to_be_read() {
+        let tmp = docs_fixture();
+        let written = tmp.path().canonicalize().unwrap().join("notes-summary.md");
+        fs::write(&written, "# summary").unwrap();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Written(written.clone())),
+                ..FakeRunner::default()
+            },
+        );
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert!(app.job_active());
+
+        app.poll_job();
+        assert!(!app.job_active());
+        let text: Vec<String> = app.messages.iter().map(|m| m.text.clone()).collect();
+        assert!(
+            text.iter()
+                .any(|t| t == &format!("summary written to {}", written.display())),
+            "expected an ok line naming the summary, got {text:?}"
+        );
+        assert_eq!(
+            app.nav.selected().unwrap().name,
+            "notes-summary.md",
+            "the summary should be under the cursor, ready for l"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_reported_and_clears_the_job() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Failed("agy: not logged in".to_string())),
+                ..FakeRunner::default()
+            },
+        );
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        app.poll_job();
+        assert!(!app.job_active());
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("not logged in"));
+    }
+
+    #[test]
+    fn a_provider_that_will_not_start_is_an_error_not_a_job() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                fail: Some("could not run 'agy': No such file or directory".to_string()),
+                ..FakeRunner::default()
+            },
+        );
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert!(!app.job_active());
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("could not run 'agy'"));
+    }
+
+    #[test]
+    fn only_one_summary_runs_at_a_time() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert_eq!(app.handle_key(KeyInput::Char('S')), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("already running"));
+        assert_eq!(runner.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_status_line_names_the_run_while_it_is_going() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(&tmp, FakeRunner::default());
+        assert_eq!(app.job_status(), None);
+        run_summary(&mut app, &["report.pdf", "notes.md"], KeyInput::Enter);
+        assert_eq!(
+            app.job_status(),
+            Some("[AI: summarizing 2 files with agy]".to_string())
+        );
+    }
+
+    #[test]
+    fn quitting_with_a_summary_running_asks_first_and_only_y_leaves() {
+        let tmp = docs_fixture();
+        for quit_key in [KeyInput::Char('q'), KeyInput::CtrlC] {
+            let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+            run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+
+            assert_eq!(app.handle_key(quit_key), Effect::None, "{quit_key:?}");
+            assert_eq!(app.mode, Mode::ConfirmQuit);
+            assert!(
+                last_msg(&app).text.contains("quit and terminate"),
+                "the log must name the run: {}",
+                last_msg(&app).text
+            );
+            assert!(!runner.terminated.load(std::sync::atomic::Ordering::SeqCst));
+
+            // Enter is not an answer, and neither is any other stray key.
+            assert_eq!(app.handle_key(KeyInput::Enter), Effect::None);
+            assert_eq!(app.mode, Mode::ConfirmQuit);
+            assert!(app.job_active());
+
+            // `n` keeps the run and the session.
+            assert_eq!(app.handle_key(KeyInput::Char('n')), Effect::None);
+            assert_eq!(app.mode, Mode::Browse);
+            assert!(app.job_active());
+            assert!(!runner.terminated.load(std::sync::atomic::Ordering::SeqCst));
+
+            // `y` terminates the child and leaves.
+            app.handle_key(quit_key);
+            assert_eq!(app.handle_key(KeyInput::Char('y')), Effect::Quit);
+            assert!(!app.job_active());
+            assert!(runner.terminated.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn esc_at_the_quit_prompt_keeps_the_run_going() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        app.handle_key(KeyInput::Char('q'));
+        assert_eq!(app.handle_key(KeyInput::Esc), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.job_active());
+        assert!(!runner.terminated.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn quit_is_immediate_with_nothing_running() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(&tmp, FakeRunner::default());
+        assert_eq!(app.handle_key(KeyInput::Char('q')), Effect::Quit);
+        assert_eq!(app.handle_key(KeyInput::CtrlC), Effect::Quit);
+        assert_eq!(app.execute_line("quit"), Effect::Quit);
+    }
+
+    #[test]
+    fn the_quit_command_also_asks_while_a_summary_runs() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(&tmp, FakeRunner::default());
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert_eq!(app.execute_line("quit"), Effect::None);
+        assert_eq!(app.mode, Mode::ConfirmQuit);
+    }
+
+    #[test]
+    fn the_help_documents_every_key_the_summarizer_adds() {
+        let help = help_lines().join("\n");
+        for needed in [
+            "S ",
+            "Space",
+            "Enter, c",
+            "1 - 5",
+            "summarize, summary",
+            "terminate the summary and quit",
+        ] {
+            assert!(help.contains(needed), "help must document '{needed}'");
+        }
     }
 
     #[test]
@@ -2433,6 +3236,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("notes.md"), "# Title\n\n- one\n> quoted\n").unwrap();
         let before = snapshot(tmp.path());
+        let runner = FakeRunner::default();
         let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
         keys.extend([
             KeyInput::Backspace,
@@ -2447,14 +3251,20 @@ mod tests {
         ]);
         for key in keys {
             let mut app = app_in(&tmp);
+            app.runner = Box::new(runner.clone());
             select(&mut app, "notes.md");
             app.handle_key(KeyInput::Char('l'));
             assert!(matches!(app.mode, Mode::Pager(_)));
             let effect = app.handle_key(key);
             assert_eq!(effect, Effect::None, "{key:?} produced an effect");
             assert!(app.pending.is_none(), "{key:?} armed an operation");
+            assert!(!app.job_active(), "{key:?} started a summary");
             assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
         }
+        assert!(
+            runner.started.lock().unwrap().is_empty(),
+            "a reader key ran an AI provider"
+        );
     }
 
     #[test]
@@ -2659,6 +3469,7 @@ mod tests {
         let can = tempfile::tempdir().unwrap();
 
         let before = snapshot(tmp.path());
+        let runner = FakeRunner::default();
         let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
         keys.extend([
             KeyInput::Enter,
@@ -2675,6 +3486,7 @@ mod tests {
         ]);
         for key in keys {
             let mut app = app_with_can(&tmp, &can);
+            app.runner = Box::new(runner.clone());
             for row in 0..app.nav.visible().len() {
                 app.nav.cursor = row;
                 app.pending = None;
@@ -2690,11 +3502,19 @@ mod tests {
                     app.pending.is_none() || key == KeyInput::Char('d'),
                     "{key:?} armed an operation"
                 );
+                // `S` opens the file selector, which is as far as any
+                // browse key gets: no AI run may start without a
+                // selection and a chosen provider.
+                assert!(!app.job_active(), "{key:?} started a summary");
             }
             assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
             assert!(
                 can_contents(&can).is_empty(),
                 "{key:?} trashed something without a confirmation"
+            );
+            assert!(
+                runner.started.lock().unwrap().is_empty(),
+                "{key:?} ran an AI provider without a confirmed selection"
             );
         }
     }

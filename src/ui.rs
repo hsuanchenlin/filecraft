@@ -28,16 +28,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Level, Mode};
+use crate::app::{App, Level, Mode, QUIT_QUESTION};
 use crate::bearings::{
     self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
 };
 use crate::fsops::FsError;
 use crate::markdown::{self, Ink, Kind, Row};
+use crate::multiselect::FileSelector;
 use crate::nav::{EntryKind, NavState};
 use crate::pager::Pager;
 use crate::picker::FolderPicker;
 use crate::preview::{format_size, format_timestamp};
+use crate::summarize;
 
 /// Rows used by everything except the file list (borders, path, status,
 /// messages, prompt, hints). `main` uses this to size PageUp/PageDown.
@@ -307,11 +309,13 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
     match &app.mode {
         Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager),
         Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker),
+        Mode::FileSelector(selector) => draw_selector(frame, theme, list_area, selector),
+        Mode::ProviderMenu { files } => draw_provider_menu(frame, theme, list_area, files.len()),
         _ => draw_listing(
             frame, app, theme, list_area, &visible, offset, &bearings, now,
         ),
     }
-    draw_status(frame, theme, status_row, &bearings, now);
+    draw_status(frame, theme, status_row, &bearings, now, app.job_status());
     draw_messages(frame, app, theme, message_area);
     draw_prompt(frame, app, theme, prompt_row);
     draw_hints(frame, app, theme, hint_row);
@@ -546,6 +550,131 @@ fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &Folder
     frame.render_widget(Paragraph::new(lines), list_area);
 }
 
+/// The multi-file selector popup. Same listing-area frame as the folder
+/// picker, so the listing underneath is unchanged and cancelling lands on
+/// the same row. Selection is drawn as a `[x]` box, never as color alone,
+/// and the header counts what is selected in words.
+fn draw_selector(frame: &mut Frame<'_>, theme: &Theme, area: Rect, selector: &FileSelector) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let block = frame_only
+        .border_style(theme.banner())
+        .title(Span::styled(" summarize: pick files ", theme.prompt()))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(
+                    " Space pick {dot} l in {dot} h up {dot} Enter/c confirm {dot} q cancel ",
+                    dot = glyphs.dot
+                ),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let [header_row, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let header = pad_to_width_with(
+        &sanitize(&selector.header_line()),
+        header_row.width as usize,
+        glyphs.ellipsis,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(header, theme.prompt()))),
+        header_row,
+    );
+
+    let rows = list_area.height as usize;
+    if rows == 0 {
+        return;
+    }
+    // Two columns of cursor marker plus four of `[x] `.
+    let name_width = (list_area.width as usize).saturating_sub(6);
+    let offset = bearings::viewport_offset(selector.cursor, selector.entries.len(), rows, 1);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = offset + row;
+        let Some(entry) = selector.entries.get(index) else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let selected = index == selector.cursor;
+        let marker = if selected { "> " } else { "  " };
+        let name = pad_to_width_with(
+            &sanitize(&entry.display_name()),
+            name_width,
+            glyphs.ellipsis,
+        );
+        let style = match () {
+            _ if selected => theme.selected(),
+            _ if entry.is_enterable() => theme.dir(),
+            _ if selector.is_chosen(&entry.path) => theme.ok(),
+            _ => Style::default(),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{} {name}", selector.mark(entry)),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// The provider dialog. Every row names its digit and its exact command
+/// line, and the default is marked in words, so nothing about the choice
+/// is carried by position or color.
+fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: usize) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let block = frame_only
+        .border_style(theme.banner())
+        .title(Span::styled(" summarize: pick a provider ", theme.prompt()))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(
+                    " 1-5 choose {dot} Enter default {dot} q cancel ",
+                    dot = glyphs.dot
+                ),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let unit = if files == 1 { "file" } else { "files" };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            sanitize(&format!("{files} {unit} selected")),
+            theme.prompt(),
+        )),
+        Line::from(""),
+    ];
+    for line in summarize::menu_lines() {
+        lines.push(Line::from(Span::raw(sanitize(&line))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "the provider runs on this machine and reads only the files above",
+        theme.meta(),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// One drawn row of the reader, with the active search query picked out.
 fn reader_line(row: &Row, theme: &Theme, query: &str) -> Line<'static> {
     let spans = markdown::highlight(&row.spans, query);
@@ -590,11 +719,20 @@ fn draw_status(
     area: Rect,
     bearings: &Bearings,
     now: SystemTime,
+    job: Option<String>,
 ) {
     let glyphs = theme.glyphs();
     let mut speakable = bearings::speakable(bearings, now);
     let separator = format!(" {} ", glyphs.dot);
-    let width = (area.width as usize).saturating_sub(1);
+    // A running summary claims the head of the row and keeps it: it is
+    // the one thing on screen that is happening rather than being shown,
+    // so it is never what a narrow terminal drops.
+    let job = job.map(|status| sanitize(&status));
+    let claimed = job
+        .as_deref()
+        .map(|status| display_width(status) + 1)
+        .unwrap_or(0);
+    let width = (area.width as usize).saturating_sub(1 + claimed);
     bearings::bound_speakable_filter(&mut speakable, &separator, width, glyphs.ellipsis);
     let text = bearings::fit_joined_pinned(
         &speakable.parts,
@@ -603,10 +741,12 @@ fn draw_status(
         glyphs.ellipsis,
         speakable.pinned,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::raw(format!(" {text}")))),
-        area,
-    );
+    let mut spans = vec![Span::raw(" ")];
+    if let Some(status) = job {
+        spans.push(Span::styled(format!("{status} "), theme.prompt()));
+    }
+    spans.push(Span::raw(text));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
@@ -680,6 +820,28 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
                 picker.destination().display()
             ))),
         ]),
+        Mode::ConfirmQuit => Line::from(vec![
+            Span::styled(" confirm ", theme.confirm()),
+            Span::styled("[y]es / [n]o  ", theme.prompt()),
+            Span::raw(QUIT_QUESTION),
+        ]),
+        Mode::FileSelector(selector) => Line::from(vec![
+            Span::styled(" pick ", theme.prompt()),
+            Span::raw(match selector.count() {
+                0 => "files to summarize - Space marks the focused file".to_string(),
+                1 => "1 file marked - Enter or c to choose a provider".to_string(),
+                n => format!("{n} files marked - Enter or c to choose a provider"),
+            }),
+        ]),
+        Mode::ProviderMenu { files } => Line::from(vec![
+            Span::styled(" pick ", theme.prompt()),
+            Span::raw(format!(
+                "provider for {} file{} - Enter takes {}",
+                files.len(),
+                if files.len() == 1 { "" } else { "s" },
+                summarize::Provider::DEFAULT.code()
+            )),
+        ]),
         Mode::Browse => Line::from(vec![
             Span::styled(" cmd> ", theme.prompt()),
             Span::raw("press : to type a command"),
@@ -713,6 +875,20 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         ],
         Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
         Mode::ConfirmOp => &["y confirm", "n/q/Esc cancel", "nothing happens without y"],
+        Mode::ConfirmQuit => &[
+            "y terminate and quit",
+            "n/Esc keep running",
+            "the summary keeps going without y",
+        ],
+        Mode::FileSelector(_) => &[
+            "Space pick",
+            "j/k move",
+            "l in",
+            "h up",
+            "Enter/c confirm",
+            "q/Esc cancel",
+        ],
+        Mode::ProviderMenu { .. } => &["1-5 choose", "Enter default (ag)", "q/Esc cancel"],
         Mode::FolderPicker(_) => &[
             "j/k focus",
             "l in",
@@ -750,7 +926,7 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, KeyInput};
+    use crate::app::{App, Effect, KeyInput};
     use crate::bearings::display_width;
     use crate::nav::NavState;
     use ratatui::backend::TestBackend;
@@ -843,6 +1019,190 @@ mod tests {
     /// from the bottom, which is what makes "read the current line" work.
     fn status_row(height: u16) -> usize {
         height as usize - 7
+    }
+
+    /// A document tree the summarizer's screens can be drawn against.
+    fn summary_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.4").unwrap();
+        fs::write(tmp.path().join("notes.md"), "# notes").unwrap();
+        fs::write(tmp.path().join("log.txt"), "log").unwrap();
+        fs::write(tmp.path().join("photo.png"), "png").unwrap();
+        tmp
+    }
+
+    /// A job that never finishes, so a screen can be drawn mid-run.
+    struct StalledJob;
+
+    impl crate::summarize::Job for StalledJob {
+        fn poll(&mut self) -> Option<crate::summarize::Outcome> {
+            None
+        }
+        fn terminate(&mut self) {}
+    }
+
+    /// Put `app` into a state where a summary is running over `files`.
+    fn with_running_job(app: &mut App, files: &[&str]) {
+        let files: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+        let output = crate::summarize::output_path_with(&files[0], "20260829-101500", &|_| false);
+        let spec =
+            crate::summarize::JobSpec::new(crate::summarize::Provider::DEFAULT, files, output)
+                .unwrap();
+        app.job = Some(crate::app::ActiveJob::new(spec, Box::new(StalledJob)));
+    }
+
+    /// Open the file selector and select every named file.
+    fn open_selector(app: &mut App, pick: &[&str]) {
+        app.handle_key(KeyInput::Char('S'));
+        for name in pick {
+            let Mode::FileSelector(selector) = &mut app.mode else {
+                panic!("expected the file selector");
+            };
+            selector.cursor = selector
+                .entries
+                .iter()
+                .position(|e| e.name == *name)
+                .unwrap_or_else(|| panic!("row '{name}' not in the selector"));
+            app.handle_key(KeyInput::Char(' '));
+        }
+    }
+
+    #[test]
+    fn the_file_selector_draws_boxes_folders_and_a_count() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        open_selector(&mut app, &["notes.md"]);
+        let screen = render(&app);
+        assert!(screen.contains("summarize: pick files"), "{screen}");
+        assert!(screen.contains("selected: 1 file"), "{screen}");
+        assert!(screen.contains("[x] notes.md"), "{screen}");
+        assert!(screen.contains("[ ] report.pdf"), "{screen}");
+        assert!(screen.contains("archive/"), "{screen}");
+        // A file the summarizer cannot read is not offered at all.
+        assert!(!screen.contains("photo.png"), "{screen}");
+        assert!(screen.contains("Space pick"), "{screen}");
+    }
+
+    #[test]
+    fn the_provider_dialog_draws_every_command_line_and_marks_the_default() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        open_selector(&mut app, &["notes.md", "report.pdf"]);
+        app.handle_key(KeyInput::Enter);
+        let screen = render(&app);
+        assert!(screen.contains("summarize: pick a provider"), "{screen}");
+        assert!(screen.contains("2 files selected"), "{screen}");
+        for line in [
+            "[1] ag: agy --dangerously-skip-permissions  [Default]",
+            "[2] cc: claude --dangerously-skip-permissions",
+            "[3] co: codex -p lavish -a on-request",
+            "[4] gk: grok --always-approve",
+            "[5] ki: kimi --yolo",
+        ] {
+            assert!(screen.contains(line), "missing '{line}':\n{screen}");
+        }
+        assert!(screen.contains("Enter default"), "{screen}");
+    }
+
+    #[test]
+    fn a_running_summary_holds_the_head_of_the_status_row() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md", "/docs/c.txt"]);
+        for (width, height) in SIZES {
+            let screen = render_size(&app, width, height);
+            let status = row(&screen, status_row(height));
+            assert!(
+                status.contains("[AI: summarizing 3 files with agy]"),
+                "{width}x{height} lost the run from the status row: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_quit_prompt_names_the_question_and_both_answers() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        with_running_job(&mut app, &["/docs/a.pdf"]);
+        assert_eq!(app.handle_key(KeyInput::Char('q')), Effect::None);
+        let screen = render(&app);
+        assert!(
+            screen
+                .contains("confirm [y]es / [n]o  task in progress: terminate AI summary and quit?"),
+            "{screen}"
+        );
+        assert!(screen.contains("y terminate and quit"), "{screen}");
+        assert!(screen.contains("n/Esc keep running"), "{screen}");
+    }
+
+    #[test]
+    fn every_summarizer_screen_keeps_its_frame_at_every_size() {
+        let tmp = summary_fixture();
+        for stage in 0..4 {
+            for (width, height) in SIZES {
+                for theme in [
+                    Theme::from_no_color_env(None),
+                    Theme::from_no_color_env(Some("1")),
+                    Theme::from_env(None, Some("1")),
+                ] {
+                    let mut app = app_at(tmp.path());
+                    match stage {
+                        0 => open_selector(&mut app, &["notes.md"]),
+                        1 => {
+                            open_selector(&mut app, &["notes.md"]);
+                            app.handle_key(KeyInput::Enter);
+                        }
+                        // A summary running under the quit prompt, and
+                        // under the reader: the status row carries the
+                        // run in both, over a popup that covers the list.
+                        2 => {
+                            with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md"]);
+                            app.handle_key(KeyInput::Char('q'));
+                        }
+                        _ => {
+                            with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md"]);
+                            app.handle_key(KeyInput::Char('?'));
+                        }
+                    }
+                    let screen = render_themed(&mut app, width, height, &theme);
+                    let lines: Vec<&str> = screen.lines().collect();
+                    assert_eq!(lines.len(), height as usize);
+                    for (index, line) in lines.iter().enumerate() {
+                        assert_eq!(
+                            display_width(line),
+                            width as usize,
+                            "stage {stage} at {width}x{height} row {index}: {line:?}"
+                        );
+                    }
+                    if theme.ascii {
+                        for c in screen.chars().filter(|c| *c != '\n') {
+                            assert!(
+                                (' '..='~').contains(&c),
+                                "stage {stage} drew non-ascii {c:?} on an ascii screen:\n{screen}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_selector_and_provider_screens_survive_without_color_or_unicode() {
+        let tmp = summary_fixture();
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        let mut app = app_at(tmp.path());
+        open_selector(&mut app, &["notes.md"]);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        // Selection is a box, not a color, so it survives both.
+        assert!(screen.contains("[x] notes.md"), "{screen}");
+        assert!(screen.contains("[ ] report.pdf"), "{screen}");
+
+        app.handle_key(KeyInput::Enter);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("[Default]"), "{screen}");
+        assert!(screen.contains("[1] ag:"), "{screen}");
     }
 
     #[test]

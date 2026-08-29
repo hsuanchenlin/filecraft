@@ -5,7 +5,9 @@ A keyboard-first, BBS-style terminal file navigator for macOS.
 Filecraft is a practical local-filesystem MVP: one stable full-screen
 terminal view, a directory listing with visible focus, a command prompt,
 compact keyboard help, and explicit command/result messages. It hands
-files to Neovim (or `$EDITOR`) for editing and preview. It is not a
+files to Neovim (or `$EDITOR`) for editing and preview, and can hand a
+set of documents to an AI CLI you already have for a Markdown summary.
+It is not a
 Finder replacement and does not own the Desktop, Open/Save panels,
 iCloud, or default file handling.
 
@@ -155,6 +157,7 @@ In browse mode:
 | `h`, Left, Backspace | parent directory |
 | `0`-`9` | jump to that ancestor on the ladder |
 | `d` | move the selected entry to the Trash (asks `y/n`) |
+| `S` | AI summary: pick files, then a provider |
 | `/` | filter the listing (Esc clears) |
 | `:` | command prompt |
 | `.` | show/hide dotfiles |
@@ -173,6 +176,11 @@ itself: it raises the same `y/n` prompt `:delete` does, and only `y`
 moves anything. Every other filesystem operation goes through select ->
 `:` command -> `y`; opening a file in the configured editor remains the
 explicit path for editing file contents.
+
+`S` is the second browse key that can lead somewhere outside the
+listing, and like `d` it does nothing by itself: it opens a file
+selector. Nothing is read, no program is started, and no file is written
+until files are picked *and* a provider is chosen.
 
 **Changed in this slice:** `l` on a text or Markdown file now opens the
 built-in reader (below) instead of refusing. On a directory it still
@@ -203,6 +211,86 @@ to the listing; nothing is moved until `y`.
 | `g` / `G` | first / last folder |
 | Enter, `m` | choose the focused folder, then confirm |
 | `q`, Esc | cancel, back to the listing |
+
+## AI summary
+
+`S`, `:summarize`, or `:summary` opens a file selector over the listing.
+Mark documents with `Space`, walk into other folders with `l` and `h` -
+the marks come with you - and confirm with `Enter` or `c`. A provider
+dialog follows; the summary then runs in the background while the screen
+stays live.
+
+| Key | Action (file selector) |
+| --- | --- |
+| `j` / `k`, Down / Up | move focus |
+| PgUp / PgDn | move focus a page |
+| `Space` | mark / unmark the focused file (`[x]`) |
+| `l`, Right | enter the focused folder |
+| `h`, Left, Backspace | parent directory |
+| `g` / `G` | first / last row |
+| Enter, `c` | confirm the selection, then pick a provider |
+| `q`, Esc | cancel; nothing is run |
+
+Only `.pdf`, `.md`, `.markdown`, and `.txt` files are offered - the
+selector lists folders and those documents, and nothing else.
+
+```
+┌ summarize: pick a provider ────────────────────────────────────────────────┐
+│ 2 files selected                                                           │
+│                                                                            │
+│ [1] ag: agy --dangerously-skip-permissions  [Default]                      │
+│ [2] cc: claude --dangerously-skip-permissions                              │
+│ [3] co: codex -p lavish -a on-request                                      │
+│ [4] gk: grok --always-approve                                              │
+│ [5] ki: kimi --yolo                                                        │
+└───────────────────────────────────── 1-5 choose · Enter default · q cancel ┘
+```
+
+`1`-`5` run that provider; **Enter alone runs the default, `ag`**; `q`
+or Esc cancels. The command lines are a fixed table in
+`src/summarize.rs` - nothing you type ever becomes a program name or a
+flag, and the provider is spawned directly, never through a shell.
+
+While it runs, the status row carries the job and keeps it even on a
+narrow terminal:
+
+```
+ [AI: summarizing 3 files with agy] row 1 of 6 · all rows shown · notes.md
+```
+
+The screen stays fully usable: navigate, read files, run other commands.
+When the run ends, `ok: summary written to <path>` appears in the log
+without a keypress, the listing refreshes, and the new file is placed
+under the cursor so `l` opens it in the reader.
+
+The summary is written **beside the first file you marked**, as
+`<first-stem>-summary.md`. An existing file of that name is never
+overwritten: the run falls back to `<first-stem>-summary-<stamp>.md`.
+The provider is asked to write that one path and nothing else; if it
+prints the summary instead of writing it, its stdout is saved there.
+
+### Quitting with a summary running
+
+`q` and Ctrl-C ask first:
+
+```
+ confirm [y]es / [n]o  task in progress: terminate AI summary and quit?
+```
+
+`y` kills the child process and leaves. `n` or Esc keeps it running.
+Enter is **not** an answer here, for the same reason it is not one for a
+delete: the key that raised the prompt sits one slip away.
+
+### What this does and does not do
+
+- Nothing runs until you mark files and choose a provider. Both are
+  explicit key presses.
+- The provider is a program you already have installed. Filecraft opens
+  no network connection of its own, but that program may - the summary
+  is the one place Filecraft hands your file paths to something else.
+- Source files are never modified: a summary only ever adds a file.
+- This is not the `agent` seam, which stays disabled - see
+  [docs/agent-seam.md](docs/agent-seam.md).
 
 ## Reader
 
@@ -281,6 +369,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `open` | hand the selected entry to macOS `open` |
 | `edit` | edit the selected regular file in `$EDITOR` or `nvim` |
 | `preview` | read-only preview (Neovim if available, else built-in) |
+| `summarize`, `summary` | AI summary of files you pick (same as `S`) |
 | `agent [...]` | future AI seam; disabled in v0 (see [docs/agent-seam.md](docs/agent-seam.md)) |
 | `help` | help screen |
 | `quit` | leave Filecraft |
@@ -326,15 +415,22 @@ answering them with a deletion.
 ## Safety
 
 - Operations stay on the local filesystem. No telemetry, background
-  daemon, or hidden file index. The TUI never opens a network
-  connection; `filecraft update` is the only command that does, and
-  only to fetch and install this repository.
+  daemon, or hidden file index. Filecraft itself opens a network
+  connection only in `filecraft update`, and only to fetch and install
+  this repository.
+- `summarize` is the one command that hands your data to another
+  program: an AI CLI you already have, over files you marked yourself,
+  and that program may use the network. It runs only after an explicit
+  selection and an explicit provider choice, and its command line comes
+  from a fixed table - never from anything you type.
 - Commands are never evaluated by a shell.
 - Moves never overwrite an existing entry and never copy+delete across
   volumes.
 - Deletion is a move to the system Trash and is always recoverable. No
   code path in the shipped binary calls `remove_file`, `remove_dir`, or
   `remove_dir_all`.
+- A summary never overwrites a file: it writes a new `.md`, falling back
+  to a stamped name when the preferred one is taken.
 - The Filecraft screen is restored after the editor exits.
 
 ## Developer setup
