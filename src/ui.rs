@@ -1147,28 +1147,45 @@ mod tests {
         }
     }
 
-    /// No row of this dialog may *begin* with a flag. A command line too
-    /// wide for the box continues under its own command, indented, so it
-    /// can never be read as one more provider - which is only true while
-    /// `wrap_hanging` is the single thing deciding where a row breaks.
-    /// Well below the documented 60x20 minimum, where every row wraps.
+    /// Well below the documented 60x20 minimum, where every row wraps and
+    /// `--dangerously-skip-permissions` is wider than the whole dialog.
+    /// Nothing may be lost there either: a clipped row names a command
+    /// line that is not the one that runs. No row may *begin* with a
+    /// flag, so a continuation can never be read as one more provider -
+    /// which holds only while `wrap_hanging` is the single thing
+    /// deciding where a row breaks.
     #[test]
-    fn no_dialog_row_ever_begins_with_a_flag() {
+    fn a_narrow_dialog_still_draws_every_command_line_whole() {
         let tmp = summary_fixture();
         let mut app = app_at(tmp.path());
         open_selector(&mut app, &["notes.md", "report.pdf"]);
         app.handle_key(KeyInput::Enter);
         let screen = render_size(&app, 40, 30);
+
+        for line in summarize::menu_lines() {
+            let drawn = dialog_rows(&line, 40);
+            for piece in &drawn {
+                assert!(
+                    screen.contains(piece),
+                    "40x30 clipped '{piece}' of '{line}':\n{screen}"
+                );
+            }
+            // The pieces put the row back: the widest flag here does not
+            // fit one row at this width, and it still reaches the screen
+            // in full rather than being cut in half.
+            assert_eq!(
+                drawn.concat().replace(' ', ""),
+                line.replace(' ', ""),
+                "40x30 lost part of '{line}'"
+            );
+        }
+        assert!(
+            screen.contains("--dangerously-skip-permiss"),
+            "the widest flag never reached the screen:\n{screen}"
+        );
         assert!(
             !screen.contains("\u{2502} -"),
             "a row started with a flag instead of continuing under one:\n{screen}"
-        );
-        assert!(
-            screen.contains(&format!(
-                "\u{2502} {}--dangerously",
-                " ".repeat(summarize::MENU_INDENT)
-            )),
-            "the continuation lost its indent:\n{screen}"
         );
     }
 

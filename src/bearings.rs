@@ -162,9 +162,18 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
 /// with every row after the first indented by `indent` so a continuation
 /// reads as part of the row above and not as a new entry beneath it.
 ///
-/// A single word wider than the budget is left whole. These rows are
-/// command lines, and one cut mid-flag would name something other than
-/// what runs.
+/// Spaces are the preferred break and a word is kept whole wherever it
+/// fits on a row of its own. A word too wide even for that is broken
+/// across rows by character. That last resort is the deliberate choice:
+/// these rows are command lines, and a row left over-wide for the caller
+/// to clip would name something other than what runs. **Every row that
+/// comes back fits `width`**, so nothing downstream needs to wrap or cut
+/// it a second time - the one exception is a single character wider than
+/// the budget itself, which cannot be split and is handed over rather
+/// than dropped. The indent gives way for the same reason: a row with no
+/// room left for a character once it is applied is drawn without it,
+/// because the indent is a nicety and the text is not. A `width` of 0
+/// has no budget to fit anything into, so the text comes back whole.
 pub fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
     if width == 0 || display_width(text) <= width {
         return vec![text.to_string()];
@@ -180,12 +189,51 @@ pub fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
             row.push_str(word);
         } else {
             rows.push(std::mem::take(&mut row));
-            row.push_str(&pad);
-            row.push_str(word);
+            row = continue_under(&pad, word, width);
+        }
+        while display_width(&row) > width {
+            let (head, rest) = split_at_width(&row, width);
+            rows.push(head);
+            row = continue_under(&pad, &rest, width);
         }
     }
     rows.push(row);
     rows
+}
+
+/// A continuation row: the hanging indent, then what is left of the row -
+/// unless the indent would leave no room for even one character of it,
+/// which is also what keeps the split above making progress.
+fn continue_under(pad: &str, rest: &str, width: usize) -> String {
+    let first = rest.chars().next().map(char_width).unwrap_or(0);
+    if display_width(pad) + first > width {
+        return rest.to_string();
+    }
+    format!("{pad}{rest}")
+}
+
+/// `text` cut at the last character boundary that still fits `width`
+/// columns, never inside a wide character. A first character wider than
+/// the whole budget is taken anyway, so the split always advances.
+fn split_at_width(text: &str, width: usize) -> (String, String) {
+    let mut head = String::new();
+    let mut used = 0usize;
+    let mut rest = text.chars().peekable();
+    while let Some(&c) = rest.peek() {
+        let w = char_width(c);
+        if used + w > width {
+            break;
+        }
+        head.push(c);
+        used += w;
+        rest.next();
+    }
+    if head.is_empty() {
+        if let Some(c) = rest.next() {
+            head.push(c);
+        }
+    }
+    (head, rest.collect())
 }
 
 /// Join `parts` with `sep`, dropping whole trailing parts that do not
@@ -752,16 +800,53 @@ mod tests {
         assert_eq!(wrap_hanging(row, 80, 8), vec![row.to_string()]);
         let marked = "[1] ag: agy --dangerously-skip-permissions  [Default]";
         assert_eq!(wrap_hanging(marked, 54, 8), vec![marked.to_string()]);
-        // A word wider than the budget is left whole rather than cut: a
-        // flag cut in half would name something that does not run.
+        // A word too wide even for a row of its own is broken by
+        // character rather than left for the caller to clip - the last
+        // resort, and the only way the whole flag reaches the screen.
         assert_eq!(
-            wrap_hanging("[3] co: --a-very-long-flag-indeed", 12, 8),
+            wrap_hanging("[1] ag: agy --dangerously-skip-permissions", 34, 8),
             vec![
-                "[3] co:".to_string(),
-                "        --a-very-long-flag-indeed".to_string()
+                "[1] ag: agy".to_string(),
+                "        --dangerously-skip-permiss".to_string(),
+                "        ions".to_string(),
             ]
         );
         assert_eq!(wrap_hanging("anything", 0, 8), vec!["anything".to_string()]);
+    }
+
+    /// The two halves of the promise: every row fits the budget, so no
+    /// caller has to clip one, and putting the rows back together loses
+    /// nothing - not a flag, not a character of one. The single
+    /// exception is a character wider than the budget itself, which is
+    /// drawn over the edge rather than dropped.
+    #[test]
+    fn wrapping_fits_every_row_and_drops_nothing() {
+        let lines = [
+            "[1] ag: agy --dangerously-skip-permissions  [Default]",
+            "[3] co: codex exec -s workspace-write --skip-git-repo-check",
+            "the provider runs locally and reads only these files",
+            "[9] zz: --one-single-word-far-too-wide-for-any-of-this",
+            "wide 幅の広い文字 mixed in",
+        ];
+        for line in lines {
+            for width in [1, 2, 5, 12, 20, 34, 54, 80] {
+                for indent in [0, 8] {
+                    let rows = wrap_hanging(line, width, indent);
+                    for row in &rows {
+                        assert!(
+                            display_width(row) <= width || row.trim_start().chars().count() == 1,
+                            "{line:?} at {width}/{indent}: {row:?} overflows"
+                        );
+                    }
+                    let squeezed = |text: &str| text.replace(' ', "");
+                    assert_eq!(
+                        squeezed(&rows.concat()),
+                        squeezed(line),
+                        "{line:?} at {width}/{indent} lost something"
+                    );
+                }
+            }
+        }
     }
 
     use super::*;
