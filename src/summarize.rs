@@ -54,7 +54,7 @@ pub enum Provider {
     Ag,
     /// `claude --dangerously-skip-permissions -p <prompt>`
     Cc,
-    /// `codex exec --skip-git-repo-check <prompt>`
+    /// `codex exec -s workspace-write --skip-git-repo-check <prompt>`
     Co,
     /// `grok --always-approve -p <prompt>`
     Gk,
@@ -93,14 +93,18 @@ impl Provider {
     /// Each line is the form that runs headless and answers no questions:
     ///
     /// - `agy` / `claude`: their own skip-permissions flag, then `--print`.
-    /// - `codex`: the `exec` subcommand, which is the non-interactive one,
-    ///   and nothing else. A named `-p`/`--profile` would be a
+    /// - `codex`: the `exec` subcommand, which is the non-interactive
+    ///   one, then the two grants the run needs spelled out on the line
+    ///   itself. `-s workspace-write` is the write grant: `codex exec`
+    ///   takes its sandbox from the user's `config.toml` when the flag is
+    ///   absent, so a summary that is only ever written *beside its
+    ///   sources* must ask for it here rather than hope for it.
+    ///   `--skip-git-repo-check` is required because a folder of
+    ///   documents is usually not a git repository. A named
+    ///   `-p`/`--profile` would carry both, and did, but it names a
     ///   `$CODEX_HOME/<name>.config.toml` that exists only on the machine
-    ///   it was written on, so every other user would get a config error
-    ///   instead of a summary; `codex`'s own defaults already confine the
-    ///   run to the directory it is started in.
-    ///   `--skip-git-repo-check` is required because a folder of documents
-    ///   is usually not a git repository.
+    ///   it was written on: every other user would get a config error
+    ///   instead of a summary.
     /// - `grok`: `--always-approve`, then `--single`.
     /// - `kimi`: nothing but the program. `kimi` *refuses* to combine
     ///   `--yolo` or `--auto` with `--prompt` ("Cannot combine --prompt
@@ -109,7 +113,13 @@ impl Provider {
         let words: &[&str] = match self {
             Provider::Ag => &["agy", "--dangerously-skip-permissions"],
             Provider::Cc => &["claude", "--dangerously-skip-permissions"],
-            Provider::Co => &["codex", "exec", "--skip-git-repo-check"],
+            Provider::Co => &[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "--skip-git-repo-check",
+            ],
             Provider::Gk => &["grok", "--always-approve"],
             Provider::Ki => &["kimi"],
         };
@@ -192,6 +202,12 @@ pub fn resolve(digit: Option<char>) -> Option<Provider> {
         Some(c) => Provider::from_digit(c),
     }
 }
+
+/// How far into a menu row its command line starts - `[3] co: ` is
+/// eight columns. A row too wide for the dialog is continued under its
+/// command line rather than beside the digits, so the continuation can
+/// never be read as a sixth provider.
+pub const MENU_INDENT: usize = 8;
 
 /// The provider dialog as drawn: one row per provider, the default
 /// marked in words so the choice never rests on position or color.
@@ -485,9 +501,14 @@ impl Runner for ProcessRunner {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let shared = Arc::new(Mutex::new(Some(child)));
+        // Shared with the worker rather than moved into it: the quit path
+        // has to be able to fill the same reservation when the worker is
+        // still blocked on a pipe it no longer owns.
+        let reservation = Arc::new(Mutex::new(reservation));
         let (tx, rx) = mpsc::channel();
 
         let waiter = Arc::clone(&shared);
+        let writer = Arc::clone(&reservation);
         let output = spec.output.clone();
         let worker = std::thread::spawn(move || {
             let out_reader = std::thread::spawn(move || drain(stdout));
@@ -517,7 +538,7 @@ impl Runner for ProcessRunner {
             let outcome = match finish(exit_ok, written, &stdout_text, &stderr_text) {
                 Finish::UseWrittenFile => Outcome::Written(output),
                 Finish::WriteStdout => {
-                    match write_reserved(&mut reservation, stdout_text.as_bytes()) {
+                    match write_reserved(&mut hold(&writer), stdout_text.as_bytes()) {
                         Ok(()) => Outcome::Written(output),
                         Err(e) => {
                             Outcome::Failed(format!("could not write {}: {e}", output.display()))
@@ -525,7 +546,7 @@ impl Runner for ProcessRunner {
                     }
                 }
                 Finish::Failed(reason) => {
-                    match write_reserved(&mut reservation, failure_note(&reason).as_bytes()) {
+                    match write_reserved(&mut hold(&writer), failure_note(&reason).as_bytes()) {
                         Ok(()) => Outcome::Failed(reason),
                         Err(e) => Outcome::Failed(format!(
                             "{reason}; could not record failure in {}: {e}",
@@ -539,6 +560,8 @@ impl Runner for ProcessRunner {
 
         Ok(Box::new(ProcessJob {
             child: shared,
+            reservation,
+            output: spec.output.clone(),
             rx,
             done: None,
             worker: Some(worker),
@@ -548,6 +571,16 @@ impl Runner for ProcessRunner {
     fn description(&self) -> String {
         "a child process".to_string()
     }
+}
+
+/// The reservation, borrowed for as long as one write takes. A lock
+/// poisoned by a panicking writer still hands back the file: the quit
+/// path is the last chance to say what happened, and a panic there would
+/// leave the terminal in raw mode.
+fn hold(reservation: &Mutex<std::fs::File>) -> std::sync::MutexGuard<'_, std::fs::File> {
+    reservation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_reserved(file: &mut std::fs::File, content: &[u8]) -> std::io::Result<()> {
@@ -576,7 +609,7 @@ fn non_empty_file(path: &Path) -> bool {
 }
 
 /// How long [`ProcessJob::terminate`] waits for a killed run to wind
-/// itself up before it stops waiting.
+/// itself up before it finishes the job off itself.
 ///
 /// Killing the child does not close its pipes: anything it spawned
 /// inherited them, and the drain threads block until the *last* writer
@@ -585,11 +618,38 @@ fn non_empty_file(path: &Path) -> bool {
 /// about can hold the terminal in raw mode for as long as it likes.
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 
+/// What a run stopped at the quit prompt is called in its own summary
+/// file, when it did not wind up inside [`TERMINATE_GRACE`].
+pub const STOPPED_REASON: &str = "the summary run was stopped before it could finish";
+
 struct ProcessJob {
     child: Arc<Mutex<Option<Child>>>,
+    /// Shared with the worker. Whichever of the two finishes the run
+    /// writes through it, so the reserved file is never left empty.
+    reservation: Arc<Mutex<std::fs::File>>,
+    output: PathBuf,
     rx: Receiver<Outcome>,
     done: Option<Outcome>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProcessJob {
+    /// The run is over as far as the app is concerned, but the worker is
+    /// still blocked on a pipe the killed child no longer owns. Fill the
+    /// reservation here: the app drops the job the moment `terminate`
+    /// returns, and a detached worker dies with the process.
+    fn record_stopped(&self) -> Outcome {
+        match write_reserved(
+            &mut hold(&self.reservation),
+            failure_note(STOPPED_REASON).as_bytes(),
+        ) {
+            Ok(()) => Outcome::Failed(STOPPED_REASON.to_string()),
+            Err(e) => Outcome::Failed(format!(
+                "{STOPPED_REASON}; could not record failure in {}: {e}",
+                self.output.display()
+            )),
+        }
+    }
 }
 
 impl Job for ProcessJob {
@@ -616,12 +676,15 @@ impl Job for ProcessJob {
         }
         // Bounded on purpose: see `TERMINATE_GRACE`. Past the grace the
         // handle is dropped rather than joined, which detaches the worker
-        // and its two drain threads - they own nothing the quit path needs
-        // and the process exit collects them.
+        // and its two drain threads; the reservation they share is filled
+        // here first, so the run still ends in a note on disk and a
+        // failure the job reports.
         if let Some(worker) = self.worker.take() {
             let deadline = Instant::now() + TERMINATE_GRACE;
             while !worker.is_finished() {
                 if Instant::now() >= deadline {
+                    let stopped = self.record_stopped();
+                    self.done = Some(stopped);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -657,7 +720,11 @@ mod tests {
         let expected = [
             ("ag", "agy --dangerously-skip-permissions", '1'),
             ("cc", "claude --dangerously-skip-permissions", '2'),
-            ("co", "codex exec --skip-git-repo-check", '3'),
+            (
+                "co",
+                "codex exec -s workspace-write --skip-git-repo-check",
+                '3',
+            ),
             ("gk", "grok --always-approve", '4'),
             ("ki", "kimi", '5'),
         ];
@@ -686,7 +753,14 @@ mod tests {
             ),
             (
                 Provider::Co,
-                &["codex", "exec", "--skip-git-repo-check", "PROMPT"],
+                &[
+                    "codex",
+                    "exec",
+                    "-s",
+                    "workspace-write",
+                    "--skip-git-repo-check",
+                    "PROMPT",
+                ],
             ),
             (Provider::Gk, &["grok", "--always-approve", "-p", "PROMPT"]),
             (Provider::Ki, &["kimi", "-p", "PROMPT"]),
@@ -701,33 +775,84 @@ mod tests {
         }
     }
 
+    /// A flag whose value is a name looked up in the user's own
+    /// configuration rather than a word the CLI understands by itself.
+    /// The value is portable-looking and still machine-local, which is
+    /// why the flag, not the value, is what gives it away.
+    fn selects_a_configured_name(flag: &str) -> bool {
+        matches!(
+            flag,
+            "-p" | "--profile" | "-c" | "--config" | "--config-file" | "--settings"
+        )
+    }
+
+    /// A value that names a place instead of a mode: absolute, home
+    /// relative, environment expanded, or any other path.
+    fn names_a_place(value: &str) -> bool {
+        value.starts_with('/')
+            || value.starts_with('~')
+            || value.starts_with('.')
+            || value.contains('$')
+            || value.contains('/')
+    }
+
     /// The fixed line has to run on any machine that has the CLI
-    /// installed. A bare word *after* a flag is that flag's value, and
-    /// every value these CLIs take names something local to one machine:
-    /// a profile, a model, a directory. `codex exec -p lavish` was
-    /// exactly that - it needed a `$CODEX_HOME/lavish.config.toml` no
-    /// other user has, and codex exits with a config error without it.
+    /// installed, so no word in it may name something only one machine
+    /// has. `codex exec -p lavish` was exactly that: it needed a
+    /// `$CODEX_HOME/lavish.config.toml` no other user has, and codex
+    /// exits with a config error rather than writing a summary.
+    ///
+    /// A flag that takes a value is fine - `-s workspace-write` is a
+    /// mode every install understands. What is refused is a value looked
+    /// up in the user's configuration, and a value that is a path.
     #[test]
     fn no_provider_line_carries_a_machine_local_value() {
         for provider in Provider::ALL {
             let argv = provider.base_argv();
-            let mut after_a_flag = false;
+            let code = provider.code();
+            let mut expects_a_value: Option<&str> = None;
             for word in argv.iter().skip(1) {
-                if let Some(flag) = word.strip_prefix('-') {
-                    after_a_flag = true;
+                if let Some((flag, value)) = word.split_once('=').filter(|_| word.starts_with('-'))
+                {
                     assert!(
-                        !flag.contains('='),
-                        "{}: '{word}' carries a value",
-                        provider.code()
+                        !selects_a_configured_name(flag),
+                        "{code}: '{word}' selects a name from the user's own config"
                     );
-                } else {
+                    assert!(!names_a_place(value), "{code}: '{word}' names a path");
+                    expects_a_value = None;
+                } else if word.starts_with('-') {
+                    expects_a_value = Some(word);
+                } else if let Some(flag) = expects_a_value.take() {
                     assert!(
-                        !after_a_flag,
-                        "{}: '{word}' is a value for the flag before it",
-                        provider.code()
+                        !selects_a_configured_name(flag),
+                        "{code}: '{flag} {word}' selects a name from the user's own config"
                     );
+                    assert!(!names_a_place(word), "{code}: '{word}' names a path");
                 }
             }
+        }
+    }
+
+    /// The guard has to be able to fail, and to fail only on the thing it
+    /// is about: a name resolved out of the user's own configuration or a
+    /// path, never a portable mode word.
+    #[test]
+    fn the_machine_local_guard_reads_flag_values_and_not_positions() {
+        assert!(selects_a_configured_name("-p"));
+        assert!(selects_a_configured_name("--profile"));
+        assert!(selects_a_configured_name("--config"));
+        assert!(!selects_a_configured_name("-s"));
+        assert!(!selects_a_configured_name("-m"));
+        assert!(!selects_a_configured_name("--sandbox"));
+
+        for local in ["/Users/me/x.toml", "~/.codex/x.toml", "$HOME/x", "./x"] {
+            assert!(names_a_place(local), "{local} names a place");
+        }
+        for portable in ["workspace-write", "on-request", "gpt-5", "exec"] {
+            assert!(
+                !names_a_place(portable),
+                "{portable} is a mode, not a place"
+            );
         }
     }
 
@@ -794,6 +919,18 @@ mod tests {
         assert_eq!(resolve(Some('x')), None);
     }
 
+    /// Every row's command line starts at the same column, and that is
+    /// the column a continuation is indented to.
+    #[test]
+    fn every_menu_row_starts_its_command_at_the_indent() {
+        for (line, provider) in menu_lines().iter().zip(Provider::ALL) {
+            let prefix = format!("[{}] {}: ", provider.digit(), provider.code());
+            assert_eq!(prefix.chars().count(), MENU_INDENT, "{prefix:?}");
+            assert!(line.starts_with(&prefix), "{line:?}");
+            assert!(line[MENU_INDENT..].starts_with(&provider.command_line()));
+        }
+    }
+
     #[test]
     fn the_menu_marks_exactly_one_default() {
         let lines = menu_lines();
@@ -802,7 +939,10 @@ mod tests {
             lines[0],
             "[1] ag: agy --dangerously-skip-permissions  [Default]"
         );
-        assert_eq!(lines[2], "[3] co: codex exec --skip-git-repo-check");
+        assert_eq!(
+            lines[2],
+            "[3] co: codex exec -s workspace-write --skip-git-repo-check"
+        );
         assert_eq!(lines[4], "[5] ki: kimi");
         assert_eq!(
             lines.iter().filter(|l| l.contains("[Default]")).count(),

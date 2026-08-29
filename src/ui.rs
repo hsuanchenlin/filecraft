@@ -657,15 +657,20 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
         return;
     }
     let unit = if files == 1 { "file" } else { "files" };
-    let mut lines = vec![
-        Line::from(Span::styled(
-            sanitize(&format!("{files} {unit} selected")),
-            theme.prompt(),
-        )),
-        Line::from(""),
-    ];
+    // No blank under the count: at 60x20 this dialog has exactly nine
+    // rows, and the widest command line needs two of them.
+    let mut lines = vec![Line::from(Span::styled(
+        sanitize(&format!("{files} {unit} selected")),
+        theme.prompt(),
+    ))];
     for line in summarize::menu_lines() {
-        lines.push(Line::from(Span::raw(sanitize(&line))));
+        for row in bearings::wrap_hanging(
+            &sanitize(&line),
+            inner.width as usize,
+            summarize::MENU_INDENT,
+        ) {
+            lines.push(Line::from(Span::raw(row)));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1088,6 +1093,17 @@ mod tests {
         assert!(screen.contains("Space pick"), "{screen}");
     }
 
+    /// The provider dialog's inner width: the outer frame's two borders,
+    /// the dialog's own two, and one column of padding either side.
+    fn dialog_width(frame_width: u16) -> usize {
+        frame_width as usize - 6
+    }
+
+    /// One dialog line as the rows it is actually drawn on.
+    fn dialog_rows(line: &str, frame_width: u16) -> Vec<String> {
+        bearings::wrap_hanging(line, dialog_width(frame_width), summarize::MENU_INDENT)
+    }
+
     #[test]
     fn the_provider_dialog_draws_every_command_line_and_marks_the_default() {
         let tmp = summary_fixture();
@@ -1104,14 +1120,19 @@ mod tests {
             for line in [
                 "[1] ag: agy --dangerously-skip-permissions  [Default]",
                 "[2] cc: claude --dangerously-skip-permissions",
-                "[3] co: codex exec --skip-git-repo-check",
+                "[3] co: codex exec -s workspace-write --skip-git-repo-check",
                 "[4] gk: grok --always-approve",
                 "[5] ki: kimi",
             ] {
-                assert!(
-                    screen.contains(line),
-                    "{width}x{height} lost '{line}':\n{screen}"
-                );
+                // A row too wide for the dialog is continued under
+                // itself, not cut short: asserting every piece is what
+                // proves the whole command line reached the screen.
+                for piece in dialog_rows(line, width) {
+                    assert!(
+                        screen.contains(&piece),
+                        "{width}x{height} lost '{piece}' of '{line}':\n{screen}"
+                    );
+                }
             }
             // The safety statement is the point of the dialog, so it
             // has to survive the narrowest terminal whole.

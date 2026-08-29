@@ -158,6 +158,36 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
     out
 }
 
+/// One line as the rows it is drawn on: broken on spaces to fit `width`,
+/// with every row after the first indented by `indent` so a continuation
+/// reads as part of the row above and not as a new entry beneath it.
+///
+/// A single word wider than the budget is left whole. These rows are
+/// command lines, and one cut mid-flag would name something other than
+/// what runs.
+pub fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
+    if width == 0 || display_width(text) <= width {
+        return vec![text.to_string()];
+    }
+    let pad = " ".repeat(indent.min(width.saturating_sub(1)));
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split(' ') {
+        if row.is_empty() {
+            row.push_str(word);
+        } else if display_width(&row) + 1 + display_width(word) <= width {
+            row.push(' ');
+            row.push_str(word);
+        } else {
+            rows.push(std::mem::take(&mut row));
+            row.push_str(&pad);
+            row.push_str(word);
+        }
+    }
+    rows.push(row);
+    rows
+}
+
 /// Join `parts` with `sep`, dropping whole trailing parts that do not
 /// fit. The result never exceeds `width` columns and never ends inside a
 /// word - which is what makes the hint row safe at the documented 80x24
@@ -705,6 +735,35 @@ pub fn filter_matched_nothing(bearings: &Bearings) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A command line too wide for its box is continued *under* itself.
+    /// Column zero would read as the next entry in the list, which is
+    /// exactly what the provider dialog must never say.
+    #[test]
+    fn a_row_too_wide_is_continued_under_its_own_command() {
+        let row = "[3] co: codex exec -s workspace-write --skip-git-repo-check";
+        assert_eq!(
+            wrap_hanging(row, 54, 8),
+            vec![
+                "[3] co: codex exec -s workspace-write".to_string(),
+                "        --skip-git-repo-check".to_string(),
+            ]
+        );
+        // Room to spare: one row, byte for byte, double spaces and all.
+        assert_eq!(wrap_hanging(row, 80, 8), vec![row.to_string()]);
+        let marked = "[1] ag: agy --dangerously-skip-permissions  [Default]";
+        assert_eq!(wrap_hanging(marked, 54, 8), vec![marked.to_string()]);
+        // A word wider than the budget is left whole rather than cut: a
+        // flag cut in half would name something that does not run.
+        assert_eq!(
+            wrap_hanging("[3] co: --a-very-long-flag-indeed", 12, 8),
+            vec![
+                "[3] co:".to_string(),
+                "        --a-very-long-flag-indeed".to_string()
+            ]
+        );
+        assert_eq!(wrap_hanging("anything", 0, 8), vec!["anything".to_string()]);
+    }
+
     use super::*;
     use std::time::Duration;
 

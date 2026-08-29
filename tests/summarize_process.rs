@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use filecraft::summarize::{
-    output_path_with, Job, JobSpec, Outcome, ProcessRunner, Provider, Runner,
+    output_path_with, Job, JobSpec, Outcome, ProcessRunner, Provider, Runner, STOPPED_REASON,
 };
 
 /// Longest a stub run may take before the test gives up. Generous: it is
@@ -266,7 +266,16 @@ fn every_provider_is_handed_its_prompt_through_the_flag_its_cli_requires() {
             Provider::Cc,
             &["claude", "--dangerously-skip-permissions", "-p"],
         ),
-        (Provider::Co, &["codex", "exec", "--skip-git-repo-check"]),
+        (
+            Provider::Co,
+            &[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "--skip-git-repo-check",
+            ],
+        ),
         (Provider::Gk, &["grok", "--always-approve", "-p"]),
         (Provider::Ki, &["kimi", "-p"]),
     ];
@@ -461,6 +470,19 @@ fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
         waited < ORPHAN_LIFETIME / 2,
         "terminate waited {waited:?} for a pipe the killed child no longer owns"
     );
+
+    // And the run still ends the way every other failed run ends: the
+    // reservation holds a note, and the job says what happened. The
+    // worker that would normally write it is still blocked on the pipe,
+    // and the app drops the job the moment `terminate` returns.
+    assert_eq!(
+        job.poll(),
+        Some(Outcome::Failed(STOPPED_REASON.to_string())),
+        "a stopped run has to report a failure"
+    );
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(artifact.contains("Summary failed"), "{artifact}");
+    assert!(artifact.contains(STOPPED_REASON), "{artifact}");
 }
 
 #[test]

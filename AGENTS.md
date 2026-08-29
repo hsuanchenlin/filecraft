@@ -100,8 +100,10 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   in front of a user. A fixed line must also name nothing that exists on
   one machine only - a `--profile`, a config path - or the provider is
   unusable for everyone but its author;
-  `no_provider_line_carries_a_machine_local_value` refuses any flag that
-  takes a value.
+  `no_provider_line_carries_a_machine_local_value` refuses a value looked
+  up in the user's own config (`-p`/`--profile`/`--config`) and a value
+  that is a path, and allows a portable mode word such as
+  `codex`'s `-s workspace-write`.
   At most one job runs: `App::job` is the single thing the status row,
   the quit confirmation, and the completion message all refer to.
   `ProcessRunner` atomically reserves the output before spawning. A failed
@@ -115,7 +117,10 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   a trash. `terminate` runs on the UI thread, so it waits only
   `TERMINATE_GRACE` for the run to wind up: killing the child does not
   close pipes a grandchild inherited, and an unbounded wait leaves the
-  TUI frozen in raw mode.
+  TUI frozen in raw mode. Past the grace `terminate` itself fills the
+  reservation with the failure note and reports `Outcome::Failed` - the
+  reservation is an `Arc<Mutex<File>>` shared with the worker for exactly
+  that, because the app drops the job the moment `terminate` returns.
 - `no_browse_key_ever_mutates_the_filesystem` and its reader twin also
   assert that no key starts an AI run. `S` may open the selector and
   nothing more; a provider only ever runs after a selection *and* a

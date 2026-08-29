@@ -237,10 +237,9 @@ selector lists folders and those documents, and nothing else.
 ```
 ┌ summarize: pick a provider ────────────────────────────────────────────────┐
 │ 2 files selected                                                           │
-│                                                                            │
 │ [1] ag: agy --dangerously-skip-permissions  [Default]                      │
 │ [2] cc: claude --dangerously-skip-permissions                              │
-│ [3] co: codex exec --skip-git-repo-check                                   │
+│ [3] co: codex exec -s workspace-write --skip-git-repo-check                │
 │ [4] gk: grok --always-approve                                              │
 │ [5] ki: kimi                                                               │
 └───────────────────────────────────── 1-5 choose · Enter default · q cancel ┘
@@ -272,9 +271,12 @@ its prompt mode carries its own permissions.
 
 Each line runs on any machine that has the CLI installed: it names no
 profile, no config file, and nothing else that would only exist where it
-was written. `codex` is the one that needs a flag of its own,
-`--skip-git-repo-check`, because a folder of documents is usually not a
-git repository; it otherwise runs under `codex`'s own defaults.
+was written. A flag that takes a value is fine when the value is a mode
+every install understands, which is why `codex` spells both of its
+grants out - `-s workspace-write`, because `codex exec` otherwise takes
+its sandbox from your own `config.toml` and a summary is written beside
+its sources, and `--skip-git-repo-check`, because a folder of documents
+is usually not a git repository.
 
 While it runs, the status row carries the job and keeps it even on a
 narrow terminal:
