@@ -19,6 +19,9 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::session;
+use crate::stream;
+
 /// Extensions the summarizer accepts. Anything else is refused in words
 /// rather than handed to a model that cannot read it.
 pub const SUMMARIZABLE: [&str; 4] = ["pdf", "md", "markdown", "txt"];
@@ -160,6 +163,41 @@ impl Provider {
         argv.extend(self.prompt_flag().map(str::to_string));
         argv.push(prompt.to_string());
         argv
+    }
+
+    /// The fixed line that **reopens** a finished run's session in the
+    /// provider's own CLI, without the identifier.
+    ///
+    /// A second table, and a second set of flags that are not guessable
+    /// from the first: `agy` resumes with `--conversation` and has no
+    /// `--resume` at all, `codex` resumes through a subcommand rather
+    /// than a flag, and `kimi` calls it `--session`. Every line here was
+    /// read off the installed CLI's own `--help`, for the same reason
+    /// [`Provider::prompt_flag`] was - a plausible-looking flag that the
+    /// tool does not have is worse than no advice, because it is advice
+    /// the user will follow.
+    ///
+    /// Filecraft never runs these. They are printed - in the log
+    /// viewer's header and in the summary's footer - for the user to run
+    /// themselves, outside Filecraft.
+    pub fn resume_words(self) -> &'static [&'static str] {
+        match self {
+            // `--conversation <id>`: resume a previous conversation by ID.
+            Provider::Ag => &["agy", "--conversation"],
+            // `-r, --resume <session-id>`.
+            Provider::Cc => &["claude", "--resume"],
+            // A subcommand, not a flag: `codex resume <id>`.
+            Provider::Co => &["codex", "resume"],
+            // `-r, --resume <SESSION_ID_OR_TITLE>`.
+            Provider::Gk => &["grok", "--resume"],
+            // `-S, --session [id]`.
+            Provider::Ki => &["kimi", "--session"],
+        }
+    }
+
+    /// The reopen command for one session, as one readable line.
+    pub fn resume_command(self, id: &str) -> String {
+        format!("{} {id}", self.resume_words().join(" "))
     }
 
     /// The program the child process will be, for status lines and errors.
@@ -455,8 +493,13 @@ pub trait Job: Send {
 
 /// How a [`JobSpec`] becomes a running [`Job`]. The seam: the shipped
 /// binary spawns a process, tests hand back a scripted job.
+///
+/// `stream` is the log the run fills as it goes. The caller owns it and
+/// keeps it after the job is dropped, which is what lets the log viewer
+/// still be opened over a run that has already finished; a runner that
+/// has nothing to say into it simply never appends.
 pub trait Runner: Send {
-    fn start(&self, spec: &JobSpec) -> Result<Box<dyn Job>, String>;
+    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, String>;
     /// What this runner is, for the message log.
     fn description(&self) -> String {
         "a child process".to_string()
@@ -473,7 +516,7 @@ pub fn process_runner() -> Box<dyn Runner> {
 }
 
 impl Runner for ProcessRunner {
-    fn start(&self, spec: &JobSpec) -> Result<Box<dyn Job>, String> {
+    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, String> {
         let argv = spec.argv();
         let mut reservation = std::fs::OpenOptions::new()
             .write(true)
@@ -491,6 +534,8 @@ impl Runner for ProcessRunner {
             Ok(child) => child,
             Err(e) => {
                 let reason = format!("could not run '{}': {e}", argv[0]);
+                stream.append(stream::Origin::Err, &format!("{reason}\n"));
+                stream.end();
                 write_reserved(&mut reservation, failure_note(&reason).as_bytes()).map_err(
                     |write_error| format!("{reason}; could not record failure: {write_error}"),
                 )?;
@@ -510,9 +555,15 @@ impl Runner for ProcessRunner {
         let waiter = Arc::clone(&shared);
         let writer = Arc::clone(&reservation);
         let output = spec.output.clone();
+        let provider = spec.provider;
+        let live = stream.clone();
+        let out_live = stream.clone();
+        let err_live = stream.clone();
         let worker = std::thread::spawn(move || {
-            let out_reader = std::thread::spawn(move || drain(stdout));
-            let err_reader = std::thread::spawn(move || drain(stderr));
+            let out_reader =
+                std::thread::spawn(move || drain(stdout, stream::Origin::Out, &out_live));
+            let err_reader =
+                std::thread::spawn(move || drain(stderr, stream::Origin::Err, &err_live));
 
             // Polled rather than waited on, so `terminate` can take the
             // same lock and kill the child mid-run.
@@ -534,12 +585,16 @@ impl Runner for ProcessRunner {
 
             let stdout_text = out_reader.join().unwrap_or_default();
             let stderr_text = err_reader.join().unwrap_or_default();
+            // Both pipes are closed: whatever the provider said, it has
+            // said. Ending the log here is what commits an unterminated
+            // last line and settles the session the footer names.
+            live.end();
             let written = non_empty_file(&output);
             let outcome = match finish(exit_ok, written, &stdout_text, &stderr_text) {
-                Finish::UseWrittenFile => Outcome::Written(output),
+                Finish::UseWrittenFile => Outcome::Written(output.clone()),
                 Finish::WriteStdout => {
                     match write_reserved(&mut hold(&writer), stdout_text.as_bytes()) {
-                        Ok(()) => Outcome::Written(output),
+                        Ok(()) => Outcome::Written(output.clone()),
                         Err(e) => {
                             Outcome::Failed(format!("could not write {}: {e}", output.display()))
                         }
@@ -555,6 +610,7 @@ impl Runner for ProcessRunner {
                     }
                 }
             };
+            sign(&output, provider, live.session().as_deref());
             let _ = tx.send(outcome);
         });
 
@@ -562,6 +618,8 @@ impl Runner for ProcessRunner {
             child: shared,
             reservation,
             output: spec.output.clone(),
+            provider: spec.provider,
+            live: stream.clone(),
             rx,
             done: None,
             worker: Some(worker),
@@ -590,14 +648,94 @@ fn write_reserved(file: &mut std::fs::File, content: &[u8]) -> std::io::Result<(
     file.flush()
 }
 
-/// Read a captured pipe to the end, losing nothing to encoding.
-fn drain(pipe: Option<impl Read>) -> String {
+/// Read a captured pipe to the end, losing nothing to encoding, and hand
+/// every chunk to the live log on the way past.
+///
+/// Read in chunks rather than to the end, because the log is watched
+/// while the run is going: `read_to_end` would show the whole run at
+/// once, the moment it no longer mattered. The full text is still
+/// returned, because [`finish`] needs the whole of stdout - the log
+/// forgets its oldest lines and a summary written from it would be
+/// missing its beginning.
+fn drain(pipe: Option<impl Read>, origin: stream::Origin, live: &stream::Handle) -> String {
     let Some(mut pipe) = pipe else {
         return String::new();
     };
-    let mut buf = Vec::new();
-    let _ = pipe.read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut text = String::new();
+    let mut buf = [0u8; 8 * 1024];
+    // A chunk boundary can split a multi-byte character; the tail waits
+    // for the rest of itself rather than becoming a replacement char.
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => {
+                tail.extend_from_slice(&buf[..read]);
+                let chunk = match std::str::from_utf8(&tail) {
+                    Ok(whole) => {
+                        let chunk = whole.to_string();
+                        tail.clear();
+                        chunk
+                    }
+                    Err(error) => {
+                        let good = error.valid_up_to();
+                        let chunk = String::from_utf8_lossy(&tail[..good]).into_owned();
+                        tail.drain(..good);
+                        chunk
+                    }
+                };
+                text.push_str(&chunk);
+                live.append(origin, &chunk);
+            }
+            Err(_) => break,
+        }
+    }
+    if !tail.is_empty() {
+        let rest = String::from_utf8_lossy(&tail).into_owned();
+        text.push_str(&rest);
+        live.append(origin, &rest);
+    }
+    text
+}
+
+/// Append the run's provenance to the Markdown it produced: which
+/// provider wrote it, which session it belongs to, and the command that
+/// reopens that session in the provider's own CLI.
+///
+/// Every ending gets one - a written summary, a summary saved from
+/// stdout, and a failure note - because the session is exactly what a
+/// failed run is worth reopening for. A run whose provider never
+/// announced a session still says which provider it was.
+///
+/// Best effort by design: the summary is the point, and a footer that
+/// could not be appended must never turn a finished run into a failure.
+fn sign(output: &Path, provider: Provider, session: Option<&str>) {
+    let resume = session.map(|id| provider.resume_command(id));
+    let footer = session::footer(&provider.program(), session, resume.as_deref());
+    let _ = append_footer(output, &footer);
+}
+
+/// Append `footer` as its own paragraph, whatever the file ended with.
+fn append_footer(path: &Path, footer: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)?;
+    let mut lead = String::new();
+    let len = file.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        file.seek(std::io::SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            lead.push('\n');
+        }
+        lead.push('\n');
+    }
+    // Opened for append: the write lands at the end whatever the read
+    // above left the cursor on.
+    file.write_all(format!("{lead}{footer}\n").as_bytes())?;
+    file.flush()
 }
 
 /// Whether the provider actually produced a summary at `path`. An empty
@@ -628,6 +766,10 @@ struct ProcessJob {
     /// writes through it, so the reserved file is never left empty.
     reservation: Arc<Mutex<std::fs::File>>,
     output: PathBuf,
+    provider: Provider,
+    /// The live log, so a run stopped at the quit prompt still signs its
+    /// note with the session it opened.
+    live: stream::Handle,
     rx: Receiver<Outcome>,
     done: Option<Outcome>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -644,15 +786,21 @@ impl ProcessJob {
     /// wins. A provider can have written its summary and still leave the
     /// drain blocked, and the note would truncate what it wrote.
     fn record_stopped(&self) -> Outcome {
+        let sign_it = || sign(&self.output, self.provider, self.live.session().as_deref());
         let reason = match finish(false, non_empty_file(&self.output), "", STOPPED_REASON) {
-            Finish::UseWrittenFile => return Outcome::Written(self.output.clone()),
+            Finish::UseWrittenFile => {
+                sign_it();
+                return Outcome::Written(self.output.clone());
+            }
             Finish::WriteStdout => STOPPED_REASON.to_string(),
             Finish::Failed(reason) => reason,
         };
-        match write_reserved(
+        let written = write_reserved(
             &mut hold(&self.reservation),
             failure_note(&reason).as_bytes(),
-        ) {
+        );
+        sign_it();
+        match written {
             Ok(()) => Outcome::Failed(reason),
             Err(e) => Outcome::Failed(format!(
                 "{reason}; could not record failure in {}: {e}",
@@ -684,6 +832,10 @@ impl Job for ProcessJob {
                 let _ = child.wait();
             }
         }
+        self.live.append(
+            stream::Origin::Err,
+            &format!("filecraft: {STOPPED_REASON}\n"),
+        );
         // Bounded on purpose: see `TERMINATE_GRACE`. Past the grace the
         // handle is dropped rather than joined, which detaches the worker
         // and its two drain threads; the reservation they share is filled
@@ -693,6 +845,10 @@ impl Job for ProcessJob {
             let deadline = Instant::now() + TERMINATE_GRACE;
             while !worker.is_finished() {
                 if Instant::now() >= deadline {
+                    // The drain threads are still blocked on a pipe a
+                    // grandchild holds; nothing more is coming into the
+                    // log that this app will ever see.
+                    self.live.end();
                     let stopped = self.record_stopped();
                     self.done = Some(stopped);
                     return;
@@ -701,6 +857,7 @@ impl Job for ProcessJob {
             }
             let _ = worker.join();
         }
+        self.live.end();
     }
 }
 
@@ -839,6 +996,67 @@ mod tests {
             }
         }
         found
+    }
+
+    /// The reopen table, read off each installed CLI's own `--help`.
+    ///
+    /// Not guessable from the run table and not uniform: only two of the
+    /// five call it `--resume`. This is the same lesson `prompt_flag`
+    /// carries, and it matters more here, because the line is printed as
+    /// advice the user will type themselves.
+    #[test]
+    fn every_provider_names_the_reopen_command_its_own_cli_has() {
+        let expected = [
+            (Provider::Ag, "agy --conversation ID"),
+            (Provider::Cc, "claude --resume ID"),
+            (Provider::Co, "codex resume ID"),
+            (Provider::Gk, "grok --resume ID"),
+            (Provider::Ki, "kimi --session ID"),
+        ];
+        for (provider, line) in expected {
+            assert_eq!(provider.resume_command("ID"), line);
+            // It reopens the same program the run was, and carries the
+            // identifier exactly once, as the last word.
+            assert_eq!(provider.resume_words()[0], provider.program());
+            assert!(line.ends_with(" ID"));
+            assert_eq!(line.matches("ID").count(), 1);
+        }
+    }
+
+    /// The reopen line is advice for another machine's shell as much as
+    /// this one's, so it is held to the same rule the run line is.
+    #[test]
+    fn no_reopen_line_carries_a_machine_local_value() {
+        for provider in Provider::ALL {
+            let words: Vec<String> = provider
+                .resume_words()
+                .iter()
+                .map(|w| (*w).to_string())
+                .collect();
+            let offenders = machine_local_words(&words);
+            assert!(
+                offenders.is_empty(),
+                "{}: {offenders:?} exist on one machine only",
+                provider.code()
+            );
+        }
+    }
+
+    /// Nothing a provider printed reaches the footer unchecked: the
+    /// identifier has already been through [`crate::session::is_id`], and
+    /// a run without one says so rather than printing half a command.
+    #[test]
+    fn the_footer_is_written_from_the_same_table_the_header_reads() {
+        let footer = session::footer(
+            &Provider::Ag.program(),
+            Some("abc-123456"),
+            Some(&Provider::Ag.resume_command("abc-123456")),
+        );
+        assert_eq!(
+            footer,
+            "> Provider: agy | Session: abc-123456 | \
+             Resume with: agy --conversation abc-123456"
+        );
     }
 
     #[test]

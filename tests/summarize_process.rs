@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use filecraft::stream::{Handle, StreamLine};
 use filecraft::summarize::{
     output_path_with, Job, JobSpec, Outcome, ProcessRunner, Provider, Runner, STOPPED_REASON,
 };
@@ -41,11 +42,16 @@ fn stub_path() -> &'static Path {
 printf '# Summary\n\nwritten by the stub provider\n' > "$path"
 "#,
         );
-        // `claude`: prints the summary instead of writing it.
+        // `claude`: announces a session, says what it is doing, and only
+        // then prints the summary instead of writing it. The banner and
+        // the second of silence after it are what let a test watch the
+        // log fill while the run is still going.
         write_stub(
             &dir,
             "claude",
-            "sleep 1\nprintf '# Summary\\n\\nfrom stdout\\n'\n",
+            &format!(
+                "printf 'session_id: {SESSION}\\n' >&2\n                 printf 'reading the files\\n' >&2\n                 sleep 1\n                 printf '# Summary\\n\\nfrom stdout\\n'\n"
+            ),
         );
         // `codex`: fails, and says why on stderr.
         write_stub(
@@ -190,6 +196,10 @@ fi
     }
 }
 
+/// The session the `claude` stub announces, in the shape `codex exec`
+/// really prints one - on stderr, in a banner, before anything else.
+const SESSION: &str = "11111111-2222-3333";
+
 /// How the `grok` stub is asked to leave a pipe holder behind, and how
 /// it says it has. Only the terminate tests write the request.
 const ORPHAN_REQUEST: &str = ".orphan";
@@ -309,7 +319,7 @@ fn every_provider_is_handed_its_prompt_through_the_flag_its_cli_requires() {
     for (provider, argv) in expected {
         let tmp = tempfile::tempdir().unwrap();
         let spec = spec_in(&tmp, provider);
-        let mut job = ProcessRunner.start(&spec).unwrap();
+        let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
         // Recorded before the stub's body, so `grok`'s endless sleep is
         // read the same way as a run that finishes on its own.
@@ -356,7 +366,7 @@ fn a_bare_trailing_prompt_is_refused_the_way_the_real_cli_refuses_it() {
 
     // What it builds now: the same line with `-p` before the prompt.
     assert_eq!(spec.argv(), Provider::Ag.argv_with_prompt(&spec.prompt()));
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
     assert_eq!(wait_for(&mut job), Outcome::Written(spec.output.clone()));
 }
 
@@ -365,7 +375,7 @@ fn a_provider_that_writes_the_file_reports_that_file() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Ag);
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     assert_eq!(wait_for(&mut job), Outcome::Written(spec.output.clone()));
     let written = std::fs::read_to_string(&spec.output).unwrap();
@@ -382,7 +392,7 @@ fn a_provider_that_only_prints_has_its_stdout_saved_as_the_summary() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Cc);
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     assert_eq!(wait_for(&mut job), Outcome::Written(spec.output.clone()));
     let written = std::fs::read_to_string(&spec.output).unwrap();
@@ -396,7 +406,7 @@ fn an_existing_output_prevents_the_provider_from_starting() {
     let spec = spec_in(&tmp, Provider::Cc);
     std::fs::write(&spec.output, "keep me").unwrap();
 
-    let error = ProcessRunner.start(&spec).err().unwrap();
+    let error = ProcessRunner.start(&spec, &Handle::new()).err().unwrap();
     assert!(error.starts_with("could not reserve"), "{error}");
     assert_eq!(std::fs::read_to_string(&spec.output).unwrap(), "keep me");
 }
@@ -406,7 +416,7 @@ fn a_failing_provider_does_not_save_its_stdout_as_a_summary() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Co);
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     assert_eq!(
         wait_for(&mut job),
@@ -422,7 +432,7 @@ fn a_silent_provider_is_a_failure_not_an_empty_summary() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Ki);
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     assert_eq!(
         wait_for(&mut job),
@@ -440,7 +450,7 @@ fn a_long_run_stays_in_flight_and_terminate_ends_it() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Gk);
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     // Still going: this is what keeps the TUI answering keys.
     std::thread::sleep(Duration::from_millis(200));
@@ -476,7 +486,7 @@ fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Gk);
     std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
     wait_for_orphan(&spec.cwd);
 
@@ -515,7 +525,7 @@ fn a_summary_already_written_survives_the_stop_that_finds_it() {
     let spec = spec_in(&tmp, Provider::Gk);
     std::fs::write(spec.cwd.join(SUMMARY_FIRST), "").unwrap();
     std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
-    let mut job = ProcessRunner.start(&spec).unwrap();
+    let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
     wait_for_orphan(&spec.cwd);
 
     job.terminate();
@@ -540,10 +550,139 @@ fn a_run_that_cannot_be_spawned_is_a_plain_error_and_never_a_job() {
     spec.cwd = tmp.path().join("gone");
 
     let error = ProcessRunner
-        .start(&spec)
+        .start(&spec, &Handle::new())
         .err()
         .expect("a spawn that cannot happen is not a running job");
     assert!(error.starts_with("could not run 'agy'"), "{error}");
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
     assert!(artifact.contains(&error), "{artifact}");
+}
+
+/// The live log: what the provider prints reaches the log *while it is
+/// still printing it*, not in one lump when the run is over.
+///
+/// The stub announces its session, says what it is doing, and then goes
+/// quiet for a second. Seeing both lines while the run is still alive is
+/// the whole contract the log viewer rests on.
+#[test]
+fn the_log_fills_while_the_run_is_still_going() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Cc);
+    let live = Handle::new();
+    let mut job = ProcessRunner.start(&spec, &live).unwrap();
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let state = live.state(Instant::now());
+        if state.total >= 2 {
+            assert!(
+                live.running(),
+                "the log only filled once the run was already over"
+            );
+            assert_eq!(state.session.as_deref(), Some(SESSION));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing reached the log while the run was going"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(wait_for(&mut job), Outcome::Written(spec.output.clone()));
+    assert!(!live.running(), "a finished run is not still live");
+    let drawn: Vec<String> = live
+        .snapshot_since(0)
+        .unwrap()
+        .lines
+        .iter()
+        .map(StreamLine::numbered)
+        .collect();
+    assert_eq!(
+        drawn[..2],
+        [
+            format!("    1 ! session_id: {SESSION}"),
+            "    2 ! reading the files".to_string(),
+        ]
+    );
+}
+
+/// The summary is signed with the session it came from, using the
+/// provider's own reopen command - so the run can be picked up in the
+/// CLI, outside Filecraft.
+#[test]
+fn a_summary_is_signed_with_the_session_its_provider_announced() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Cc);
+    let live = Handle::new();
+    let mut job = ProcessRunner.start(&spec, &live).unwrap();
+    assert_eq!(wait_for(&mut job), Outcome::Written(spec.output.clone()));
+
+    let written = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(written.contains("from stdout"), "{written}");
+    assert!(
+        written.trim_end().ends_with(&format!(
+            "> Provider: claude | Session: {SESSION} | \
+             Resume with: claude --resume {SESSION}"
+        )),
+        "{written}"
+    );
+    // Its own paragraph, whatever the summary ended with.
+    assert!(written.contains("\n\n> Provider: claude"), "{written:?}");
+}
+
+/// A run whose provider never announced a session still says which
+/// provider it was - and says plainly that there is no session, rather
+/// than printing a command that would not work.
+#[test]
+fn a_run_without_a_session_says_so_instead_of_inventing_one() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    // `kimi` succeeds silently, writing nothing: a failure note, which is
+    // exactly the ending a session would be most useful for.
+    let spec = spec_in(&tmp, Provider::Ki);
+    let live = Handle::new();
+    let mut job = ProcessRunner.start(&spec, &live).unwrap();
+    assert!(matches!(wait_for(&mut job), Outcome::Failed(_)));
+
+    assert_eq!(live.session(), None);
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(artifact.contains("Summary failed"), "{artifact}");
+    assert!(
+        artifact
+            .trim_end()
+            .ends_with("> Provider: kimi | Session: not reported"),
+        "{artifact}"
+    );
+}
+
+/// A run stopped at the quit prompt is still a run that happened: its
+/// note says so in the log, and the file it leaves behind is signed like
+/// any other ending.
+#[test]
+fn a_stopped_run_ends_its_log_and_signs_what_it_left() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Gk);
+    std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
+    let live = Handle::new();
+    let mut job = ProcessRunner.start(&spec, &live).unwrap();
+    wait_for_orphan(&spec.cwd);
+
+    job.terminate();
+    assert!(!live.running(), "a stopped run is not still live");
+    let drawn = live.snapshot_since(0).unwrap().lines;
+    assert!(
+        drawn.iter().any(|line| line.text.contains(STOPPED_REASON)),
+        "{drawn:?}"
+    );
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(
+        artifact
+            .trim_end()
+            .ends_with("> Provider: grok | Session: not reported"),
+        "{artifact}"
+    );
 }

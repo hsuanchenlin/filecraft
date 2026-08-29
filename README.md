@@ -163,6 +163,7 @@ In browse mode:
 | `.` | show/hide dotfiles |
 | `r` | refresh listing |
 | `M` | message history |
+| `L` | live log of the AI run - also after it has finished |
 | `?` | help |
 | Esc | back out one level (clears an active filter) |
 | `q`, Ctrl-C | quit |
@@ -304,6 +305,69 @@ reservation is filled with a short Markdown failure note carrying the same
 reason shown in the message log. A summary the provider had already
 written is never replaced by a note.
 
+### Watching the run
+
+`L`, `:log`, or `:job` opens the run's own output over the listing -
+stdout and stderr as the provider prints them, not in one lump at the
+end. It keeps working after the run has finished, which is usually when
+you want it.
+
+```
+┌ job log: codex ────────────────────────────────────────────────────────────┐
+│ codex · thinking · 42 lines                                                │
+│ session 01a04eef-d4a6-7232-831f-e8faf5c42241 · resume: codex resume 01a0…  │
+│    39 | reading /docs/report.pdf                                           │
+│    40 | reading /docs/notes.md                                             │
+│    41 ! warning: large attachment                                          │
+│    42 | writing /docs/report-summary.md                                    │
+└──────────────────────────────────────────────────── line 39 of 42 · 100% ──┘
+```
+
+| Key | Action (log viewer) |
+| --- | --- |
+| `j` / `k`, Down / Up | scroll one line |
+| `d` / `u` | scroll half a page |
+| `f` / `b`, PgDn / PgUp | scroll a page |
+| `g` / `G`, Home / End | top / bottom |
+| `/` | find in the log (type, then Enter) |
+| `n` / `N` | next / previous match |
+| `h`, `q`, Esc | back to the listing - **the run keeps going** |
+
+New output pulls the view down while you are at the bottom, and stops
+the moment you scroll up, so you can read something without fighting the
+stream. `G` starts it following again. Every line carries its number and
+which stream it came from: `|` is stdout, `!` is stderr. The log keeps
+the most recent 4000 lines and says so when it has dropped any.
+
+The first header row says what the run is doing - `waiting for output`,
+`thinking`, `streaming`, `finished`. The second names the session the
+provider announced and the command that reopens it. `codex exec` prints
+`session id: <uuid>` in its banner; a provider that announces nothing
+says `session: not reported`, rather than offering a command that would
+not work.
+
+### Reopening the session in the provider
+
+Every summary is signed with the run that produced it - a written
+summary, a summary saved from stdout, and a failure note alike:
+
+```markdown
+> Provider: codex | Session: 01a04eef-… | Resume with: codex resume 01a04eef-…
+```
+
+Filecraft never runs that command. It is printed so you can pick the
+conversation back up in the CLI itself, which is where you can ask it
+follow-up questions. The reopen flag is per-CLI and is *not* uniform -
+only two of the five call it `--resume`:
+
+| provider | reopen a session |
+| --- | --- |
+| `ag` | `agy --conversation <id>` |
+| `cc` | `claude --resume <id>` |
+| `co` | `codex resume <id>` (a subcommand, not a flag) |
+| `gk` | `grok --resume <id>` |
+| `ki` | `kimi --session <id>` |
+
 ### Quitting with a summary running
 
 `q` and Ctrl-C ask first:
@@ -324,6 +388,9 @@ delete: the key that raised the prompt sits one slip away.
   no network connection of its own, but that program may - the summary
   is the one place Filecraft hands your file paths to something else.
 - Source files are never modified: a summary only ever adds a file.
+- The log viewer only reads. Closing it never stops a run, no key in it
+  starts or resumes one, and the resume command is printed for you to
+  run - never run by Filecraft.
 - This is not the `agent` seam, which stays disabled - see
   [docs/agent-seam.md](docs/agent-seam.md).
 
@@ -405,6 +472,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `edit` | edit the selected regular file in `$EDITOR` or `nvim` |
 | `preview` | read-only preview (Neovim if available, else built-in) |
 | `summarize`, `summary` | AI summary of files you pick (same as `S`) |
+| `log`, `job` | the AI run's own output and session (same as `L`) |
 | `agent [...]` | future AI seam; disabled in v0 (see [docs/agent-seam.md](docs/agent-seam.md)) |
 | `help` | help screen |
 | `quit` | leave Filecraft |
