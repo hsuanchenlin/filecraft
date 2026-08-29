@@ -147,6 +147,26 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   which is how `scripts/install_test.sh` unit-tests it; that script runs
   inside `cargo test`, so CI covers the shell half too.
 
+## Releasing
+
+- The version lives in exactly one place: `package.version` in
+  `Cargo.toml`. `env!("CARGO_PKG_VERSION")` is what the banner,
+  `filecraft --version`, and `update`'s current-vs-latest comparison all
+  read - there is no second copy to keep in step.
+- `filecraft update` never looks at a tag or a GitHub release. It compares
+  against `Cargo.toml` on `main` (`MANIFEST_URL`/`MAIN_REF` in
+  `src/update.rs`) and installs from the branch - the argv is
+  `cargo install --git <GIT_URL> --locked --force`, with no `--tag`. So
+  **bumping the version on `main` is what ships an update**; a release is a
+  marker and a changelog for people. Tagging without the bump updates
+  nobody, and bumping without a tag updates everybody.
+- Releases are cut by hand: `.github/workflows/ci.yml` is test-only and
+  builds no artifacts, so nothing tags or publishes on its own.
+  `gh-axi release create v<version> --target main --title "Filecraft
+  v<version>" --notes-file <file>`. They carry no binaries on purpose -
+  both documented installs (`./install.sh`, `cargo install --git`) build
+  from source, so an asset would be a third install path to keep honest.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
