@@ -43,17 +43,22 @@ pub fn is_summarizable(path: &Path) -> bool {
 /// The table is fixed and the argv is written out here rather than
 /// assembled from user input: a provider is chosen by pressing a digit,
 /// and nothing the user types ever becomes a program name or a flag.
+///
+/// Each line is the CLI's **non-interactive** form. That is not a detail:
+/// none of these tools take a prompt as a bare trailing word, and a
+/// summary run has no terminal to answer questions on. See
+/// [`Provider::prompt_flag`] for how the prompt is actually handed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
-    /// `agy --dangerously-skip-permissions` - the default.
+    /// `agy --dangerously-skip-permissions -p <prompt>` - the default.
     Ag,
-    /// `claude --dangerously-skip-permissions`
+    /// `claude --dangerously-skip-permissions -p <prompt>`
     Cc,
-    /// `codex -p lavish -a on-request`
+    /// `codex exec -p lavish --skip-git-repo-check <prompt>`
     Co,
-    /// `grok --always-approve`
+    /// `grok --always-approve -p <prompt>`
     Gk,
-    /// `kimi --yolo`
+    /// `kimi -p <prompt>`
     Ki,
 }
 
@@ -82,29 +87,81 @@ impl Provider {
         }
     }
 
-    /// The command line, program first. Never built from user input.
-    pub fn argv(self) -> Vec<String> {
+    /// The fixed command line - program first, flags after, and *no*
+    /// prompt. Never built from user input.
+    ///
+    /// Each line is the form that runs headless and answers no questions:
+    ///
+    /// - `agy` / `claude`: their own skip-permissions flag, then `--print`.
+    /// - `codex`: the `exec` subcommand, which is the non-interactive one.
+    ///   `-p` here is `--profile`, not a prompt; the `lavish` profile is
+    ///   what carries the approval policy the interactive line used to ask
+    ///   for with `-a on-request`. `--skip-git-repo-check` is required
+    ///   because a folder of documents is usually not a git repository.
+    /// - `grok`: `--always-approve`, then `--single`.
+    /// - `kimi`: nothing but the program. `kimi` *refuses* to combine
+    ///   `--yolo` or `--auto` with `--prompt` ("Cannot combine --prompt
+    ///   with --yolo"); its prompt mode carries its own permissions.
+    pub fn base_argv(self) -> Vec<String> {
         let words: &[&str] = match self {
             Provider::Ag => &["agy", "--dangerously-skip-permissions"],
             Provider::Cc => &["claude", "--dangerously-skip-permissions"],
-            Provider::Co => &["codex", "-p", "lavish", "-a", "on-request"],
+            Provider::Co => &["codex", "exec", "-p", "lavish", "--skip-git-repo-check"],
             Provider::Gk => &["grok", "--always-approve"],
-            Provider::Ki => &["kimi", "--yolo"],
+            Provider::Ki => &["kimi"],
         };
         words.iter().map(|w| (*w).to_string()).collect()
     }
 
+    /// The flag that hands this provider its prompt, or `None` where the
+    /// prompt is a plain positional argument.
+    ///
+    /// This is the whole point of the table. A prompt appended as a bare
+    /// trailing word is not "the prompt" to any of these CLIs - `agy`
+    /// rejects it outright ("Prompts are read only from -p/--print,
+    /// -i/--prompt-interactive, or stdin"), and the rest would open an
+    /// interactive session a background job can never answer. The one
+    /// exception is `codex exec`, whose prompt genuinely is positional.
+    pub fn prompt_flag(self) -> Option<&'static str> {
+        match self {
+            // `-p` is `--print`: run one prompt and print the response.
+            Provider::Ag | Provider::Cc => Some("-p"),
+            // `codex exec [OPTIONS] [PROMPT]` - positional. Its `-p` is
+            // `--profile` and is already in `base_argv`.
+            Provider::Co => None,
+            // `-p` is `--single`: single-turn, print to stdout, exit.
+            Provider::Gk => Some("-p"),
+            // `-p` is `--prompt`: run one prompt non-interactively.
+            Provider::Ki => Some("-p"),
+        }
+    }
+
+    /// The command line that actually runs: the fixed line, the prompt
+    /// flag where the CLI needs one, then `prompt` as one single argument.
+    ///
+    /// The prompt is never split, quoted, or interpolated into a string -
+    /// it is one `argv` entry handed to `execvp`, and no shell sees it.
+    pub fn argv_with_prompt(self, prompt: &str) -> Vec<String> {
+        let mut argv = self.base_argv();
+        argv.extend(self.prompt_flag().map(str::to_string));
+        argv.push(prompt.to_string());
+        argv
+    }
+
     /// The program the child process will be, for status lines and errors.
     pub fn program(self) -> String {
-        self.argv()
+        self.base_argv()
             .first()
             .cloned()
             .unwrap_or_else(|| self.code().to_string())
     }
 
-    /// The command line as one readable string, for the menu.
+    /// The fixed part of the command line as one readable string, for the
+    /// menu. The prompt flag and the prompt are appended at run time and
+    /// are not shown: the menu answers "which tool runs", and a wrapped
+    /// row would answer it worse.
     pub fn command_line(self) -> String {
-        self.argv().join(" ")
+        self.base_argv().join(" ")
     }
 
     /// The digit that selects this provider.
@@ -252,32 +309,49 @@ impl JobSpec {
 
     /// The instruction handed to the provider. It names absolute paths and
     /// exactly one file to write, so the run has a finite, stated scope.
+    ///
+    /// Two things it insists on, both learned from providers that got them
+    /// wrong: **read** the listed files rather than guessing from their
+    /// names, and **actually create** the output file rather than reporting
+    /// that it did. `agy`'s own file-writing tool is restricted to its
+    /// artifact directory and it will happily answer "done" having written
+    /// nothing, so the prompt names the fallback out loud.
     pub fn prompt(&self) -> String {
         let mut out = String::new();
         out.push_str("Read and summarize the following files.\n\n");
         for file in &self.files {
             out.push_str(&format!("- {}\n", file.display()));
         }
+        out.push_str(
+            "\nOpen and read every file listed above before you write \
+             anything. Summarize what they actually say, not what their \
+             names suggest.\n",
+        );
         out.push_str(&format!(
-            "\nWrite one Markdown summary to this exact path:\n{}\n\n",
+            "\nWrite one Markdown summary to this exact absolute path:\n{}\n",
             self.output.display()
         ));
+        out.push_str(
+            "\nThat path may already exist as an empty placeholder; \
+             overwrite it. The file must exist on disk with the summary in \
+             it when you finish - if your file-writing tool refuses that \
+             path, write it with a shell command instead. Reporting that \
+             the summary is written is not the same as writing it.\n\n",
+        );
         out.push_str(
             "Give each file its own `##` heading with a few sentences, then \
              end with a `## Together` section covering what the set says as \
              a whole. Do not modify, move, or delete any of the source files \
              - write only the summary file named above. If you cannot write \
-             a file, print the Markdown summary on stdout instead.\n",
+             a file at all, print the Markdown summary on stdout instead.\n",
         );
         out
     }
 
-    /// The full command line: the provider's fixed argv with the prompt as
-    /// the final positional argument.
+    /// The full command line: the provider's fixed line, its prompt flag,
+    /// and the prompt as one argument. See [`Provider::prompt_flag`].
     pub fn argv(&self) -> Vec<String> {
-        let mut argv = self.provider.argv();
-        argv.push(self.prompt());
-        argv
+        self.provider.argv_with_prompt(&self.prompt())
     }
 
     /// The live status the screen shows while this job runs.
@@ -558,15 +632,107 @@ mod tests {
         let expected = [
             ("ag", "agy --dangerously-skip-permissions", '1'),
             ("cc", "claude --dangerously-skip-permissions", '2'),
-            ("co", "codex -p lavish -a on-request", '3'),
+            ("co", "codex exec -p lavish --skip-git-repo-check", '3'),
             ("gk", "grok --always-approve", '4'),
-            ("ki", "kimi --yolo", '5'),
+            ("ki", "kimi", '5'),
         ];
         for (provider, (code, line, digit)) in Provider::ALL.iter().zip(expected) {
             assert_eq!(provider.code(), code);
             assert_eq!(provider.command_line(), line);
             assert_eq!(provider.digit(), digit);
             assert_eq!(Provider::from_digit(digit), Some(*provider));
+        }
+    }
+
+    /// The bug this table exists to prevent: a prompt appended as a bare
+    /// trailing word. `agy` answers that with "Prompts are read only from
+    /// -p/--print, -i/--prompt-interactive, or stdin", and the others open
+    /// an interactive session no background job can answer.
+    #[test]
+    fn every_provider_takes_the_prompt_through_its_non_interactive_flag() {
+        let expected: [(Provider, &[&str]); 5] = [
+            (
+                Provider::Ag,
+                &["agy", "--dangerously-skip-permissions", "-p", "PROMPT"],
+            ),
+            (
+                Provider::Cc,
+                &["claude", "--dangerously-skip-permissions", "-p", "PROMPT"],
+            ),
+            (
+                Provider::Co,
+                &[
+                    "codex",
+                    "exec",
+                    "-p",
+                    "lavish",
+                    "--skip-git-repo-check",
+                    "PROMPT",
+                ],
+            ),
+            (Provider::Gk, &["grok", "--always-approve", "-p", "PROMPT"]),
+            (Provider::Ki, &["kimi", "-p", "PROMPT"]),
+        ];
+        for (provider, argv) in expected {
+            assert_eq!(
+                provider.argv_with_prompt("PROMPT"),
+                argv.iter().map(|w| (*w).to_string()).collect::<Vec<_>>(),
+                "{} argv",
+                provider.code()
+            );
+        }
+    }
+
+    /// `codex exec` is the one provider whose prompt is positional - its
+    /// `-p` is `--profile`. Every other provider must name a flag, or its
+    /// prompt is silently the wrong kind of argument.
+    #[test]
+    fn only_codex_takes_a_positional_prompt() {
+        for provider in Provider::ALL {
+            match provider {
+                Provider::Co => assert_eq!(provider.prompt_flag(), None),
+                other => assert_eq!(other.prompt_flag(), Some("-p"), "{}", other.code()),
+            }
+        }
+    }
+
+    /// Whatever the flags, the prompt stays exactly one argument: never
+    /// split on whitespace, never quoted into a string a shell would read.
+    #[test]
+    fn the_prompt_is_always_one_single_argument() {
+        let prompt = "read /a b.md\nand write 'it' \"there\"; rm -rf /";
+        for provider in Provider::ALL {
+            let argv = provider.argv_with_prompt(prompt);
+            assert_eq!(argv.last().map(String::as_str), Some(prompt));
+            assert_eq!(
+                argv.iter().filter(|arg| arg.contains(prompt)).count(),
+                1,
+                "{} must carry the prompt once",
+                provider.code()
+            );
+            assert!(
+                argv.starts_with(&provider.base_argv()),
+                "{} must keep its fixed line first",
+                provider.code()
+            );
+        }
+    }
+
+    /// The base line never carries a prompt of its own, and the program is
+    /// always its first word - the status row and every error say so.
+    #[test]
+    fn the_fixed_line_is_a_program_and_flags_only() {
+        for provider in Provider::ALL {
+            let base = provider.base_argv();
+            assert_eq!(provider.program(), base[0]);
+            assert_eq!(provider.command_line(), base.join(" "));
+            for word in &base[1..] {
+                assert!(
+                    word.starts_with('-') || !word.contains(' '),
+                    "{} has a suspicious fixed word {word:?}",
+                    provider.code()
+                );
+            }
         }
     }
 
@@ -588,6 +754,11 @@ mod tests {
             lines[0],
             "[1] ag: agy --dangerously-skip-permissions  [Default]"
         );
+        assert_eq!(
+            lines[2],
+            "[3] co: codex exec -p lavish --skip-git-repo-check"
+        );
+        assert_eq!(lines[4], "[5] ki: kimi");
         assert_eq!(
             lines.iter().filter(|l| l.contains("[Default]")).count(),
             1,
@@ -672,14 +843,51 @@ mod tests {
         assert!(prompt.contains("Do not modify"));
     }
 
+    /// A provider that skims filenames, or that answers "done" without
+    /// writing anything, is the failure this wording exists to prevent.
     #[test]
-    fn argv_is_the_fixed_provider_line_plus_the_prompt() {
+    fn the_prompt_says_to_read_the_files_and_to_actually_write_the_output() {
+        let prompt = spec(&["/docs/one.pdf", "/docs/two.md"]).prompt();
+        assert!(prompt.contains("Open and read every file listed above"));
+        assert!(prompt.contains("not what their names suggest"));
+        assert!(prompt.contains("exact absolute path"));
+        assert!(prompt.contains("must exist on disk"));
+        assert!(prompt.contains("write it with a shell command instead"));
+        assert!(prompt.contains("stdout"));
+    }
+
+    #[test]
+    fn argv_is_the_fixed_provider_line_the_prompt_flag_and_the_prompt() {
         let spec = spec(&["/docs/one.pdf"]);
         let argv = spec.argv();
-        assert_eq!(argv[0], "agy");
-        assert_eq!(argv[1], "--dangerously-skip-permissions");
-        assert_eq!(argv.len(), 3);
-        assert_eq!(argv[2], spec.prompt());
+        assert_eq!(
+            argv,
+            vec![
+                "agy".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "-p".to_string(),
+                spec.prompt(),
+            ]
+        );
+    }
+
+    /// Every provider's spec argv, whole - the flags and the one prompt.
+    #[test]
+    fn a_spec_builds_the_right_argv_for_every_provider() {
+        for provider in Provider::ALL {
+            let mut spec = spec(&["/docs/one.pdf", "/docs/two.md"]);
+            spec.provider = provider;
+            let argv = spec.argv();
+            assert_eq!(argv, provider.argv_with_prompt(&spec.prompt()));
+            assert_eq!(argv[0], provider.program());
+            assert_eq!(argv.last(), Some(&spec.prompt()));
+            assert_eq!(
+                argv.len(),
+                provider.base_argv().len() + usize::from(provider.prompt_flag().is_some()) + 1,
+                "{} argv length",
+                provider.code()
+            );
+        }
     }
 
     #[test]

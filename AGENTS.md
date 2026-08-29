@@ -88,6 +88,16 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   match the selector popup's borders plus header in `ui::draw_selector`.
   A provider's argv is a fixed table and never assembled from user
   input; `:summarize` deliberately has no path form for the same reason.
+  Every line in that table is its CLI's **headless** form, and the prompt
+  goes through `Provider::prompt_flag` - a prompt appended as a bare
+  trailing word is refused (`agy`: "Prompts are read only from
+  -p/--print...") or opens a session a background job cannot answer.
+  The flags are per-CLI and not guessable: `codex`'s prompt is positional
+  after `exec` (its `-p` is `--profile`), and `kimi` refuses to combine
+  `--yolo`/`--auto` with `--prompt`. Check a real `--help` before adding
+  or changing a provider - the stubs in `tests/summarize_process.rs`
+  reproduce each CLI's refusal, so a wrong flag fails there rather than
+  in front of a user.
   At most one job runs: `App::job` is the single thing the status row,
   the quit confirmation, and the completion message all refer to.
   `ProcessRunner` atomically reserves the output before spawning. A failed

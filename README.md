@@ -240,9 +240,9 @@ selector lists folders and those documents, and nothing else.
 │                                                                            │
 │ [1] ag: agy --dangerously-skip-permissions  [Default]                      │
 │ [2] cc: claude --dangerously-skip-permissions                              │
-│ [3] co: codex -p lavish -a on-request                                      │
+│ [3] co: codex exec -p lavish --skip-git-repo-check                         │
 │ [4] gk: grok --always-approve                                              │
-│ [5] ki: kimi --yolo                                                        │
+│ [5] ki: kimi                                                               │
 └───────────────────────────────────── 1-5 choose · Enter default · q cancel ┘
 ```
 
@@ -250,6 +250,25 @@ selector lists folders and those documents, and nothing else.
 or Esc cancels. The command lines are a fixed table in
 `src/summarize.rs` - nothing you type ever becomes a program name or a
 flag, and the provider is spawned directly, never through a shell.
+
+Each row shows the fixed part of the line. The prompt is appended as one
+further argument, through whichever flag that CLI reads a prompt from:
+
+| provider | how the prompt is handed over |
+| --- | --- |
+| `ag` | `-p` (`--print`) |
+| `cc` | `-p` (`--print`) |
+| `co` | positional, after `exec` - `codex`'s own `-p` is `--profile` |
+| `gk` | `-p` (`--single`) |
+| `ki` | `-p` (`--prompt`) |
+
+That flag is not decoration. A summary run has no terminal to answer
+questions on, so every line is its CLI's headless form: a prompt passed
+as a bare trailing word is either refused outright (`agy` answers
+`Prompts are read only from -p/--print, -i/--prompt-interactive, or
+stdin`) or opens an interactive session nothing can answer. `kimi` is
+listed bare because it *refuses* to combine a yolo flag with `--prompt`;
+its prompt mode carries its own permissions.
 
 While it runs, the status row carries the job and keeps it even on a
 narrow terminal:

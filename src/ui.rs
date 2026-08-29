@@ -1090,19 +1090,27 @@ mod tests {
         let mut app = app_at(tmp.path());
         open_selector(&mut app, &["notes.md", "report.pdf"]);
         app.handle_key(KeyInput::Enter);
-        let screen = render(&app);
-        assert!(screen.contains("summarize: pick a provider"), "{screen}");
-        assert!(screen.contains("2 files selected"), "{screen}");
-        for line in [
-            "[1] ag: agy --dangerously-skip-permissions  [Default]",
-            "[2] cc: claude --dangerously-skip-permissions",
-            "[3] co: codex -p lavish -a on-request",
-            "[4] gk: grok --always-approve",
-            "[5] ki: kimi --yolo",
-        ] {
-            assert!(screen.contains(line), "missing '{line}':\n{screen}");
+        // Every size, not just the default one: these rows are the widest
+        // thing the dialog draws, and a row clipped at 60 columns would
+        // name a command line that is not the one that runs.
+        for (width, height) in SIZES {
+            let screen = render_size(&app, width, height);
+            assert!(screen.contains("summarize: pick a provider"), "{screen}");
+            assert!(screen.contains("2 files selected"), "{screen}");
+            for line in [
+                "[1] ag: agy --dangerously-skip-permissions  [Default]",
+                "[2] cc: claude --dangerously-skip-permissions",
+                "[3] co: codex exec -p lavish --skip-git-repo-check",
+                "[4] gk: grok --always-approve",
+                "[5] ki: kimi",
+            ] {
+                assert!(
+                    screen.contains(line),
+                    "{width}x{height} lost '{line}':\n{screen}"
+                );
+            }
+            assert!(screen.contains("Enter default"), "{screen}");
         }
-        assert!(screen.contains("Enter default"), "{screen}");
     }
 
     #[test]
