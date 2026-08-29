@@ -162,18 +162,25 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
 /// with every row after the first indented by `indent` so a continuation
 /// reads as part of the row above and not as a new entry beneath it.
 ///
-/// Spaces are the preferred break and a word is kept whole wherever it
-/// fits on a row of its own. A word too wide even for that is broken
-/// across rows by character. That last resort is the deliberate choice:
-/// these rows are command lines, and a row left over-wide for the caller
-/// to clip would name something other than what runs. **Every row that
-/// comes back fits `width`**, so nothing downstream needs to wrap or cut
-/// it a second time - the one exception is a single character wider than
-/// the budget itself, which cannot be split and is handed over rather
-/// than dropped. The indent gives way for the same reason: a row with no
-/// room left for a character once it is applied is drawn without it,
-/// because the indent is a nicety and the text is not. A `width` of 0
-/// has no budget to fit anything into, so the text comes back whole.
+/// Spaces are the preferred break, and the precedence after that is
+/// deliberate: **the indent is applied first, and a word too wide for
+/// what it leaves - `width - indent` - is broken across rows by
+/// character underneath it**, even where that word would have fitted a
+/// row of its own had the indent been dropped. Keeping a continuation
+/// off column 0 outranks keeping a word whole, because these are command
+/// lines: a flag starting a row reads as a new entry, and a row left
+/// over-wide for the caller to clip would name something other than what
+/// runs. Nothing is lost either way - a broken word is still drawn in
+/// full, across rows.
+///
+/// **Every row that comes back fits `width`**, so nothing downstream
+/// needs to wrap or cut it a second time. Two extremes are where that
+/// gives: a single character wider than the budget itself cannot be
+/// split, so it is handed over rather than dropped, and the indent
+/// yields on a row it would leave no room for even one character of -
+/// there the text wins, because the indent is a nicety and the text is
+/// not. A `width` of 0 has no budget to fit anything into, so the text
+/// comes back whole.
 pub fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
     if width == 0 || display_width(text) <= width {
         return vec![text.to_string()];
@@ -800,18 +807,41 @@ mod tests {
         assert_eq!(wrap_hanging(row, 80, 8), vec![row.to_string()]);
         let marked = "[1] ag: agy --dangerously-skip-permissions  [Default]";
         assert_eq!(wrap_hanging(marked, 54, 8), vec![marked.to_string()]);
-        // A word too wide even for a row of its own is broken by
-        // character rather than left for the caller to clip - the last
-        // resort, and the only way the whole flag reaches the screen.
+        assert_eq!(wrap_hanging("anything", 0, 8), vec!["anything".to_string()]);
+    }
+
+    /// The precedence between the two things that can give when a word
+    /// does not fit: the indent is applied first and the word is broken
+    /// under it, never the other way round. `--dangerously-skip-permissions`
+    /// is 30 columns and the budget here is 34, so an unindented row
+    /// would hold it whole - and it is still broken, because a flag at
+    /// column 0 reads as one more entry in the list.
+    #[test]
+    fn the_indent_is_applied_before_a_word_is_kept_whole() {
+        let line = "[1] ag: agy --dangerously-skip-permissions";
+        let flag = "--dangerously-skip-permissions";
+        assert_eq!(display_width(flag), 30);
+
         assert_eq!(
-            wrap_hanging("[1] ag: agy --dangerously-skip-permissions", 34, 8),
+            wrap_hanging(line, 34, 8),
             vec![
                 "[1] ag: agy".to_string(),
                 "        --dangerously-skip-permiss".to_string(),
                 "        ions".to_string(),
-            ]
+            ],
+            "the indent has to survive, so the flag breaks under it"
         );
-        assert_eq!(wrap_hanging("anything", 0, 8), vec!["anything".to_string()]);
+        // The same budget with nothing to indent by: now the word fits a
+        // row of its own and is kept whole. The indent is the difference.
+        assert_eq!(
+            wrap_hanging(line, 34, 0),
+            vec!["[1] ag: agy".to_string(), flag.to_string()]
+        );
+        // And a word that still fits under the indent is never broken.
+        assert_eq!(
+            wrap_hanging(line, 38, 8),
+            vec!["[1] ag: agy".to_string(), format!("        {flag}")]
+        );
     }
 
     /// The two halves of the promise: every row fits the budget, so no
