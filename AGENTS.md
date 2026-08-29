@@ -12,8 +12,8 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - `cargo run -- --list [DIR]` is the non-TTY listing path.
 - `src/bearings.rs` owns every pure display computation (ladder, rail,
   scroll margin, relative time, speakable status, width padding,
-  sanitizing). Put new rendering arithmetic there, not in `ui.rs`, so it
-  stays testable without a TTY.
+  sanitizing, hanging-indent wrapping). Put new rendering arithmetic
+  there, not in `ui.rs`, so it stays testable without a TTY.
 - The reader (`l` on a text/Markdown file) splits the same way:
   `src/markdown.rs` classifies lines and wraps them to a column budget,
   `src/pager.rs` owns scroll/search/position, `ui.rs` only turns a
@@ -88,6 +88,22 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   match the selector popup's borders plus header in `ui::draw_selector`.
   A provider's argv is a fixed table and never assembled from user
   input; `:summarize` deliberately has no path form for the same reason.
+  Every line in that table is its CLI's **headless** form, and the prompt
+  goes through `Provider::prompt_flag` - a prompt appended as a bare
+  trailing word is refused (`agy`: "Prompts are read only from
+  -p/--print...") or opens a session a background job cannot answer.
+  The flags are per-CLI and not guessable: `codex`'s prompt is positional
+  after `exec` (its `-p` is `--profile`), and `kimi` refuses to combine
+  `--yolo`/`--auto` with `--prompt`. Check a real `--help` before adding
+  or changing a provider - the stubs in `tests/summarize_process.rs`
+  reproduce each CLI's refusal, so a wrong flag fails there rather than
+  in front of a user. A fixed line must also name nothing that exists on
+  one machine only - a `--profile`, a config path - or the provider is
+  unusable for everyone but its author;
+  `no_provider_line_carries_a_machine_local_value` refuses a value looked
+  up in the user's own config (`-p`/`--profile`/`--config`) and any word
+  that is a path, wherever in the line it sits, and allows a portable
+  mode word such as `codex`'s `-s workspace-write`.
   At most one job runs: `App::job` is the single thing the status row,
   the quit confirmation, and the completion message all refer to.
   `ProcessRunner` atomically reserves the output before spawning. A failed
@@ -98,7 +114,15 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   answering keys and a finished run is reported without a keypress.
   `q` / Ctrl-C with a job alive raises `Mode::ConfirmQuit`, and only
   `y` terminates the child - Enter is not an answer there, same rule as
-  a trash.
+  a trash. `terminate` runs on the UI thread, so it waits only
+  `TERMINATE_GRACE` for the run to wind up: killing the child does not
+  close pipes a grandchild inherited, and an unbounded wait leaves the
+  TUI frozen in raw mode. Past the grace `terminate` itself finishes the
+  job, through `finish` like every other ending - the reservation is an
+  `Arc<Mutex<File>>` shared with the worker for exactly that, because the
+  app drops the job the moment `terminate` returns. Going through
+  `finish` is what keeps the note from overwriting a summary the provider
+  had already written; a blocked drain does not mean an unfinished run.
 - `no_browse_key_ever_mutates_the_filesystem` and its reader twin also
   assert that no key starts an AI run. `S` may open the selector and
   nothing more; a provider only ever runs after a selection *and* a

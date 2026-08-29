@@ -237,12 +237,11 @@ selector lists folders and those documents, and nothing else.
 ```
 ┌ summarize: pick a provider ────────────────────────────────────────────────┐
 │ 2 files selected                                                           │
-│                                                                            │
 │ [1] ag: agy --dangerously-skip-permissions  [Default]                      │
 │ [2] cc: claude --dangerously-skip-permissions                              │
-│ [3] co: codex -p lavish -a on-request                                      │
+│ [3] co: codex exec -s workspace-write --skip-git-repo-check                │
 │ [4] gk: grok --always-approve                                              │
-│ [5] ki: kimi --yolo                                                        │
+│ [5] ki: kimi                                                               │
 └───────────────────────────────────── 1-5 choose · Enter default · q cancel ┘
 ```
 
@@ -250,6 +249,34 @@ selector lists folders and those documents, and nothing else.
 or Esc cancels. The command lines are a fixed table in
 `src/summarize.rs` - nothing you type ever becomes a program name or a
 flag, and the provider is spawned directly, never through a shell.
+
+Each row shows the fixed part of the line. The prompt is appended as one
+further argument, through whichever flag that CLI reads a prompt from:
+
+| provider | how the prompt is handed over |
+| --- | --- |
+| `ag` | `-p` (`--print`) |
+| `cc` | `-p` (`--print`) |
+| `co` | positional, after `exec` - `codex`'s own `-p` is `--profile` |
+| `gk` | `-p` (`--single`) |
+| `ki` | `-p` (`--prompt`) |
+
+That flag is not decoration. A summary run has no terminal to answer
+questions on, so every line is its CLI's headless form: a prompt passed
+as a bare trailing word is either refused outright (`agy` answers
+`Prompts are read only from -p/--print, -i/--prompt-interactive, or
+stdin`) or opens an interactive session nothing can answer. `kimi` is
+listed bare because it *refuses* to combine a yolo flag with `--prompt`;
+its prompt mode carries its own permissions.
+
+Each line runs on any machine that has the CLI installed: it names no
+profile, no config file, and nothing else that would only exist where it
+was written. A flag that takes a value is fine when the value is a mode
+every install understands, which is why `codex` spells both of its
+grants out - `-s workspace-write`, because `codex exec` otherwise takes
+its sandbox from your own `config.toml` and a summary is written beside
+its sources, and `--skip-git-repo-check`, because a folder of documents
+is usually not a git repository.
 
 While it runs, the status row carries the job and keeps it even on a
 narrow terminal:
@@ -271,9 +298,11 @@ overwritten: the run falls back to `<first-stem>-summary-<stamp>.md`.
 The provider is asked to write that one path and nothing else; if it
 exits cleanly having printed the summary instead of writing it, that
 stdout is saved there.
-Filecraft reserves the path before starting the provider. If the run fails
-or is terminated, that reserved file instead contains a short Markdown
-failure note with the same reason shown in the message log.
+Filecraft reserves the path before starting the provider. If the run ends
+with that file still empty - it failed, or you terminated it - the
+reservation is filled with a short Markdown failure note carrying the same
+reason shown in the message log. A summary the provider had already
+written is never replaced by a note.
 
 ### Quitting with a summary running
 

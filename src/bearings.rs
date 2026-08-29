@@ -158,6 +158,91 @@ pub fn pad_to_width_with(text: &str, width: usize, ellipsis: &str) -> String {
     out
 }
 
+/// One line as the rows it is drawn on: broken on spaces to fit `width`,
+/// with every row after the first indented by `indent` so a continuation
+/// reads as part of the row above and not as a new entry beneath it.
+///
+/// Spaces are the preferred break, and the precedence after that is
+/// deliberate: **the indent is applied first, and a word too wide for
+/// what it leaves - `width - indent` - is broken across rows by
+/// character underneath it**, even where that word would have fitted a
+/// row of its own had the indent been dropped. Keeping a continuation
+/// off column 0 outranks keeping a word whole, because these are command
+/// lines: a flag starting a row reads as a new entry, and a row left
+/// over-wide for the caller to clip would name something other than what
+/// runs. Nothing is lost either way - a broken word is still drawn in
+/// full, across rows.
+///
+/// **Every row that comes back fits `width`**, so nothing downstream
+/// needs to wrap or cut it a second time. Two extremes are where that
+/// gives: a single character wider than the budget itself cannot be
+/// split, so it is handed over rather than dropped, and the indent
+/// yields on a row it would leave no room for even one character of -
+/// there the text wins, because the indent is a nicety and the text is
+/// not. A `width` of 0 has no budget to fit anything into, so the text
+/// comes back whole.
+pub fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
+    if width == 0 || display_width(text) <= width {
+        return vec![text.to_string()];
+    }
+    let pad = " ".repeat(indent.min(width.saturating_sub(1)));
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split(' ') {
+        if row.is_empty() {
+            row.push_str(word);
+        } else if display_width(&row) + 1 + display_width(word) <= width {
+            row.push(' ');
+            row.push_str(word);
+        } else {
+            rows.push(std::mem::take(&mut row));
+            row = continue_under(&pad, word, width);
+        }
+        while display_width(&row) > width {
+            let (head, rest) = split_at_width(&row, width);
+            rows.push(head);
+            row = continue_under(&pad, &rest, width);
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// A continuation row: the hanging indent, then what is left of the row -
+/// unless the indent would leave no room for even one character of it,
+/// which is also what keeps the split above making progress.
+fn continue_under(pad: &str, rest: &str, width: usize) -> String {
+    let first = rest.chars().next().map(char_width).unwrap_or(0);
+    if display_width(pad) + first > width {
+        return rest.to_string();
+    }
+    format!("{pad}{rest}")
+}
+
+/// `text` cut at the last character boundary that still fits `width`
+/// columns, never inside a wide character. A first character wider than
+/// the whole budget is taken anyway, so the split always advances.
+fn split_at_width(text: &str, width: usize) -> (String, String) {
+    let mut head = String::new();
+    let mut used = 0usize;
+    let mut rest = text.chars().peekable();
+    while let Some(&c) = rest.peek() {
+        let w = char_width(c);
+        if used + w > width {
+            break;
+        }
+        head.push(c);
+        used += w;
+        rest.next();
+    }
+    if head.is_empty() {
+        if let Some(c) = rest.next() {
+            head.push(c);
+        }
+    }
+    (head, rest.collect())
+}
+
 /// Join `parts` with `sep`, dropping whole trailing parts that do not
 /// fit. The result never exceeds `width` columns and never ends inside a
 /// word - which is what makes the hint row safe at the documented 80x24
@@ -705,6 +790,95 @@ pub fn filter_matched_nothing(bearings: &Bearings) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A command line too wide for its box is continued *under* itself.
+    /// Column zero would read as the next entry in the list, which is
+    /// exactly what the provider dialog must never say.
+    #[test]
+    fn a_row_too_wide_is_continued_under_its_own_command() {
+        let row = "[3] co: codex exec -s workspace-write --skip-git-repo-check";
+        assert_eq!(
+            wrap_hanging(row, 54, 8),
+            vec![
+                "[3] co: codex exec -s workspace-write".to_string(),
+                "        --skip-git-repo-check".to_string(),
+            ]
+        );
+        // Room to spare: one row, byte for byte, double spaces and all.
+        assert_eq!(wrap_hanging(row, 80, 8), vec![row.to_string()]);
+        let marked = "[1] ag: agy --dangerously-skip-permissions  [Default]";
+        assert_eq!(wrap_hanging(marked, 54, 8), vec![marked.to_string()]);
+        assert_eq!(wrap_hanging("anything", 0, 8), vec!["anything".to_string()]);
+    }
+
+    /// The precedence between the two things that can give when a word
+    /// does not fit: the indent is applied first and the word is broken
+    /// under it, never the other way round. `--dangerously-skip-permissions`
+    /// is 30 columns and the budget here is 34, so an unindented row
+    /// would hold it whole - and it is still broken, because a flag at
+    /// column 0 reads as one more entry in the list.
+    #[test]
+    fn the_indent_is_applied_before_a_word_is_kept_whole() {
+        let line = "[1] ag: agy --dangerously-skip-permissions";
+        let flag = "--dangerously-skip-permissions";
+        assert_eq!(display_width(flag), 30);
+
+        assert_eq!(
+            wrap_hanging(line, 34, 8),
+            vec![
+                "[1] ag: agy".to_string(),
+                "        --dangerously-skip-permiss".to_string(),
+                "        ions".to_string(),
+            ],
+            "the indent has to survive, so the flag breaks under it"
+        );
+        // The same budget with nothing to indent by: now the word fits a
+        // row of its own and is kept whole. The indent is the difference.
+        assert_eq!(
+            wrap_hanging(line, 34, 0),
+            vec!["[1] ag: agy".to_string(), flag.to_string()]
+        );
+        // And a word that still fits under the indent is never broken.
+        assert_eq!(
+            wrap_hanging(line, 38, 8),
+            vec!["[1] ag: agy".to_string(), format!("        {flag}")]
+        );
+    }
+
+    /// The two halves of the promise: every row fits the budget, so no
+    /// caller has to clip one, and putting the rows back together loses
+    /// nothing - not a flag, not a character of one. The single
+    /// exception is a character wider than the budget itself, which is
+    /// drawn over the edge rather than dropped.
+    #[test]
+    fn wrapping_fits_every_row_and_drops_nothing() {
+        let lines = [
+            "[1] ag: agy --dangerously-skip-permissions  [Default]",
+            "[3] co: codex exec -s workspace-write --skip-git-repo-check",
+            "the provider runs locally and reads only these files",
+            "[9] zz: --one-single-word-far-too-wide-for-any-of-this",
+            "wide 幅の広い文字 mixed in",
+        ];
+        for line in lines {
+            for width in [1, 2, 5, 12, 20, 34, 54, 80] {
+                for indent in [0, 8] {
+                    let rows = wrap_hanging(line, width, indent);
+                    for row in &rows {
+                        assert!(
+                            display_width(row) <= width || row.trim_start().chars().count() == 1,
+                            "{line:?} at {width}/{indent}: {row:?} overflows"
+                        );
+                    }
+                    let squeezed = |text: &str| text.replace(' ', "");
+                    assert_eq!(
+                        squeezed(&rows.concat()),
+                        squeezed(line),
+                        "{line:?} at {width}/{indent} lost something"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::time::Duration;
 

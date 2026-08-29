@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Extensions the summarizer accepts. Anything else is refused in words
 /// rather than handed to a model that cannot read it.
@@ -43,17 +43,22 @@ pub fn is_summarizable(path: &Path) -> bool {
 /// The table is fixed and the argv is written out here rather than
 /// assembled from user input: a provider is chosen by pressing a digit,
 /// and nothing the user types ever becomes a program name or a flag.
+///
+/// Each line is the CLI's **non-interactive** form. That is not a detail:
+/// none of these tools take a prompt as a bare trailing word, and a
+/// summary run has no terminal to answer questions on. See
+/// [`Provider::prompt_flag`] for how the prompt is actually handed over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
-    /// `agy --dangerously-skip-permissions` - the default.
+    /// `agy --dangerously-skip-permissions -p <prompt>` - the default.
     Ag,
-    /// `claude --dangerously-skip-permissions`
+    /// `claude --dangerously-skip-permissions -p <prompt>`
     Cc,
-    /// `codex -p lavish -a on-request`
+    /// `codex exec -s workspace-write --skip-git-repo-check <prompt>`
     Co,
-    /// `grok --always-approve`
+    /// `grok --always-approve -p <prompt>`
     Gk,
-    /// `kimi --yolo`
+    /// `kimi -p <prompt>`
     Ki,
 }
 
@@ -82,29 +87,95 @@ impl Provider {
         }
     }
 
-    /// The command line, program first. Never built from user input.
-    pub fn argv(self) -> Vec<String> {
+    /// The fixed command line - program first, flags after, and *no*
+    /// prompt. Never built from user input.
+    ///
+    /// Each line is the form that runs headless and answers no questions:
+    ///
+    /// - `agy` / `claude`: their own skip-permissions flag, then `--print`.
+    /// - `codex`: the `exec` subcommand, which is the non-interactive
+    ///   one, then the two grants the run needs spelled out on the line
+    ///   itself. `-s workspace-write` is the write grant: `codex exec`
+    ///   takes its sandbox from the user's `config.toml` when the flag is
+    ///   absent, so a summary that is only ever written *beside its
+    ///   sources* must ask for it here rather than hope for it.
+    ///   `--skip-git-repo-check` is required because a folder of
+    ///   documents is usually not a git repository. A named
+    ///   `-p`/`--profile` would carry both, and did, but it names a
+    ///   `$CODEX_HOME/<name>.config.toml` that exists only on the machine
+    ///   it was written on: every other user would get a config error
+    ///   instead of a summary.
+    /// - `grok`: `--always-approve`, then `--single`.
+    /// - `kimi`: nothing but the program. `kimi` *refuses* to combine
+    ///   `--yolo` or `--auto` with `--prompt` ("Cannot combine --prompt
+    ///   with --yolo"); its prompt mode carries its own permissions.
+    pub fn base_argv(self) -> Vec<String> {
         let words: &[&str] = match self {
             Provider::Ag => &["agy", "--dangerously-skip-permissions"],
             Provider::Cc => &["claude", "--dangerously-skip-permissions"],
-            Provider::Co => &["codex", "-p", "lavish", "-a", "on-request"],
+            Provider::Co => &[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "--skip-git-repo-check",
+            ],
             Provider::Gk => &["grok", "--always-approve"],
-            Provider::Ki => &["kimi", "--yolo"],
+            Provider::Ki => &["kimi"],
         };
         words.iter().map(|w| (*w).to_string()).collect()
     }
 
+    /// The flag that hands this provider its prompt, or `None` where the
+    /// prompt is a plain positional argument.
+    ///
+    /// This is the whole point of the table. A prompt appended as a bare
+    /// trailing word is not "the prompt" to any of these CLIs - `agy`
+    /// rejects it outright ("Prompts are read only from -p/--print,
+    /// -i/--prompt-interactive, or stdin"), and the rest would open an
+    /// interactive session a background job can never answer. The one
+    /// exception is `codex exec`, whose prompt genuinely is positional.
+    pub fn prompt_flag(self) -> Option<&'static str> {
+        match self {
+            // `-p` is `--print`: run one prompt and print the response.
+            Provider::Ag | Provider::Cc => Some("-p"),
+            // `codex exec [OPTIONS] [PROMPT]` - positional. Its own
+            // `-p` is `--profile`, so a prompt flag here would name a
+            // config file rather than hand over the prompt.
+            Provider::Co => None,
+            // `-p` is `--single`: single-turn, print to stdout, exit.
+            Provider::Gk => Some("-p"),
+            // `-p` is `--prompt`: run one prompt non-interactively.
+            Provider::Ki => Some("-p"),
+        }
+    }
+
+    /// The command line that actually runs: the fixed line, the prompt
+    /// flag where the CLI needs one, then `prompt` as one single argument.
+    ///
+    /// The prompt is never split, quoted, or interpolated into a string -
+    /// it is one `argv` entry handed to `execvp`, and no shell sees it.
+    pub fn argv_with_prompt(self, prompt: &str) -> Vec<String> {
+        let mut argv = self.base_argv();
+        argv.extend(self.prompt_flag().map(str::to_string));
+        argv.push(prompt.to_string());
+        argv
+    }
+
     /// The program the child process will be, for status lines and errors.
     pub fn program(self) -> String {
-        self.argv()
+        self.base_argv()
             .first()
             .cloned()
             .unwrap_or_else(|| self.code().to_string())
     }
 
-    /// The command line as one readable string, for the menu.
+    /// The fixed part of the command line as one readable string, for the
+    /// menu. The prompt flag and the prompt are appended at run time and
+    /// are not shown: the menu answers "which tool runs", and a wrapped
+    /// row would answer it worse.
     pub fn command_line(self) -> String {
-        self.argv().join(" ")
+        self.base_argv().join(" ")
     }
 
     /// The digit that selects this provider.
@@ -131,6 +202,12 @@ pub fn resolve(digit: Option<char>) -> Option<Provider> {
         Some(c) => Provider::from_digit(c),
     }
 }
+
+/// How far into a menu row its command line starts - `[3] co: ` is
+/// eight columns. A row too wide for the dialog is continued under its
+/// command line rather than beside the digits, so the continuation can
+/// never be read as a sixth provider.
+pub const MENU_INDENT: usize = 8;
 
 /// The provider dialog as drawn: one row per provider, the default
 /// marked in words so the choice never rests on position or color.
@@ -252,32 +329,49 @@ impl JobSpec {
 
     /// The instruction handed to the provider. It names absolute paths and
     /// exactly one file to write, so the run has a finite, stated scope.
+    ///
+    /// Two things it insists on, both learned from providers that got them
+    /// wrong: **read** the listed files rather than guessing from their
+    /// names, and **actually create** the output file rather than reporting
+    /// that it did. `agy`'s own file-writing tool is restricted to its
+    /// artifact directory and it will happily answer "done" having written
+    /// nothing, so the prompt names the fallback out loud.
     pub fn prompt(&self) -> String {
         let mut out = String::new();
         out.push_str("Read and summarize the following files.\n\n");
         for file in &self.files {
             out.push_str(&format!("- {}\n", file.display()));
         }
+        out.push_str(
+            "\nOpen and read every file listed above before you write \
+             anything. Summarize what they actually say, not what their \
+             names suggest.\n",
+        );
         out.push_str(&format!(
-            "\nWrite one Markdown summary to this exact path:\n{}\n\n",
+            "\nWrite one Markdown summary to this exact absolute path:\n{}\n",
             self.output.display()
         ));
+        out.push_str(
+            "\nThat path may already exist as an empty placeholder; \
+             overwrite it. The file must exist on disk with the summary in \
+             it when you finish - if your file-writing tool refuses that \
+             path, write it with a shell command instead. Reporting that \
+             the summary is written is not the same as writing it.\n\n",
+        );
         out.push_str(
             "Give each file its own `##` heading with a few sentences, then \
              end with a `## Together` section covering what the set says as \
              a whole. Do not modify, move, or delete any of the source files \
              - write only the summary file named above. If you cannot write \
-             a file, print the Markdown summary on stdout instead.\n",
+             a file at all, print the Markdown summary on stdout instead.\n",
         );
         out
     }
 
-    /// The full command line: the provider's fixed argv with the prompt as
-    /// the final positional argument.
+    /// The full command line: the provider's fixed line, its prompt flag,
+    /// and the prompt as one argument. See [`Provider::prompt_flag`].
     pub fn argv(&self) -> Vec<String> {
-        let mut argv = self.provider.argv();
-        argv.push(self.prompt());
-        argv
+        self.provider.argv_with_prompt(&self.prompt())
     }
 
     /// The live status the screen shows while this job runs.
@@ -407,9 +501,14 @@ impl Runner for ProcessRunner {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let shared = Arc::new(Mutex::new(Some(child)));
+        // Shared with the worker rather than moved into it: the quit path
+        // has to be able to fill the same reservation when the worker is
+        // still blocked on a pipe it no longer owns.
+        let reservation = Arc::new(Mutex::new(reservation));
         let (tx, rx) = mpsc::channel();
 
         let waiter = Arc::clone(&shared);
+        let writer = Arc::clone(&reservation);
         let output = spec.output.clone();
         let worker = std::thread::spawn(move || {
             let out_reader = std::thread::spawn(move || drain(stdout));
@@ -439,7 +538,7 @@ impl Runner for ProcessRunner {
             let outcome = match finish(exit_ok, written, &stdout_text, &stderr_text) {
                 Finish::UseWrittenFile => Outcome::Written(output),
                 Finish::WriteStdout => {
-                    match write_reserved(&mut reservation, stdout_text.as_bytes()) {
+                    match write_reserved(&mut hold(&writer), stdout_text.as_bytes()) {
                         Ok(()) => Outcome::Written(output),
                         Err(e) => {
                             Outcome::Failed(format!("could not write {}: {e}", output.display()))
@@ -447,7 +546,7 @@ impl Runner for ProcessRunner {
                     }
                 }
                 Finish::Failed(reason) => {
-                    match write_reserved(&mut reservation, failure_note(&reason).as_bytes()) {
+                    match write_reserved(&mut hold(&writer), failure_note(&reason).as_bytes()) {
                         Ok(()) => Outcome::Failed(reason),
                         Err(e) => Outcome::Failed(format!(
                             "{reason}; could not record failure in {}: {e}",
@@ -461,6 +560,8 @@ impl Runner for ProcessRunner {
 
         Ok(Box::new(ProcessJob {
             child: shared,
+            reservation,
+            output: spec.output.clone(),
             rx,
             done: None,
             worker: Some(worker),
@@ -470,6 +571,16 @@ impl Runner for ProcessRunner {
     fn description(&self) -> String {
         "a child process".to_string()
     }
+}
+
+/// The reservation, borrowed for as long as one write takes. A lock
+/// poisoned by a panicking writer still hands back the file: the quit
+/// path is the last chance to say what happened, and a panic there would
+/// leave the terminal in raw mode.
+fn hold(reservation: &Mutex<std::fs::File>) -> std::sync::MutexGuard<'_, std::fs::File> {
+    reservation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_reserved(file: &mut std::fs::File, content: &[u8]) -> std::io::Result<()> {
@@ -497,11 +608,58 @@ fn non_empty_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How long [`ProcessJob::terminate`] waits for a killed run to wind
+/// itself up before it finishes the job off itself.
+///
+/// Killing the child does not close its pipes: anything it spawned
+/// inherited them, and the drain threads block until the *last* writer
+/// closes. `terminate` runs on the UI thread from the quit prompt, so
+/// that wait has to be bounded or a grandchild the summarizer never knew
+/// about can hold the terminal in raw mode for as long as it likes.
+const TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+/// What a run stopped at the quit prompt is called in its own summary
+/// file, when it did not wind up inside [`TERMINATE_GRACE`].
+pub const STOPPED_REASON: &str = "the summary run was stopped before it could finish";
+
 struct ProcessJob {
     child: Arc<Mutex<Option<Child>>>,
+    /// Shared with the worker. Whichever of the two finishes the run
+    /// writes through it, so the reserved file is never left empty.
+    reservation: Arc<Mutex<std::fs::File>>,
+    output: PathBuf,
     rx: Receiver<Outcome>,
     done: Option<Outcome>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProcessJob {
+    /// The run is over as far as the app is concerned, but the worker is
+    /// still blocked on a pipe the killed child no longer owns. Finish
+    /// the job here: the app drops it the moment `terminate` returns, and
+    /// a detached worker dies with the process.
+    ///
+    /// Through [`finish`], because the precedence is the same one every
+    /// other ending obeys - the file the provider was asked to write
+    /// wins. A provider can have written its summary and still leave the
+    /// drain blocked, and the note would truncate what it wrote.
+    fn record_stopped(&self) -> Outcome {
+        let reason = match finish(false, non_empty_file(&self.output), "", STOPPED_REASON) {
+            Finish::UseWrittenFile => return Outcome::Written(self.output.clone()),
+            Finish::WriteStdout => STOPPED_REASON.to_string(),
+            Finish::Failed(reason) => reason,
+        };
+        match write_reserved(
+            &mut hold(&self.reservation),
+            failure_note(&reason).as_bytes(),
+        ) {
+            Ok(()) => Outcome::Failed(reason),
+            Err(e) => Outcome::Failed(format!(
+                "{reason}; could not record failure in {}: {e}",
+                self.output.display()
+            )),
+        }
+    }
 }
 
 impl Job for ProcessJob {
@@ -526,7 +684,21 @@ impl Job for ProcessJob {
                 let _ = child.wait();
             }
         }
+        // Bounded on purpose: see `TERMINATE_GRACE`. Past the grace the
+        // handle is dropped rather than joined, which detaches the worker
+        // and its two drain threads; the reservation they share is filled
+        // here first, so the run still ends in a note on disk and a
+        // failure the job reports.
         if let Some(worker) = self.worker.take() {
+            let deadline = Instant::now() + TERMINATE_GRACE;
+            while !worker.is_finished() {
+                if Instant::now() >= deadline {
+                    let stopped = self.record_stopped();
+                    self.done = Some(stopped);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let _ = worker.join();
         }
     }
@@ -558,15 +730,234 @@ mod tests {
         let expected = [
             ("ag", "agy --dangerously-skip-permissions", '1'),
             ("cc", "claude --dangerously-skip-permissions", '2'),
-            ("co", "codex -p lavish -a on-request", '3'),
+            (
+                "co",
+                "codex exec -s workspace-write --skip-git-repo-check",
+                '3',
+            ),
             ("gk", "grok --always-approve", '4'),
-            ("ki", "kimi --yolo", '5'),
+            ("ki", "kimi", '5'),
         ];
         for (provider, (code, line, digit)) in Provider::ALL.iter().zip(expected) {
             assert_eq!(provider.code(), code);
             assert_eq!(provider.command_line(), line);
             assert_eq!(provider.digit(), digit);
             assert_eq!(Provider::from_digit(digit), Some(*provider));
+        }
+    }
+
+    /// The bug this table exists to prevent: a prompt appended as a bare
+    /// trailing word. `agy` answers that with "Prompts are read only from
+    /// -p/--print, -i/--prompt-interactive, or stdin", and the others open
+    /// an interactive session no background job can answer.
+    #[test]
+    fn every_provider_takes_the_prompt_through_its_non_interactive_flag() {
+        let expected: [(Provider, &[&str]); 5] = [
+            (
+                Provider::Ag,
+                &["agy", "--dangerously-skip-permissions", "-p", "PROMPT"],
+            ),
+            (
+                Provider::Cc,
+                &["claude", "--dangerously-skip-permissions", "-p", "PROMPT"],
+            ),
+            (
+                Provider::Co,
+                &[
+                    "codex",
+                    "exec",
+                    "-s",
+                    "workspace-write",
+                    "--skip-git-repo-check",
+                    "PROMPT",
+                ],
+            ),
+            (Provider::Gk, &["grok", "--always-approve", "-p", "PROMPT"]),
+            (Provider::Ki, &["kimi", "-p", "PROMPT"]),
+        ];
+        for (provider, argv) in expected {
+            assert_eq!(
+                provider.argv_with_prompt("PROMPT"),
+                argv.iter().map(|w| (*w).to_string()).collect::<Vec<_>>(),
+                "{} argv",
+                provider.code()
+            );
+        }
+    }
+
+    /// A flag whose value is a name looked up in the user's own
+    /// configuration rather than a word the CLI understands by itself.
+    /// The value is portable-looking and still machine-local, which is
+    /// why the flag, not the value, is what gives it away.
+    fn selects_a_configured_name(flag: &str) -> bool {
+        matches!(
+            flag,
+            "-p" | "--profile" | "-c" | "--config" | "--config-file" | "--settings"
+        )
+    }
+
+    /// A value that names a place instead of a mode: absolute, home
+    /// relative, environment expanded, or any other path.
+    fn names_a_place(value: &str) -> bool {
+        value.starts_with('/')
+            || value.starts_with('~')
+            || value.starts_with('.')
+            || value.contains('$')
+            || value.contains('/')
+    }
+
+    /// The fixed line has to run on any machine that has the CLI
+    /// installed, so no word in it may name something only one machine
+    /// has. `codex exec -p lavish` was exactly that: it needed a
+    /// `$CODEX_HOME/lavish.config.toml` no other user has, and codex
+    /// exits with a config error rather than writing a summary.
+    ///
+    /// A flag that takes a value is fine - `-s workspace-write` is a
+    /// mode every install understands. What is refused is a value looked
+    /// up in the user's configuration, and *any* word that is a path,
+    /// wherever in the line it sits: the program, a subcommand, a flag's
+    /// value, or a bare trailing argument.
+    fn machine_local_words(argv: &[String]) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut expects_a_value: Option<&str> = None;
+        for word in argv {
+            if let Some((flag, value)) = word.split_once('=').filter(|_| word.starts_with('-')) {
+                expects_a_value = None;
+                if selects_a_configured_name(flag) || names_a_place(value) {
+                    found.push(word.clone());
+                }
+            } else if word.starts_with('-') {
+                expects_a_value = Some(word);
+            } else {
+                match expects_a_value.take() {
+                    Some(flag) if selects_a_configured_name(flag) => {
+                        found.push(format!("{flag} {word}"));
+                    }
+                    _ if names_a_place(word) => found.push(word.clone()),
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_provider_line_carries_a_machine_local_value() {
+        for provider in Provider::ALL {
+            let offenders = machine_local_words(&provider.base_argv());
+            assert!(
+                offenders.is_empty(),
+                "{}: {offenders:?} exist on one machine only",
+                provider.code()
+            );
+        }
+    }
+
+    /// The guard has to be able to fail, and to fail only on the thing it
+    /// is about: a name resolved out of the user's own configuration or a
+    /// path, wherever it sits - never a portable mode word.
+    #[test]
+    fn the_machine_local_guard_reads_words_and_not_positions() {
+        let line = |words: &[&str]| -> Vec<String> {
+            machine_local_words(&words.iter().map(|w| (*w).to_string()).collect::<Vec<_>>())
+        };
+
+        // The bug this guard is named after, and the shapes around it.
+        assert_eq!(
+            line(&["codex", "exec", "-p", "lavish", "--skip-git-repo-check"]),
+            vec!["-p lavish".to_string()]
+        );
+        assert_eq!(
+            line(&["codex", "--config=/Users/me/x.toml"]),
+            vec!["--config=/Users/me/x.toml".to_string()]
+        );
+        // A path is refused wherever it sits, including where no flag is
+        // waiting for it: trailing, leading, or as the program itself.
+        assert_eq!(
+            line(&[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "/Users/me/notes.toml"
+            ]),
+            vec!["/Users/me/notes.toml".to_string()]
+        );
+        assert_eq!(
+            line(&["tool", "~/.config/tool.toml"]),
+            vec!["~/.config/tool.toml".to_string()]
+        );
+        assert_eq!(
+            line(&["/opt/homebrew/bin/codex", "exec"]),
+            vec!["/opt/homebrew/bin/codex".to_string()]
+        );
+
+        // Portable constants stay portable.
+        for portable in [
+            &[
+                "codex",
+                "exec",
+                "-s",
+                "workspace-write",
+                "--skip-git-repo-check",
+            ][..],
+            &["agy", "--dangerously-skip-permissions"][..],
+            &["some-cli", "-m", "gpt-5", "--color=never"][..],
+        ] {
+            assert!(line(portable).is_empty(), "{portable:?} is portable");
+        }
+    }
+
+    /// `codex exec` is the one provider whose prompt is positional - its
+    /// `-p` is `--profile`. Every other provider must name a flag, or its
+    /// prompt is silently the wrong kind of argument.
+    #[test]
+    fn only_codex_takes_a_positional_prompt() {
+        for provider in Provider::ALL {
+            match provider {
+                Provider::Co => assert_eq!(provider.prompt_flag(), None),
+                other => assert_eq!(other.prompt_flag(), Some("-p"), "{}", other.code()),
+            }
+        }
+    }
+
+    /// Whatever the flags, the prompt stays exactly one argument: never
+    /// split on whitespace, never quoted into a string a shell would read.
+    #[test]
+    fn the_prompt_is_always_one_single_argument() {
+        let prompt = "read /a b.md\nand write 'it' \"there\"; rm -rf /";
+        for provider in Provider::ALL {
+            let argv = provider.argv_with_prompt(prompt);
+            assert_eq!(argv.last().map(String::as_str), Some(prompt));
+            assert_eq!(
+                argv.iter().filter(|arg| arg.contains(prompt)).count(),
+                1,
+                "{} must carry the prompt once",
+                provider.code()
+            );
+            assert!(
+                argv.starts_with(&provider.base_argv()),
+                "{} must keep its fixed line first",
+                provider.code()
+            );
+        }
+    }
+
+    /// The base line never carries a prompt of its own, and the program is
+    /// always its first word - the status row and every error say so.
+    #[test]
+    fn the_fixed_line_is_a_program_and_flags_only() {
+        for provider in Provider::ALL {
+            let base = provider.base_argv();
+            assert_eq!(provider.program(), base[0]);
+            assert_eq!(provider.command_line(), base.join(" "));
+            for word in &base[1..] {
+                assert!(
+                    word.starts_with('-') || !word.contains(' '),
+                    "{} has a suspicious fixed word {word:?}",
+                    provider.code()
+                );
+            }
         }
     }
 
@@ -580,6 +971,18 @@ mod tests {
         assert_eq!(resolve(Some('x')), None);
     }
 
+    /// Every row's command line starts at the same column, and that is
+    /// the column a continuation is indented to.
+    #[test]
+    fn every_menu_row_starts_its_command_at_the_indent() {
+        for (line, provider) in menu_lines().iter().zip(Provider::ALL) {
+            let prefix = format!("[{}] {}: ", provider.digit(), provider.code());
+            assert_eq!(prefix.chars().count(), MENU_INDENT, "{prefix:?}");
+            assert!(line.starts_with(&prefix), "{line:?}");
+            assert!(line[MENU_INDENT..].starts_with(&provider.command_line()));
+        }
+    }
+
     #[test]
     fn the_menu_marks_exactly_one_default() {
         let lines = menu_lines();
@@ -588,6 +991,11 @@ mod tests {
             lines[0],
             "[1] ag: agy --dangerously-skip-permissions  [Default]"
         );
+        assert_eq!(
+            lines[2],
+            "[3] co: codex exec -s workspace-write --skip-git-repo-check"
+        );
+        assert_eq!(lines[4], "[5] ki: kimi");
         assert_eq!(
             lines.iter().filter(|l| l.contains("[Default]")).count(),
             1,
@@ -672,14 +1080,51 @@ mod tests {
         assert!(prompt.contains("Do not modify"));
     }
 
+    /// A provider that skims filenames, or that answers "done" without
+    /// writing anything, is the failure this wording exists to prevent.
     #[test]
-    fn argv_is_the_fixed_provider_line_plus_the_prompt() {
+    fn the_prompt_says_to_read_the_files_and_to_actually_write_the_output() {
+        let prompt = spec(&["/docs/one.pdf", "/docs/two.md"]).prompt();
+        assert!(prompt.contains("Open and read every file listed above"));
+        assert!(prompt.contains("not what their names suggest"));
+        assert!(prompt.contains("exact absolute path"));
+        assert!(prompt.contains("must exist on disk"));
+        assert!(prompt.contains("write it with a shell command instead"));
+        assert!(prompt.contains("stdout"));
+    }
+
+    #[test]
+    fn argv_is_the_fixed_provider_line_the_prompt_flag_and_the_prompt() {
         let spec = spec(&["/docs/one.pdf"]);
         let argv = spec.argv();
-        assert_eq!(argv[0], "agy");
-        assert_eq!(argv[1], "--dangerously-skip-permissions");
-        assert_eq!(argv.len(), 3);
-        assert_eq!(argv[2], spec.prompt());
+        assert_eq!(
+            argv,
+            vec![
+                "agy".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "-p".to_string(),
+                spec.prompt(),
+            ]
+        );
+    }
+
+    /// Every provider's spec argv, whole - the flags and the one prompt.
+    #[test]
+    fn a_spec_builds_the_right_argv_for_every_provider() {
+        for provider in Provider::ALL {
+            let mut spec = spec(&["/docs/one.pdf", "/docs/two.md"]);
+            spec.provider = provider;
+            let argv = spec.argv();
+            assert_eq!(argv, provider.argv_with_prompt(&spec.prompt()));
+            assert_eq!(argv[0], provider.program());
+            assert_eq!(argv.last(), Some(&spec.prompt()));
+            assert_eq!(
+                argv.len(),
+                provider.base_argv().len() + usize::from(provider.prompt_flag().is_some()) + 1,
+                "{} argv length",
+                provider.code()
+            );
+        }
     }
 
     #[test]
