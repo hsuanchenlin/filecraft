@@ -1020,6 +1020,13 @@ impl App {
                 _ => {}
             }
         }
+        if let Mode::JobLog(pane) = &mut self.mode {
+            // A committed search moves the view exactly as a scroll key
+            // does, so the follow is re-read here too: otherwise the next
+            // frame pulls the log back to the bottom and the match the
+            // search just found is never seen.
+            pane.refollow(width, view, &glyphs);
+        }
         if let Some(text) = missed {
             return self.err(text);
         }
@@ -2428,6 +2435,47 @@ mod tests {
         live.append(stream::Origin::Out, "line 82\n");
         frame(&mut app);
         assert_eq!(log_pane(&app).pager.scroll, 82 - view);
+    }
+
+    /// A committed search jumps the view, and the next frame has to leave
+    /// it there. Following is being at the bottom, so a search that
+    /// landed somewhere else is not following any more - otherwise the
+    /// match is pulled off the screen before it is ever drawn.
+    #[test]
+    fn a_search_in_the_log_viewer_survives_the_next_frame() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        app.viewport_rows = 14;
+        app.viewport_cols = 60;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        let live = runner.live();
+        live.append(stream::Origin::Err, "session id: 01a04eef-d4a6\n");
+        for i in 2..=80 {
+            live.append(stream::Origin::Out, &format!("line {i}\n"));
+        }
+        app.handle_key(KeyInput::Char('L'));
+        assert!(log_pane(&app).follow);
+
+        for key in "/session".chars() {
+            app.handle_key(KeyInput::Char(key));
+        }
+        assert_eq!(app.handle_key(KeyInput::Enter), Effect::None);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+        assert!(!log_pane(&app).follow, "the search left the view following");
+
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+        assert!(
+            log_lines(&app)[0].contains("session id"),
+            "{:?}",
+            log_lines(&app)
+        );
+
+        // And the run is still streaming into a pane that is no longer
+        // pulled down by it.
+        live.append(stream::Origin::Out, "line 81\n");
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
     }
 
     #[test]

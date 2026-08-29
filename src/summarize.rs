@@ -15,6 +15,7 @@
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -552,8 +553,12 @@ impl Runner for ProcessRunner {
         let reservation = Arc::new(Mutex::new(reservation));
         let (tx, rx) = mpsc::channel();
 
+        // Shared for the same reason the reservation is: the quit path
+        // and the worker can both reach the end of this one run.
+        let signed = Arc::new(AtomicBool::new(false));
         let waiter = Arc::clone(&shared);
         let writer = Arc::clone(&reservation);
+        let signer = Arc::clone(&signed);
         let output = spec.output.clone();
         let provider = spec.provider;
         let live = stream.clone();
@@ -610,13 +615,14 @@ impl Runner for ProcessRunner {
                     }
                 }
             };
-            sign(&output, provider, live.session().as_deref());
+            sign_once(&signer, &output, provider, live.session().as_deref());
             let _ = tx.send(outcome);
         });
 
         Ok(Box::new(ProcessJob {
             child: shared,
             reservation,
+            signed,
             output: spec.output.clone(),
             provider: spec.provider,
             live: stream.clone(),
@@ -665,25 +671,15 @@ fn drain(pipe: Option<impl Read>, origin: stream::Origin, live: &stream::Handle)
     let mut buf = [0u8; 8 * 1024];
     // A chunk boundary can split a multi-byte character; the tail waits
     // for the rest of itself rather than becoming a replacement char.
+    // Everything else `stream::decode` consumes, so a byte that is not
+    // UTF-8 at all cannot stall the run's whole remaining output.
     let mut tail: Vec<u8> = Vec::new();
     loop {
         match pipe.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => {
                 tail.extend_from_slice(&buf[..read]);
-                let chunk = match std::str::from_utf8(&tail) {
-                    Ok(whole) => {
-                        let chunk = whole.to_string();
-                        tail.clear();
-                        chunk
-                    }
-                    Err(error) => {
-                        let good = error.valid_up_to();
-                        let chunk = String::from_utf8_lossy(&tail[..good]).into_owned();
-                        tail.drain(..good);
-                        chunk
-                    }
-                };
+                let chunk = stream::decode(&mut tail);
                 text.push_str(&chunk);
                 live.append(origin, &chunk);
             }
@@ -707,12 +703,27 @@ fn drain(pipe: Option<impl Read>, origin: stream::Origin, live: &stream::Handle)
 /// failed run is worth reopening for. A run whose provider never
 /// announced a session still says which provider it was.
 ///
+/// Exactly one, though, and `signed` is what holds that: two threads can
+/// reach the end of the same run. Past [`TERMINATE_GRACE`] the UI thread
+/// finishes the job itself in [`ProcessJob::record_stopped`], while the
+/// worker is merely detached rather than stopped - when the drain threads
+/// it is blocked on finally unblock, it re-evaluates the very same ending
+/// and arrives here too. Whichever gets here first signs; the other finds
+/// the run already signed and leaves the file alone.
+///
 /// Best effort by design: the summary is the point, and a footer that
 /// could not be appended must never turn a finished run into a failure.
-fn sign(output: &Path, provider: Provider, session: Option<&str>) {
+/// A footer that did not land leaves the run unsigned, so the thread
+/// arriving second still has its turn.
+fn sign_once(signed: &AtomicBool, output: &Path, provider: Provider, session: Option<&str>) {
+    if signed.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let resume = session.map(|id| provider.resume_command(id));
     let footer = session::footer(&provider.program(), session, resume.as_deref());
-    let _ = append_footer(output, &footer);
+    if append_footer(output, &footer).is_err() {
+        signed.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Append `footer` as its own paragraph, whatever the file ended with.
@@ -765,6 +776,9 @@ struct ProcessJob {
     /// Shared with the worker. Whichever of the two finishes the run
     /// writes through it, so the reserved file is never left empty.
     reservation: Arc<Mutex<std::fs::File>>,
+    /// Whether the run's footer has been appended. Shared with the worker
+    /// so the run is signed once however it ends - see [`sign_once`].
+    signed: Arc<AtomicBool>,
     output: PathBuf,
     provider: Provider,
     /// The live log, so a run stopped at the quit prompt still signs its
@@ -786,7 +800,14 @@ impl ProcessJob {
     /// wins. A provider can have written its summary and still leave the
     /// drain blocked, and the note would truncate what it wrote.
     fn record_stopped(&self) -> Outcome {
-        let sign_it = || sign(&self.output, self.provider, self.live.session().as_deref());
+        let sign_it = || {
+            sign_once(
+                &self.signed,
+                &self.output,
+                self.provider,
+                self.live.session().as_deref(),
+            )
+        };
         let reason = match finish(false, non_empty_file(&self.output), "", STOPPED_REASON) {
             Finish::UseWrittenFile => {
                 sign_it();
@@ -1056,6 +1077,99 @@ mod tests {
             footer,
             "> Provider: agy | Session: abc-123456 | \
              Resume with: agy --conversation abc-123456"
+        );
+    }
+
+    /// A pipe that hands over exactly the chunks it was given, so a test
+    /// can split a character across two reads the way a real one does.
+    /// It records how much of the log had arrived before each read, which
+    /// is the difference between output that streams and output that only
+    /// lands once the pipe closes.
+    struct Chunks {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        live: stream::Handle,
+        held: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let total = self.live.state(Instant::now()).total;
+            self.held.lock().unwrap().push(total);
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            let taken = chunk.len().min(buf.len());
+            buf[..taken].copy_from_slice(&chunk[..taken]);
+            if taken < chunk.len() {
+                self.chunks.push_front(chunk[taken..].to_vec());
+            }
+            Ok(taken)
+        }
+    }
+
+    /// The bug this guards: one byte that is not UTF-8 stalling the live
+    /// log for the whole rest of the run, so everything the provider
+    /// still had to say only appears once the pipe closes - by which time
+    /// the point of watching it has gone. A character genuinely split
+    /// across two reads still has to be joined rather than replaced.
+    #[test]
+    fn output_after_a_byte_that_is_not_utf8_still_reaches_the_live_log() {
+        let live = stream::Handle::new();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let pipe = Chunks {
+            chunks: vec![
+                b"reading the files\n".to_vec(),
+                vec![0xff],
+                b"still going\n".to_vec(),
+                vec![0xe2, 0x94],
+                vec![0x80],
+                b" done\n".to_vec(),
+            ]
+            .into(),
+            live: live.clone(),
+            held: Arc::clone(&held),
+        };
+        let text = drain(Some(pipe), stream::Origin::Out, &live);
+
+        // Every line was in the log before the pipe reached its end.
+        assert_eq!(held.lock().unwrap().last().copied(), Some(3));
+        let lines: Vec<String> = live
+            .snapshot_since(0)
+            .expect("a log to have been filled")
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "reading the files".to_string(),
+                "\u{FFFD}still going".to_string(),
+                "\u{2500} done".to_string(),
+            ]
+        );
+        // And what `finish` would save as the summary is what a lossy
+        // read of the whole pipe would have given it.
+        assert_eq!(
+            text,
+            "reading the files\n\u{FFFD}still going\n\u{2500} done\n"
+        );
+    }
+
+    #[test]
+    fn a_run_is_signed_once_however_many_threads_reach_its_ending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("notes-summary.md");
+        std::fs::write(&output, "# Summary\n\nwritten by the provider\n").unwrap();
+        let signed = AtomicBool::new(false);
+        for _ in 0..3 {
+            sign_once(&signed, &output, Provider::Ag, Some("abc-123456"));
+        }
+        let text = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(text.matches("> Provider: agy").count(), 1, "{text}");
+        assert!(
+            text.ends_with("Resume with: agy --conversation abc-123456\n"),
+            "{text}"
         );
     }
 

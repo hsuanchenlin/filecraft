@@ -182,6 +182,45 @@ impl StreamLog {
     }
 }
 
+/// Take everything decodable out of `tail`, leaving behind only bytes the
+/// pipe has not finished handing over.
+///
+/// Two things look alike at a chunk boundary and are not. A multi-byte
+/// character split by the boundary has to wait for the rest of itself,
+/// or a spinner glyph cut in half becomes a replacement character. Bytes
+/// that are simply not UTF-8 will never become valid, so waiting for them
+/// would wait forever - they are consumed here as the one replacement
+/// character a lossy read would have produced for them, which is what
+/// keeps the decoded stream identical to reading the whole pipe lossily.
+pub fn decode(tail: &mut Vec<u8>) -> String {
+    let mut text = String::new();
+    loop {
+        match std::str::from_utf8(tail) {
+            Ok(whole) => {
+                text.push_str(whole);
+                tail.clear();
+                return text;
+            }
+            Err(error) => {
+                let good = error.valid_up_to();
+                text.push_str(std::str::from_utf8(&tail[..good]).unwrap_or_default());
+                match error.error_len() {
+                    // Invalid: consumed, so the loop always moves on.
+                    Some(bad) => {
+                        text.push(char::REPLACEMENT_CHARACTER);
+                        tail.drain(..good + bad);
+                    }
+                    // Incomplete: the rest of it is still in the pipe.
+                    None => {
+                        tail.drain(..good);
+                        return text;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One raw line as a terminal would have left it: the last rewrite wins,
 /// and no escape sequence survives.
 fn settle(raw: &str) -> String {
@@ -445,6 +484,50 @@ mod tests {
 
     fn texts(log: &StreamLog) -> Vec<String> {
         log.lines().map(|line| line.text.clone()).collect()
+    }
+
+    /// A character split by a chunk boundary waits for the rest of
+    /// itself; bytes that are not UTF-8 at all are consumed, because
+    /// waiting for those would stall every line after them for the rest
+    /// of the run.
+    #[test]
+    fn a_split_character_waits_and_an_invalid_one_does_not() {
+        let mut tail: Vec<u8> = Vec::new();
+        tail.extend_from_slice("done ".as_bytes());
+        tail.extend_from_slice(&[0xe2, 0x94]);
+        assert_eq!(decode(&mut tail), "done ");
+        assert_eq!(tail, vec![0xe2, 0x94]);
+
+        tail.extend_from_slice(&[0x80]);
+        tail.extend_from_slice(" more\n".as_bytes());
+        assert_eq!(decode(&mut tail), "\u{2500} more\n");
+        assert!(tail.is_empty());
+
+        // Bytes that will never be valid: one replacement character, and
+        // everything after them still arrives.
+        tail.extend_from_slice(&[0xff, 0xfe]);
+        tail.extend_from_slice("after\n".as_bytes());
+        assert_eq!(decode(&mut tail), "\u{FFFD}\u{FFFD}after\n");
+        assert!(tail.is_empty());
+    }
+
+    /// Whatever the chunks were, the decoded stream is byte for byte what
+    /// reading the whole pipe lossily would have produced - that text is
+    /// still the summary when a provider prints one instead of writing it.
+    #[test]
+    fn decoding_in_chunks_reads_the_same_as_reading_it_all_at_once() {
+        let bytes: Vec<u8> = b"one \xe2\x94\x80 two \xff\xfe three \xf0\x9f".to_vec();
+        let whole = String::from_utf8_lossy(&bytes).into_owned();
+        for size in 1..=bytes.len() {
+            let mut tail: Vec<u8> = Vec::new();
+            let mut text = String::new();
+            for chunk in bytes.chunks(size) {
+                tail.extend_from_slice(chunk);
+                text.push_str(&decode(&mut tail));
+            }
+            text.push_str(&String::from_utf8_lossy(&tail));
+            assert_eq!(text, whole, "chunks of {size}");
+        }
     }
 
     #[test]
