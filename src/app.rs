@@ -724,23 +724,36 @@ impl App {
         match outcome {
             Outcome::Written(path) => {
                 self.push_msg(Level::Ok, format!("summary written to {}", path.display()));
-                // The summary is a new file in some directory; if it is
-                // this one, the listing should already show it.
-                if let Err(e) = self.nav.refresh() {
+                let Some(parent) = path.parent() else {
+                    return;
+                };
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned());
+                let moved = parent != self.nav.cwd;
+                let result = if moved {
+                    self.nav.change_dir(parent.to_path_buf(), name.as_deref())
+                } else {
+                    self.nav.refresh()
+                };
+                if let Err(e) = result {
                     self.push_msg(Level::Error, e.to_string());
                     return;
                 }
-                if path.parent() == Some(self.nav.cwd.as_path()) {
-                    if let Some(name) = path.file_name() {
-                        let name = name.to_string_lossy().into_owned();
-                        let visible = self.nav.visible();
-                        if let Some(pos) = visible
-                            .iter()
-                            .position(|&i| self.nav.entries[i].name == name)
-                        {
-                            self.nav.cursor = pos;
-                            self.push_msg(Level::Info, "press l to read it".to_string());
-                        }
+                if moved {
+                    self.push_msg(
+                        Level::Info,
+                        format!("listing moved to {}", parent.display()),
+                    );
+                }
+                if let Some(name) = name {
+                    let visible = self.nav.visible();
+                    if let Some(pos) = visible
+                        .iter()
+                        .position(|&i| self.nav.entries[i].name == name)
+                    {
+                        self.nav.cursor = pos;
+                        self.push_msg(Level::Info, "press l to read it".to_string());
                     }
                 }
             }
@@ -1920,6 +1933,38 @@ mod tests {
             "notes-summary.md",
             "the summary should be under the cursor, ready for l"
         );
+    }
+
+    #[test]
+    fn a_cross_directory_summary_moves_the_listing_and_focuses_the_file() {
+        let tmp = docs_fixture();
+        let deep = tmp.path().canonicalize().unwrap().join("deep");
+        let written = deep.join("inner-summary.md");
+        fs::write(&written, "# summary").unwrap();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Written(written.clone())),
+                ..FakeRunner::default()
+            },
+        );
+
+        app.handle_key(KeyInput::Char('S'));
+        focus_row(&mut app, "deep");
+        app.handle_key(KeyInput::Char('l'));
+        focus_row(&mut app, "inner.markdown");
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Char('h'));
+        app.handle_key(KeyInput::Enter);
+        app.handle_key(KeyInput::Enter);
+        app.poll_job();
+
+        assert_eq!(app.nav.cwd, deep);
+        assert_eq!(app.nav.selected().unwrap().name, "inner-summary.md");
+        assert!(app.messages.iter().any(|message| {
+            message.text == format!("listing moved to {}", app.nav.cwd.display())
+        }));
+        assert_eq!(last_msg(&app).text, "press l to read it");
     }
 
     #[test]

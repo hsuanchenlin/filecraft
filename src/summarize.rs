@@ -12,7 +12,7 @@
 //! nothing here runs unless the user selects files, picks a provider, and
 //! the summarizer is handed an explicit, finite list of paths.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -202,9 +202,17 @@ pub fn output_path_with(first: &Path, stamp: &str, taken: &dyn Fn(&Path) -> bool
     if !taken(&stamped) {
         return stamped;
     }
-    // Third time is a different second or a directory nobody can write
-    // to; either way the caller reports the real error.
-    dir.join(format!("summary-{stamp}.md"))
+    let generic = dir.join(format!("summary-{stamp}.md"));
+    if !taken(&generic) {
+        return generic;
+    }
+    for suffix in 2..=usize::MAX {
+        let candidate = dir.join(format!("{stem}-summary-{stamp}-{suffix}.md"));
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("every possible summary filename is already in use")
 }
 
 /// [`output_path_with`] against the real filesystem.
@@ -309,7 +317,7 @@ pub fn finish(exit_ok: bool, output_written: bool, stdout: &str, stderr: &str) -
     if output_written {
         return Finish::UseWrittenFile;
     }
-    if !stdout.trim().is_empty() {
+    if exit_ok && !stdout.trim().is_empty() {
         return Finish::WriteStdout;
     }
     let detail = last_meaningful_line(stderr)
@@ -412,10 +420,19 @@ impl Runner for ProcessRunner {
             let written = non_empty_file(&output);
             let outcome = match finish(exit_ok, written, &stdout_text, &stderr_text) {
                 Finish::UseWrittenFile => Outcome::Written(output),
-                Finish::WriteStdout => match std::fs::write(&output, stdout_text.as_bytes()) {
-                    Ok(()) => Outcome::Written(output),
-                    Err(e) => Outcome::Failed(format!("could not write {}: {e}", output.display())),
-                },
+                Finish::WriteStdout => {
+                    let write = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&output)
+                        .and_then(|mut file| file.write_all(stdout_text.as_bytes()));
+                    match write {
+                        Ok(()) => Outcome::Written(output),
+                        Err(e) => {
+                            Outcome::Failed(format!("could not write {}: {e}", output.display()))
+                        }
+                    }
+                }
                 Finish::Failed(reason) => Outcome::Failed(reason),
             };
             let _ = tx.send(outcome);
@@ -563,6 +580,21 @@ mod tests {
             output_path_with(&first, "20260829-101500", &both_taken),
             PathBuf::from("/docs/summary-20260829-101500.md")
         );
+        let earlier_taken = |p: &Path| {
+            matches!(
+                p.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "report-summary.md"
+                        | "report-summary-20260829-101500.md"
+                        | "summary-20260829-101500.md"
+                        | "report-summary-20260829-101500-2.md"
+                )
+            )
+        };
+        assert_eq!(
+            output_path_with(&first, "20260829-101500", &earlier_taken),
+            PathBuf::from("/docs/report-summary-20260829-101500-3.md")
+        );
     }
 
     #[test]
@@ -639,6 +671,14 @@ mod tests {
     #[test]
     fn stdout_is_the_fallback_summary() {
         assert_eq!(finish(true, false, "# Summary\n", ""), Finish::WriteStdout);
+    }
+
+    #[test]
+    fn stdout_from_a_failed_provider_is_a_diagnostic() {
+        assert_eq!(
+            finish(false, false, "agy: request failed\n", ""),
+            Finish::Failed("agy: request failed".to_string())
+        );
     }
 
     #[test]

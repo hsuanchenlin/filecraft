@@ -41,12 +41,16 @@ printf '# Summary\n\nwritten by the stub provider\n' > "$path"
 "#,
         );
         // `claude`: prints the summary instead of writing it.
-        write_stub(&dir, "claude", "printf '# Summary\\n\\nfrom stdout\\n'\n");
+        write_stub(
+            &dir,
+            "claude",
+            "sleep 1\nprintf '# Summary\\n\\nfrom stdout\\n'\n",
+        );
         // `codex`: fails, and says why on stderr.
         write_stub(
             &dir,
             "codex",
-            "printf 'codex: not logged in\\n' >&2\nexit 1\n",
+            "printf 'progress: contacting provider\\n'\nprintf 'codex: not logged in\\n' >&2\nexit 1\n",
         );
         // `grok`: never finishes on its own.
         write_stub(&dir, "grok", "sleep 600\n");
@@ -124,7 +128,20 @@ fn a_provider_that_only_prints_has_its_stdout_saved_as_the_summary() {
 }
 
 #[test]
-fn a_failing_provider_reports_what_it_said_and_writes_nothing() {
+fn stdout_fallback_never_overwrites_a_file_created_during_the_run() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Cc);
+    let mut job = ProcessRunner.start(&spec).unwrap();
+    std::fs::File::create(&spec.output).unwrap();
+
+    let outcome = wait_for(&mut job);
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(std::fs::metadata(&spec.output).unwrap().len(), 0);
+}
+
+#[test]
+fn a_failing_provider_does_not_save_its_stdout_as_a_summary() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Co);
