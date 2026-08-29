@@ -25,7 +25,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Level, Mode, QUIT_QUESTION};
@@ -669,10 +669,14 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "the provider runs on this machine and reads only the files above",
+        "the provider runs locally and reads only these files",
         theme.meta(),
     )));
-    frame.render_widget(Paragraph::new(lines), inner);
+    // Wrapped, not clipped: this dialog is the one screen whose rows are
+    // command lines, and half a command line read as a whole one is worse
+    // than a row that runs on. The words are chosen to fit the narrowest
+    // supported terminal on one line anyway.
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// One drawn row of the reader, with the active search query picked out.
@@ -1100,7 +1104,7 @@ mod tests {
             for line in [
                 "[1] ag: agy --dangerously-skip-permissions  [Default]",
                 "[2] cc: claude --dangerously-skip-permissions",
-                "[3] co: codex exec -p lavish --skip-git-repo-check",
+                "[3] co: codex exec --skip-git-repo-check",
                 "[4] gk: grok --always-approve",
                 "[5] ki: kimi",
             ] {
@@ -1109,6 +1113,12 @@ mod tests {
                     "{width}x{height} lost '{line}':\n{screen}"
                 );
             }
+            // The safety statement is the point of the dialog, so it
+            // has to survive the narrowest terminal whole.
+            assert!(
+                screen.contains("the provider runs locally and reads only these files"),
+                "{width}x{height} clipped the safety line:\n{screen}"
+            );
             assert!(screen.contains("Enter default"), "{screen}");
         }
     }

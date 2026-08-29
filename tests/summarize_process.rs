@@ -57,7 +57,23 @@ printf '# Summary\n\nwritten by the stub provider\n' > "$path"
         // *replaced* by the sleep rather than parenting it: `terminate`
         // kills the process Filecraft spawned, and only an `exec`ed body
         // guarantees that is the one holding the pipes open.
-        write_stub(&dir, "grok", "exec sleep 600\n");
+        //
+        // A `.orphan` marker in the working directory asks for the other
+        // shape, the one a real node CLI has: a grandchild that keeps the
+        // inherited stdout and stderr open after the child is killed.
+        // `.orphaned` says it exists, so a test never races it.
+        write_stub(
+            &dir,
+            "grok",
+            &format!(
+                "if [ -e {ORPHAN_REQUEST} ]; then\n  \
+                 sleep {} &\n  \
+                 : > {ORPHANED}\n\
+                 fi\n\
+                 exec sleep 600\n",
+                ORPHAN_LIFETIME.as_secs()
+            ),
+        );
         // `kimi`: succeeds silently, writing nothing at all.
         write_stub(&dir, "kimi", "exit 0\n");
 
@@ -86,8 +102,7 @@ n=$#
 i=1
 for arg in "$@"; do
   if [ "$i" -lt "$n" ]; then
-    printf '%s
-' "$arg" >> "$FLAGS_FILE.tmp"
+    printf '%s\n' "$arg" >> "$FLAGS_FILE.tmp"
   else
     printf '%s' "$arg" > "$PROMPT_FILE.tmp"
   fi
@@ -110,18 +125,15 @@ fn contract(name: &str) -> &'static str {
     match name {
         "agy" => {
             r#"if [ "$prev" != "-p" ]; then
-  printf 'Error: unexpected argument "%s".
-' "$last" >&2
-  printf 'Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin, so this argument would have been ignored.
-' >&2
+  printf 'Error: unexpected argument "%s".\n' "$last" >&2
+  printf 'Prompts are read only from -p/--print, -i/--prompt-interactive, or stdin, so this argument would have been ignored.\n' >&2
   exit 1
 fi
 "#
         }
         "claude" => {
             r#"if [ "$prev" != "-p" ]; then
-  printf 'claude: a prompt without --print opens an interactive session
-' >&2
+  printf 'claude: a prompt without --print opens an interactive session\n' >&2
   exit 1
 fi
 "#
@@ -130,15 +142,13 @@ fi
         // `-a` nor `-q` exists under it. Its `-p` is `--profile`.
         "codex" => {
             r#"if [ "$1" != "exec" ]; then
-  printf 'codex: a bare prompt opens the interactive TUI
-' >&2
+  printf 'codex: a bare prompt opens the interactive TUI\n' >&2
   exit 1
 fi
 for arg in "$@"; do
   case "$arg" in
     -a|--ask-for-approval|-q)
-      printf "error: unexpected argument '%s' found
-" "$arg" >&2
+      printf "error: unexpected argument '%s' found\n" "$arg" >&2
       exit 1
       ;;
   esac
@@ -147,8 +157,7 @@ done
         }
         "grok" => {
             r#"if [ "$prev" != "-p" ]; then
-  printf 'grok: a bare prompt opens the interactive TUI
-' >&2
+  printf 'grok: a bare prompt opens the interactive TUI\n' >&2
   exit 1
 fi
 "#
@@ -159,15 +168,13 @@ fi
             r#"for arg in "$@"; do
   case "$arg" in
     --yolo|-y|--auto)
-      printf 'error: Cannot combine --prompt with %s.
-' "$arg" >&2
+      printf 'error: Cannot combine --prompt with %s.\n' "$arg" >&2
       exit 1
       ;;
   esac
 done
 if [ "$prev" != "-p" ]; then
-  printf 'kimi: a bare prompt opens an interactive session
-' >&2
+  printf 'kimi: a bare prompt opens an interactive session\n' >&2
   exit 1
 fi
 "#
@@ -175,6 +182,16 @@ fi
         other => panic!("no argument contract written for the stub {other}"),
     }
 }
+
+/// How the `grok` stub is asked to leave a pipe holder behind, and how
+/// it says it has. Only the terminate test writes the request.
+const ORPHAN_REQUEST: &str = ".orphan";
+const ORPHANED: &str = ".orphaned";
+
+/// How long that grandchild holds the pipes. Long enough that a
+/// `terminate` which waited for it would be unmistakable, short enough
+/// that the stray process is gone moments after the suite is.
+const ORPHAN_LIFETIME: Duration = Duration::from_secs(10);
 
 fn write_stub(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
@@ -249,10 +266,7 @@ fn every_provider_is_handed_its_prompt_through_the_flag_its_cli_requires() {
             Provider::Cc,
             &["claude", "--dangerously-skip-permissions", "-p"],
         ),
-        (
-            Provider::Co,
-            &["codex", "exec", "-p", "lavish", "--skip-git-repo-check"],
-        ),
+        (Provider::Co, &["codex", "exec", "--skip-git-repo-check"]),
         (Provider::Gk, &["grok", "--always-approve", "-p"]),
         (Provider::Ki, &["kimi", "-p"]),
     ];
@@ -412,6 +426,40 @@ fn a_long_run_stays_in_flight_and_terminate_ends_it() {
     assert!(
         artifact.contains("the provider exited without writing a summary"),
         "{artifact}"
+    );
+}
+
+/// `terminate` is called on the UI thread by `y` at the quit prompt, so
+/// it has to come back even when killing the child does not close the
+/// child's pipes. Here it does not: the stub leaves a grandchild holding
+/// the inherited stdout and stderr, which is what a CLI that shells out
+/// does. Unbounded, the drain threads read until that grandchild exits
+/// and the TUI stays frozen in raw mode for the whole of it.
+#[test]
+fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
+    stub_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let spec = spec_in(&tmp, Provider::Gk);
+    std::fs::write(spec.cwd.join(ORPHAN_REQUEST), "").unwrap();
+    let mut job = ProcessRunner.start(&spec).unwrap();
+
+    // Terminating before the grandchild exists would prove nothing.
+    let orphaned = spec.cwd.join(ORPHANED);
+    let deadline = Instant::now() + PATIENCE;
+    while !orphaned.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the stub never left a grandchild holding the pipes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let started = Instant::now();
+    job.terminate();
+    let waited = started.elapsed();
+    assert!(
+        waited < ORPHAN_LIFETIME / 2,
+        "terminate waited {waited:?} for a pipe the killed child no longer owns"
     );
 }
 

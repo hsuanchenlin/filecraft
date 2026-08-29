@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Extensions the summarizer accepts. Anything else is refused in words
 /// rather than handed to a model that cannot read it.
@@ -54,7 +54,7 @@ pub enum Provider {
     Ag,
     /// `claude --dangerously-skip-permissions -p <prompt>`
     Cc,
-    /// `codex exec -p lavish --skip-git-repo-check <prompt>`
+    /// `codex exec --skip-git-repo-check <prompt>`
     Co,
     /// `grok --always-approve -p <prompt>`
     Gk,
@@ -93,11 +93,14 @@ impl Provider {
     /// Each line is the form that runs headless and answers no questions:
     ///
     /// - `agy` / `claude`: their own skip-permissions flag, then `--print`.
-    /// - `codex`: the `exec` subcommand, which is the non-interactive one.
-    ///   `-p` here is `--profile`, not a prompt; the `lavish` profile is
-    ///   what carries the approval policy the interactive line used to ask
-    ///   for with `-a on-request`. `--skip-git-repo-check` is required
-    ///   because a folder of documents is usually not a git repository.
+    /// - `codex`: the `exec` subcommand, which is the non-interactive one,
+    ///   and nothing else. A named `-p`/`--profile` would be a
+    ///   `$CODEX_HOME/<name>.config.toml` that exists only on the machine
+    ///   it was written on, so every other user would get a config error
+    ///   instead of a summary; `codex`'s own defaults already confine the
+    ///   run to the directory it is started in.
+    ///   `--skip-git-repo-check` is required because a folder of documents
+    ///   is usually not a git repository.
     /// - `grok`: `--always-approve`, then `--single`.
     /// - `kimi`: nothing but the program. `kimi` *refuses* to combine
     ///   `--yolo` or `--auto` with `--prompt` ("Cannot combine --prompt
@@ -106,7 +109,7 @@ impl Provider {
         let words: &[&str] = match self {
             Provider::Ag => &["agy", "--dangerously-skip-permissions"],
             Provider::Cc => &["claude", "--dangerously-skip-permissions"],
-            Provider::Co => &["codex", "exec", "-p", "lavish", "--skip-git-repo-check"],
+            Provider::Co => &["codex", "exec", "--skip-git-repo-check"],
             Provider::Gk => &["grok", "--always-approve"],
             Provider::Ki => &["kimi"],
         };
@@ -126,8 +129,9 @@ impl Provider {
         match self {
             // `-p` is `--print`: run one prompt and print the response.
             Provider::Ag | Provider::Cc => Some("-p"),
-            // `codex exec [OPTIONS] [PROMPT]` - positional. Its `-p` is
-            // `--profile` and is already in `base_argv`.
+            // `codex exec [OPTIONS] [PROMPT]` - positional. Its own
+            // `-p` is `--profile`, so a prompt flag here would name a
+            // config file rather than hand over the prompt.
             Provider::Co => None,
             // `-p` is `--single`: single-turn, print to stdout, exit.
             Provider::Gk => Some("-p"),
@@ -571,6 +575,16 @@ fn non_empty_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How long [`ProcessJob::terminate`] waits for a killed run to wind
+/// itself up before it stops waiting.
+///
+/// Killing the child does not close its pipes: anything it spawned
+/// inherited them, and the drain threads block until the *last* writer
+/// closes. `terminate` runs on the UI thread from the quit prompt, so
+/// that wait has to be bounded or a grandchild the summarizer never knew
+/// about can hold the terminal in raw mode for as long as it likes.
+const TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
 struct ProcessJob {
     child: Arc<Mutex<Option<Child>>>,
     rx: Receiver<Outcome>,
@@ -600,7 +614,18 @@ impl Job for ProcessJob {
                 let _ = child.wait();
             }
         }
+        // Bounded on purpose: see `TERMINATE_GRACE`. Past the grace the
+        // handle is dropped rather than joined, which detaches the worker
+        // and its two drain threads - they own nothing the quit path needs
+        // and the process exit collects them.
         if let Some(worker) = self.worker.take() {
+            let deadline = Instant::now() + TERMINATE_GRACE;
+            while !worker.is_finished() {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let _ = worker.join();
         }
     }
@@ -632,7 +657,7 @@ mod tests {
         let expected = [
             ("ag", "agy --dangerously-skip-permissions", '1'),
             ("cc", "claude --dangerously-skip-permissions", '2'),
-            ("co", "codex exec -p lavish --skip-git-repo-check", '3'),
+            ("co", "codex exec --skip-git-repo-check", '3'),
             ("gk", "grok --always-approve", '4'),
             ("ki", "kimi", '5'),
         ];
@@ -661,14 +686,7 @@ mod tests {
             ),
             (
                 Provider::Co,
-                &[
-                    "codex",
-                    "exec",
-                    "-p",
-                    "lavish",
-                    "--skip-git-repo-check",
-                    "PROMPT",
-                ],
+                &["codex", "exec", "--skip-git-repo-check", "PROMPT"],
             ),
             (Provider::Gk, &["grok", "--always-approve", "-p", "PROMPT"]),
             (Provider::Ki, &["kimi", "-p", "PROMPT"]),
@@ -680,6 +698,36 @@ mod tests {
                 "{} argv",
                 provider.code()
             );
+        }
+    }
+
+    /// The fixed line has to run on any machine that has the CLI
+    /// installed. A bare word *after* a flag is that flag's value, and
+    /// every value these CLIs take names something local to one machine:
+    /// a profile, a model, a directory. `codex exec -p lavish` was
+    /// exactly that - it needed a `$CODEX_HOME/lavish.config.toml` no
+    /// other user has, and codex exits with a config error without it.
+    #[test]
+    fn no_provider_line_carries_a_machine_local_value() {
+        for provider in Provider::ALL {
+            let argv = provider.base_argv();
+            let mut after_a_flag = false;
+            for word in argv.iter().skip(1) {
+                if let Some(flag) = word.strip_prefix('-') {
+                    after_a_flag = true;
+                    assert!(
+                        !flag.contains('='),
+                        "{}: '{word}' carries a value",
+                        provider.code()
+                    );
+                } else {
+                    assert!(
+                        !after_a_flag,
+                        "{}: '{word}' is a value for the flag before it",
+                        provider.code()
+                    );
+                }
+            }
         }
     }
 
@@ -754,10 +802,7 @@ mod tests {
             lines[0],
             "[1] ag: agy --dangerously-skip-permissions  [Default]"
         );
-        assert_eq!(
-            lines[2],
-            "[3] co: codex exec -p lavish --skip-git-repo-check"
-        );
+        assert_eq!(lines[2], "[3] co: codex exec --skip-git-repo-check");
         assert_eq!(lines[4], "[5] ki: kimi");
         assert_eq!(
             lines.iter().filter(|l| l.contains("[Default]")).count(),

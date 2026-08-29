@@ -240,7 +240,7 @@ selector lists folders and those documents, and nothing else.
 │                                                                            │
 │ [1] ag: agy --dangerously-skip-permissions  [Default]                      │
 │ [2] cc: claude --dangerously-skip-permissions                              │
-│ [3] co: codex exec -p lavish --skip-git-repo-check                         │
+│ [3] co: codex exec --skip-git-repo-check                                   │
 │ [4] gk: grok --always-approve                                              │
 │ [5] ki: kimi                                                               │
 └───────────────────────────────────── 1-5 choose · Enter default · q cancel ┘
@@ -269,6 +269,12 @@ as a bare trailing word is either refused outright (`agy` answers
 stdin`) or opens an interactive session nothing can answer. `kimi` is
 listed bare because it *refuses* to combine a yolo flag with `--prompt`;
 its prompt mode carries its own permissions.
+
+Each line runs on any machine that has the CLI installed: it names no
+profile, no config file, and nothing else that would only exist where it
+was written. `codex` is the one that needs a flag of its own,
+`--skip-git-repo-check`, because a folder of documents is usually not a
+git repository; it otherwise runs under `codex`'s own defaults.
 
 While it runs, the status row carries the job and keeps it even on a
 narrow terminal:

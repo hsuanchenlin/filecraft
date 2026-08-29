@@ -97,7 +97,11 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   `--yolo`/`--auto` with `--prompt`. Check a real `--help` before adding
   or changing a provider - the stubs in `tests/summarize_process.rs`
   reproduce each CLI's refusal, so a wrong flag fails there rather than
-  in front of a user.
+  in front of a user. A fixed line must also name nothing that exists on
+  one machine only - a `--profile`, a config path - or the provider is
+  unusable for everyone but its author;
+  `no_provider_line_carries_a_machine_local_value` refuses any flag that
+  takes a value.
   At most one job runs: `App::job` is the single thing the status row,
   the quit confirmation, and the completion message all refer to.
   `ProcessRunner` atomically reserves the output before spawning. A failed
@@ -108,7 +112,10 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   answering keys and a finished run is reported without a keypress.
   `q` / Ctrl-C with a job alive raises `Mode::ConfirmQuit`, and only
   `y` terminates the child - Enter is not an answer there, same rule as
-  a trash.
+  a trash. `terminate` runs on the UI thread, so it waits only
+  `TERMINATE_GRACE` for the run to wind up: killing the child does not
+  close pipes a grandchild inherited, and an unbounded wait leaves the
+  TUI frozen in raw mode.
 - `no_browse_key_ever_mutates_the_filesystem` and its reader twin also
   assert that no key starts an AI run. `S` may open the selector and
   nothing more; a provider only ever runs after a selection *and* a
