@@ -58,8 +58,10 @@ autonomous loop that keeps acting after a single approval.
 
 Every applied action is recorded in a user-visible log: timestamp,
 scope, operation, target path, and result (applied / rejected / failed).
-The log is local. v0 still has no network, telemetry, or background
-daemon, and a future agent does not add those by default.
+The log is local. Filecraft keeps no telemetry and runs no background
+daemon, and a future agent does not add either by default. What
+Filecraft does and does not send over the network is the README's
+Safety section; the `agent` seam adds nothing to it.
 
 ## Opt-in (not implemented)
 

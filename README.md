@@ -260,14 +260,17 @@ narrow terminal:
 
 The screen stays fully usable: navigate, read files, run other commands.
 When the run ends, `ok: summary written to <path>` appears in the log
-without a keypress, the listing refreshes, and the new file is placed
-under the cursor so `l` opens it in the reader.
+without a keypress and the new file is placed under the cursor, so `l`
+opens it in the reader. Because the summary lands beside the *first* file
+you marked, that folder may not be the one you are looking at; when it is
+not, the listing moves there and says so - `listing moved to <path>`.
 
 The summary is written **beside the first file you marked**, as
 `<first-stem>-summary.md`. An existing file of that name is never
 overwritten: the run falls back to `<first-stem>-summary-<stamp>.md`.
 The provider is asked to write that one path and nothing else; if it
-prints the summary instead of writing it, its stdout is saved there.
+exits cleanly having printed the summary instead of writing it, that
+stdout is saved there.
 Filecraft reserves the path before starting the provider. If the run fails
 or is terminated, that reserved file instead contains a short Markdown
 failure note with the same reason shown in the message log.
