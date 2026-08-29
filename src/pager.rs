@@ -83,6 +83,20 @@ impl Pager {
         &self.doc
     }
 
+    /// Swap the document, keeping where the reader is and what it is
+    /// searching for.
+    ///
+    /// A file never does this - it is read once and does not change
+    /// underneath. A running provider's log does: it grows while it is
+    /// being read, and the offset, the live `/` input, and the committed
+    /// query all have to survive that. The layout cache does not: it is
+    /// keyed on the geometry, not on the document, so it is dropped here
+    /// rather than left describing lines that are gone.
+    pub fn replace_doc(&mut self, doc: Vec<DocLine>) {
+        self.doc = doc;
+        *self.laid.borrow_mut() = None;
+    }
+
     /// Every source line as plain text.
     pub fn lines(&self) -> Vec<String> {
         self.doc.iter().map(DocLine::text).collect()
@@ -347,6 +361,26 @@ mod tests {
         let mut pager = numbered(30);
         pager.scroll = 9_999;
         assert_eq!(pager.top_line(W, &Glyphs::UNICODE), 29);
+    }
+
+    /// A growing document keeps the reader where it was and keeps what
+    /// it was searching for, and the memoized layout is dropped so the
+    /// new lines are actually drawn.
+    #[test]
+    fn replacing_the_document_keeps_the_reader_where_it_was() {
+        let mut pager = numbered(30);
+        pager.scroll_by(5, W, H, &Glyphs::UNICODE);
+        pager.query = "line 2".to_string();
+        pager.find = Some("part".to_string());
+        let before = pager.rows(W, &Glyphs::UNICODE);
+
+        pager.replace_doc(markdown::parse_plain(&"grew\n".repeat(60)));
+        assert_eq!(pager.scroll, 5);
+        assert_eq!(pager.query, "line 2");
+        assert_eq!(pager.find.as_deref(), Some("part"));
+        let after = pager.rows(W, &Glyphs::UNICODE);
+        assert!(!Rc::ptr_eq(&before, &after));
+        assert_eq!(after.len(), 60);
     }
 
     #[test]

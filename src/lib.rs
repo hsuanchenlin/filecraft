@@ -17,6 +17,12 @@
 //!   display rows.
 //! - [`pager`] is the read-only full-screen reader: scroll, search, and
 //!   the position it reports.
+//! - [`stream`] buffers a running provider's stdout and stderr into
+//!   whole, numbered, terminal-safe lines.
+//! - [`session`] recognizes the session a provider announces and writes
+//!   the footer that says how to reopen it.
+//! - [`joblog`] is the live log viewer over a summary run: the pane, its
+//!   header, and the follow-the-newest-output rule.
 //! - [`picker`] is the folder-only destination picker for `:move` with
 //!   no path: cursor, descend, ascend, and the dest path it reports.
 //! - [`multiselect`] is the cross-directory multi-file selector behind
@@ -47,6 +53,7 @@ pub mod cli;
 pub mod command;
 pub mod editor;
 pub mod fsops;
+pub mod joblog;
 pub mod markdown;
 pub mod multiselect;
 pub mod nav;
@@ -54,6 +61,8 @@ pub mod pager;
 pub mod pathcheck;
 pub mod picker;
 pub mod preview;
+pub mod session;
+pub mod stream;
 pub mod summarize;
 pub mod trash;
 pub mod ui;

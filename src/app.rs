@@ -7,19 +7,21 @@
 //! trash confirmations - is deterministically testable.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crate::agent::{self, Agent, AgentRequest};
 use crate::bearings::{self, Glyphs, Ladder};
 use crate::command::{self, Command};
 use crate::editor;
 use crate::fsops::{self, FsError};
+use crate::joblog::{self, LogPane};
 use crate::markdown::{self, DocLine};
 use crate::multiselect::{self, FileSelector, ToggleError, Toggled};
 use crate::nav::NavState;
 use crate::pager::{self, Pager};
 use crate::picker::{self, FolderPicker};
 use crate::preview::{self, PreviewData, ViewSource};
+use crate::stream;
 use crate::summarize::{self, Job, JobSpec, Outcome, Provider, Runner};
 use crate::trash::{self, Trasher};
 
@@ -82,6 +84,9 @@ pub enum Mode {
         files: Vec<PathBuf>,
     },
     Pager(Pager),
+    /// Watching a summary run's own output. Read-only, like every other
+    /// pane: closing it closes a view, never the run.
+    JobLog(LogPane),
 }
 
 /// A move, rename, or trash waiting for explicit confirmation.
@@ -208,6 +213,30 @@ pub struct App {
     /// the status row, the quit confirmation, and the message it finally
     /// logs all refer to the same unambiguous thing.
     pub job: Option<ActiveJob>,
+    /// The most recent summary run's log. Kept after the run ends - and
+    /// after a run that could not even start - so `L` can still be
+    /// pressed to read what the provider actually said.
+    pub run_log: Option<RunLog>,
+}
+
+/// A summary run's own output, and enough about the run to make sense of
+/// it. Outlives the [`ActiveJob`]: a finished run is exactly the one you
+/// want to read afterwards.
+#[derive(Debug, Clone)]
+pub struct RunLog {
+    pub provider: Provider,
+    /// The Markdown file the run was asked to write.
+    pub output: PathBuf,
+    /// Everything the provider printed, filled in as it printed it.
+    pub stream: stream::Handle,
+}
+
+impl RunLog {
+    /// Whether this is the run currently going, rather than the last one
+    /// that went.
+    pub fn running(&self) -> bool {
+        self.stream.running()
+    }
 }
 
 /// A summary run in flight, plus the spec that describes it in words.
@@ -251,6 +280,7 @@ impl App {
             trasher: trash::system(),
             runner: summarize::process_runner(),
             job: None,
+            run_log: None,
         };
         app.push_msg(
             Level::Info,
@@ -289,7 +319,7 @@ impl App {
             Mode::FolderPicker(_) => self.handle_picker_key(key),
             Mode::FileSelector(_) => self.handle_selector_key(key),
             Mode::ProviderMenu { .. } => self.handle_provider_key(key),
-            Mode::Pager(_) => self.handle_pager_key(key),
+            Mode::Pager(_) | Mode::JobLog(_) => self.handle_pager_key(key),
         }
     }
 
@@ -329,6 +359,10 @@ impl App {
             // does, and only `y` moves anything.
             KeyInput::Char('d') => self.cmd_trash(),
             KeyInput::Char('M') => self.show_messages(),
+            // The live log of the summary run. Read-only, and it does
+            // not touch the run: it opens a view over output already
+            // captured.
+            KeyInput::Char('L') => self.cmd_log(),
             KeyInput::Char('/') => {
                 self.mode = Mode::Filter {
                     input: self.nav.filter.clone(),
@@ -686,17 +720,37 @@ impl App {
             Ok(spec) => spec,
             Err(e) => return self.err(format!("summarize: {e}")),
         };
-        match self.runner.start(&spec) {
+        // The log is the app's, not the job's: the runner fills it while
+        // it runs, and it is still here to read once the job is gone.
+        let live = stream::Handle::new();
+        let started = self.runner.start(&spec, &live);
+        self.run_log = Some(RunLog {
+            provider,
+            output: spec.output.clone(),
+            stream: live,
+        });
+        match started {
             Ok(handle) => {
                 self.push_msg(Level::Ok, spec.status_line());
                 self.push_msg(
                     Level::Info,
                     format!("summarize: will write {}", spec.output.display()),
                 );
+                self.push_msg(
+                    Level::Info,
+                    "press L to watch what the provider is doing".to_string(),
+                );
                 self.job = Some(ActiveJob { spec, handle });
                 Effect::None
             }
-            Err(e) => self.err(format!("summarize: {e}")),
+            Err(e) => {
+                // A run that never started still has a log - one line
+                // saying why - and `L` still opens it.
+                if let Some(run) = &self.run_log {
+                    run.stream.end();
+                }
+                self.err(format!("summarize: {e}"))
+            }
         }
     }
 
@@ -721,6 +775,12 @@ impl App {
             return;
         };
         self.job = None;
+        // Whatever the runner did with it, the log is closed when the
+        // app collects the outcome: the header stops saying "thinking"
+        // about a run that is over.
+        if let Some(run) = &self.run_log {
+            run.stream.end();
+        }
         match outcome {
             Outcome::Written(path) => {
                 self.push_msg(Level::Ok, format!("summary written to {}", path.display()));
@@ -778,6 +838,71 @@ impl App {
         if let Mode::Pager(pager) = &mut self.mode {
             pager.clamp(width, view, &glyphs);
         }
+        self.sync_job_log();
+    }
+
+    /// Read the running summary's log into an open log viewer.
+    ///
+    /// Called from [`App::set_viewport`], which every surface that draws
+    /// goes through once a frame: a log that grew between two frames is
+    /// on screen at the next one, without a keypress and without the
+    /// event loop knowing anything about panes.
+    fn sync_job_log(&mut self) {
+        let Some(live) = self.run_log.as_ref().map(|run| run.stream.clone()) else {
+            return;
+        };
+        let (width, view, glyphs) = (self.log_cols(), self.log_rows(), self.glyphs);
+        if let Mode::JobLog(pane) = &mut self.mode {
+            pane.sync(&live, Instant::now(), width, view, &glyphs);
+        }
+    }
+
+    /// Columns of text the log viewer has - the reader's frame plus its
+    /// own pinned header.
+    pub fn log_cols(&self) -> usize {
+        self.viewport_cols.saturating_sub(joblog::FRAME_COLS).max(1)
+    }
+
+    /// Rows of log the viewer has.
+    pub fn log_rows(&self) -> usize {
+        self.viewport_rows.saturating_sub(joblog::FRAME_ROWS).max(1)
+    }
+
+    /// The geometry of whichever full-screen pane is open, so one set of
+    /// scroll keys serves the reader and the log viewer alike.
+    fn pane_geometry(&self) -> (usize, usize) {
+        match &self.mode {
+            Mode::JobLog(_) => (self.log_cols(), self.log_rows()),
+            _ => (self.pager_cols(), self.pager_rows()),
+        }
+    }
+
+    /// The [`Pager`] inside whichever pane is open.
+    fn pane(&mut self) -> Option<&mut Pager> {
+        match &mut self.mode {
+            Mode::Pager(pager) => Some(pager),
+            Mode::JobLog(pane) => Some(&mut pane.pager),
+            _ => None,
+        }
+    }
+
+    /// `L` / `:log` / `:job` - open the summary run's own output.
+    ///
+    /// Read-only and detached: the run is not touched, not waited on,
+    /// and not stopped when the pane is closed. A finished run's log is
+    /// still here, which is what makes this the place to find the
+    /// session a provider announced.
+    fn cmd_log(&mut self) -> Effect {
+        let Some(run) = &self.run_log else {
+            return self
+                .err("log: no AI summary has run yet - press S to pick files for one".to_string());
+        };
+        let (provider, live) = (run.provider, run.stream.clone());
+        let mut pane = LogPane::new(provider);
+        let (width, view, glyphs) = (self.log_cols(), self.log_rows(), self.glyphs);
+        pane.sync(&live, Instant::now(), width, view, &glyphs);
+        self.mode = Mode::JobLog(pane);
+        Effect::None
     }
 
     /// Columns of text the reader has, mirrored from the terminal the
@@ -792,17 +917,23 @@ impl App {
         self.viewport_rows.saturating_sub(pager::FRAME_ROWS).max(1)
     }
 
+    /// The scroll, search, and back-out keys of a full-screen pane.
+    ///
+    /// One implementation for the file reader and the log viewer: they
+    /// are the same pane over different documents, and a key that meant
+    /// two things in the two of them would be the bug this avoids.
     fn handle_pager_key(&mut self, key: KeyInput) -> Effect {
-        if matches!(&self.mode, Mode::Pager(p) if p.find.is_some()) {
+        if self.pane().is_some_and(|pager| pager.find.is_some()) {
             return self.handle_find_key(key);
         }
-        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        let (width, view) = self.pane_geometry();
+        let glyphs = self.glyphs;
         let page = view as isize;
         let half = (view as isize / 2).max(1);
         let mut close = false;
         let mut missed: Option<(Level, String)> = None;
         {
-            let Mode::Pager(pager) = &mut self.mode else {
+            let Some(pager) = self.pane() else {
                 return Effect::None;
             };
             match key {
@@ -841,8 +972,15 @@ impl App {
         }
         if close {
             // The listing is untouched underneath, so closing lands on
-            // exactly the row the reader was opened from.
+            // exactly the row the reader was opened from. A summary run
+            // watched through the log viewer keeps running: the pane
+            // owns nothing the run needs.
             self.mode = Mode::Browse;
+        } else if let Mode::JobLog(pane) = &mut self.mode {
+            // Following the newest output *is* being at the bottom, so
+            // it is re-read from where the scroll left the view rather
+            // than toggled by a key of its own.
+            pane.refollow(width, view, &glyphs);
         }
         if let Some((level, text)) = missed {
             self.push_msg(level, text);
@@ -853,10 +991,11 @@ impl App {
     /// The `/` prompt inside the reader. Esc leaves the search, not the
     /// reader - backing out is always exactly one level.
     fn handle_find_key(&mut self, key: KeyInput) -> Effect {
-        let (width, view, glyphs) = (self.pager_cols(), self.pager_rows(), self.glyphs);
+        let (width, view) = self.pane_geometry();
+        let glyphs = self.glyphs;
         let mut missed: Option<String> = None;
         {
-            let Mode::Pager(pager) = &mut self.mode else {
+            let Some(pager) = self.pane() else {
                 return Effect::None;
             };
             let Some(input) = pager.find.as_mut() else {
@@ -880,6 +1019,13 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if let Mode::JobLog(pane) = &mut self.mode {
+            // A committed search moves the view exactly as a scroll key
+            // does, so the follow is re-read here too: otherwise the next
+            // frame pulls the log back to the bottom and the match the
+            // search just found is never seen.
+            pane.refollow(width, view, &glyphs);
         }
         if let Some(text) = missed {
             return self.err(text);
@@ -1109,6 +1255,7 @@ impl App {
             Command::Edit => self.cmd_edit(),
             Command::Preview => self.cmd_preview(),
             Command::Summarize => self.cmd_summarize(),
+            Command::Log => self.cmd_log(),
             Command::Help => self.show_help(),
             Command::Quit => self.quit_or_confirm(),
             Command::Agent { args } => self.cmd_agent(args),
@@ -1490,6 +1637,7 @@ pub fn help_lines() -> Vec<String> {
         "  .                    show/hide dotfiles",
         "  r                    refresh listing",
         "  M                    message history",
+        "  L                    live log of the AI run (also after it ends)",
         "  ?                    this help",
         "  Esc                  back out one level (clears a filter)",
         "  q, Ctrl-C            quit",
@@ -1502,6 +1650,19 @@ pub fn help_lines() -> Vec<String> {
         "  /                    find in this file (Enter searches)",
         "  n / N                next / previous match",
         "  h, q, Esc            back to the listing, on the same row",
+        "",
+        "KEYS (log viewer - L, :log or :job)",
+        "  j / k, Down / Up     scroll one line",
+        "  d / u                scroll half a page",
+        "  f / b, PgDn / PgUp   scroll a page",
+        "  g / G, Home / End    top / bottom",
+        "  /                    find in the log (Enter searches)",
+        "  n / N                next / previous match",
+        "  h, q, Esc            back to the listing - the run keeps going",
+        "  (new output follows the view while you are at the bottom;",
+        "   scroll up to hold your place, G to follow again)",
+        "  (NNN | is stdout, NNN ! is stderr; the header names the",
+        "   session and the command that reopens it in the provider)",
         "",
         "KEYS (confirmation prompt)",
         "  y                    go ahead",
@@ -1546,6 +1707,7 @@ pub fn help_lines() -> Vec<String> {
         "  edit                 edit selected file in $EDITOR (or nvim)",
         "  preview              read-only preview (nvim -R, or built-in)",
         "  summarize, summary   AI summary of files you pick (same as S)",
+        "  log, job             the AI run's own output (same as L)",
         "  agent [...]          future AI seam - disabled in v0",
         "  help                 this help",
         "  quit                 leave filecraft",
@@ -1562,6 +1724,10 @@ pub fn help_lines() -> Vec<String> {
         "  - a summary is never started, and no file is read for one,",
         "    until you select files and choose a provider",
         "  - the summary is a new .md file; it never overwrites one",
+        "  - the log viewer only reads: closing it never stops a run,",
+        "    and no key in it starts, resumes, or answers one",
+        "  - the resume command is printed for you to run yourself;",
+        "    filecraft never runs it",
         "",
         "MARKERS   name/ directory   name@ symlink   name@! broken symlink",
         "",
@@ -1661,24 +1827,42 @@ mod tests {
     /// The [`Runner`] seam, scripted. It records every spec it was asked
     /// to start, so the argv, the prompt, and the output path a real run
     /// would have used are all assertable without an AI CLI installed.
+    ///
+    /// It also keeps the log handle it was handed, which is how a test
+    /// makes a run "print" something: the app cannot tell a line written
+    /// here from a line a child process wrote.
     #[derive(Clone, Default)]
     struct FakeRunner {
         started: std::sync::Arc<Mutex<Vec<JobSpec>>>,
         terminated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        streams: std::sync::Arc<Mutex<Vec<stream::Handle>>>,
         outcome: Option<Outcome>,
         fail: Option<String>,
     }
 
     impl Runner for FakeRunner {
-        fn start(&self, spec: &JobSpec) -> Result<Box<dyn Job>, String> {
+        fn start(&self, spec: &JobSpec, live: &stream::Handle) -> Result<Box<dyn Job>, String> {
             if let Some(reason) = &self.fail {
                 return Err(reason.clone());
             }
             self.started.lock().unwrap().push(spec.clone());
+            self.streams.lock().unwrap().push(live.clone());
             Ok(Box::new(ScriptedJob {
                 outcome: self.outcome.clone(),
                 terminated: std::sync::Arc::clone(&self.terminated),
             }))
+        }
+    }
+
+    impl FakeRunner {
+        /// The log of the run it most recently started.
+        fn live(&self) -> stream::Handle {
+            self.streams
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("no run was started")
         }
     }
 
@@ -2100,6 +2284,328 @@ mod tests {
             "1 - 5",
             "summarize, summary",
             "terminate the summary and quit",
+        ] {
+            assert!(help.contains(needed), "help must document '{needed}'");
+        }
+    }
+
+    /// The open log viewer.
+    fn log_pane(app: &App) -> &LogPane {
+        let Mode::JobLog(pane) = &app.mode else {
+            panic!("expected the log viewer, got {:?}", app.mode);
+        };
+        pane
+    }
+
+    /// The rows the open log viewer would draw, gutters and all.
+    fn log_lines(app: &App) -> Vec<String> {
+        log_pane(app)
+            .pager
+            .rows(app.log_cols(), &app.glyphs)
+            .iter()
+            .map(|row| row.text().trim_end().to_string())
+            .collect()
+    }
+
+    /// One frame of the event loop: the geometry is mirrored in, which is
+    /// also when an open log viewer re-reads the run.
+    fn frame(app: &mut App) {
+        let (rows, cols) = (app.viewport_rows, app.viewport_cols);
+        app.set_viewport(rows, cols);
+    }
+
+    #[test]
+    fn the_log_viewer_says_there_is_nothing_to_watch_before_a_run() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.handle_key(KeyInput::Char('L')), Effect::None);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("no AI summary has run yet"));
+    }
+
+    #[test]
+    fn the_key_and_both_commands_open_the_running_providers_output() {
+        let tmp = docs_fixture();
+        for open_it in [":L", "log", "job"] {
+            let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+            run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+            runner
+                .live()
+                .append(stream::Origin::Out, "reading notes.md\n");
+            if let Some(line) = open_it.strip_prefix(':') {
+                app.handle_key(KeyInput::Char(line.chars().next().unwrap()));
+            } else {
+                app.execute_line(open_it);
+            }
+            assert_eq!(
+                log_lines(&app),
+                vec!["    1 | reading notes.md".to_string()],
+                "'{open_it}' did not open the log"
+            );
+            assert!(app.job_active(), "'{open_it}' disturbed the run");
+        }
+    }
+
+    /// The point of the whole pane: output printed while it is open
+    /// reaches the screen on the next frame, with no key pressed.
+    #[test]
+    fn output_printed_while_the_pane_is_open_arrives_without_a_keypress() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        app.handle_key(KeyInput::Char('L'));
+        assert_eq!(log_lines(&app), vec!["(no output yet)".to_string()]);
+        assert_eq!(log_pane(&app).activity(), stream::Activity::Waiting);
+
+        let live = runner.live();
+        live.append(stream::Origin::Out, "thinking about it\n");
+        live.append(stream::Origin::Err, "session id: 01a04eef-d4a6\n");
+        frame(&mut app);
+        assert_eq!(
+            log_lines(&app),
+            vec![
+                "    1 | thinking about it".to_string(),
+                "    2 ! session id: 01a04eef-d4a6".to_string(),
+            ]
+        );
+        assert_eq!(log_pane(&app).activity(), stream::Activity::Streaming);
+        assert_eq!(log_pane(&app).session(), Some("01a04eef-d4a6"));
+    }
+
+    /// The header is what makes the session reachable outside Filecraft:
+    /// it names the provider's own reopen command, never one Filecraft
+    /// would run itself.
+    #[test]
+    fn the_header_names_the_session_and_how_to_reopen_it() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        // `3` is codex, whose banner really does announce a session.
+        run_summary(&mut app, &["notes.md"], KeyInput::Char('3'));
+        runner
+            .live()
+            .append(stream::Origin::Err, "session id: 01a04eef-d4a6\n");
+        app.handle_key(KeyInput::Char('L'));
+        let [top, bottom] = log_pane(&app).header(&app.glyphs);
+        assert!(top.starts_with("codex "), "{top:?}");
+        assert_eq!(
+            bottom,
+            "session 01a04eef-d4a6 · resume: codex resume 01a04eef-d4a6"
+        );
+    }
+
+    #[test]
+    fn the_log_viewer_scrolls_with_the_readers_own_keys() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        app.viewport_rows = 14;
+        app.viewport_cols = 60;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        let live = runner.live();
+        for i in 1..=80 {
+            live.append(stream::Origin::Out, &format!("line {i}\n"));
+        }
+        app.handle_key(KeyInput::Char('L'));
+
+        // It opens at the newest output, following it.
+        let view = app.log_rows();
+        assert!(log_pane(&app).follow);
+        assert_eq!(log_pane(&app).pager.scroll, 80 - view);
+
+        // Scrolling up stops the follow and holds the place.
+        app.handle_key(KeyInput::Char('k'));
+        assert!(!log_pane(&app).follow);
+        assert_eq!(log_pane(&app).pager.scroll, 80 - view - 1);
+        app.handle_key(KeyInput::Char('u'));
+        assert_eq!(
+            log_pane(&app).pager.scroll,
+            80 - view - 1 - (view as isize / 2).max(1) as usize
+        );
+        app.handle_key(KeyInput::Char('g'));
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+
+        // New output leaves a reader who scrolled up exactly where it is.
+        live.append(stream::Origin::Out, "line 81\n");
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+
+        // `G` goes to the bottom, which is what following is.
+        app.handle_key(KeyInput::Char('G'));
+        assert!(log_pane(&app).follow);
+        live.append(stream::Origin::Out, "line 82\n");
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 82 - view);
+    }
+
+    /// A committed search jumps the view, and the next frame has to leave
+    /// it there. Following is being at the bottom, so a search that
+    /// landed somewhere else is not following any more - otherwise the
+    /// match is pulled off the screen before it is ever drawn.
+    #[test]
+    fn a_search_in_the_log_viewer_survives_the_next_frame() {
+        let tmp = docs_fixture();
+        let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+        app.viewport_rows = 14;
+        app.viewport_cols = 60;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        let live = runner.live();
+        live.append(stream::Origin::Err, "session id: 01a04eef-d4a6\n");
+        for i in 2..=80 {
+            live.append(stream::Origin::Out, &format!("line {i}\n"));
+        }
+        app.handle_key(KeyInput::Char('L'));
+        assert!(log_pane(&app).follow);
+
+        for key in "/session".chars() {
+            app.handle_key(KeyInput::Char(key));
+        }
+        assert_eq!(app.handle_key(KeyInput::Enter), Effect::None);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+        assert!(!log_pane(&app).follow, "the search left the view following");
+
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+        assert!(
+            log_lines(&app)[0].contains("session id"),
+            "{:?}",
+            log_lines(&app)
+        );
+
+        // And the run is still streaming into a pane that is no longer
+        // pulled down by it.
+        live.append(stream::Origin::Out, "line 81\n");
+        frame(&mut app);
+        assert_eq!(log_pane(&app).pager.scroll, 0);
+    }
+
+    #[test]
+    fn every_back_out_key_leaves_the_run_alone() {
+        let tmp = docs_fixture();
+        for key in [
+            KeyInput::Char('h'),
+            KeyInput::Char('q'),
+            KeyInput::Esc,
+            KeyInput::Enter,
+            KeyInput::Left,
+        ] {
+            let (mut app, runner) = app_with_runner(&tmp, FakeRunner::default());
+            run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+            app.handle_key(KeyInput::Char('L'));
+            assert_eq!(app.handle_key(key), Effect::None, "{key:?}");
+            assert_eq!(app.mode, Mode::Browse, "{key:?} did not close the pane");
+            assert!(app.job_active(), "{key:?} ended the run");
+            assert!(
+                !runner.terminated.load(std::sync::atomic::Ordering::SeqCst),
+                "{key:?} terminated the provider"
+            );
+            // And it is still there to reopen.
+            app.handle_key(KeyInput::Char('L'));
+            assert!(matches!(app.mode, Mode::JobLog(_)), "{key:?}");
+        }
+    }
+
+    /// A finished run is exactly the one worth reading afterwards, so its
+    /// log outlives it - and says it has finished.
+    #[test]
+    fn the_log_outlives_the_run_that_wrote_it() {
+        let tmp = docs_fixture();
+        let output = tmp.path().join("notes-summary.md");
+        let (mut app, runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Written(output)),
+                ..FakeRunner::default()
+            },
+        );
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        runner
+            .live()
+            .append(stream::Origin::Out, "wrote the summary\n");
+        app.poll_job();
+        assert!(!app.job_active());
+
+        app.handle_key(KeyInput::Char('L'));
+        assert_eq!(log_pane(&app).activity(), stream::Activity::Ended);
+        assert_eq!(
+            log_lines(&app),
+            vec!["    1 | wrote the summary".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_run_that_could_not_start_still_has_a_log_saying_why() {
+        let tmp = docs_fixture();
+        let (mut app, _) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                fail: Some("could not run 'agy': No such file".to_string()),
+                ..FakeRunner::default()
+            },
+        );
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert!(!app.job_active());
+        app.handle_key(KeyInput::Char('L'));
+        assert_eq!(log_pane(&app).activity(), stream::Activity::Ended);
+    }
+
+    /// The log viewer's twin of the reader's rule: it is a view, and a
+    /// view changes nothing - not the tree, not the run.
+    #[test]
+    fn no_log_viewer_key_ever_mutates_the_filesystem_or_the_run() {
+        let tmp = docs_fixture();
+        let before = snapshot(tmp.path());
+        let can = tempfile::tempdir().unwrap();
+        let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
+        keys.extend([
+            KeyInput::Enter,
+            KeyInput::Esc,
+            KeyInput::Backspace,
+            KeyInput::Up,
+            KeyInput::Down,
+            KeyInput::Left,
+            KeyInput::Right,
+            KeyInput::PageUp,
+            KeyInput::PageDown,
+            KeyInput::Home,
+            KeyInput::End,
+        ]);
+        for key in keys {
+            let runner = FakeRunner::default();
+            let mut app = app_with_can(&tmp, &can);
+            app.runner = Box::new(runner.clone());
+            run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+            runner.live().append(stream::Origin::Out, "working\n");
+            app.handle_key(KeyInput::Char('L'));
+            assert!(matches!(app.mode, Mode::JobLog(_)));
+
+            let effect = app.handle_key(key);
+            assert_eq!(effect, Effect::None, "{key:?} produced an effect");
+            assert!(app.pending.is_none(), "{key:?} armed an operation");
+            assert!(app.job_active(), "{key:?} ended the run");
+            assert!(
+                !runner.terminated.load(std::sync::atomic::Ordering::SeqCst),
+                "{key:?} terminated the provider"
+            );
+            assert_eq!(
+                runner.started.lock().unwrap().len(),
+                1,
+                "{key:?} started a second run"
+            );
+            assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
+            assert!(can_contents(&can).is_empty(), "{key:?} trashed something");
+        }
+    }
+
+    #[test]
+    fn help_documents_the_log_viewer_and_both_its_commands() {
+        let help = help_lines().join("\n");
+        for needed in [
+            "L ",
+            "KEYS (log viewer",
+            "log, job",
+            "the run keeps going",
+            "stdout",
+            "stderr",
         ] {
             assert!(help.contains(needed), "help must document '{needed}'");
         }

@@ -123,10 +123,43 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   app drops the job the moment `terminate` returns. Going through
   `finish` is what keeps the note from overwriting a summary the provider
   had already written; a blocked drain does not mean an unfinished run.
-- `no_browse_key_ever_mutates_the_filesystem` and its reader twin also
-  assert that no key starts an AI run. `S` may open the selector and
-  nothing more; a provider only ever runs after a selection *and* a
-  chosen provider.
+- A run's own output is watchable while it happens: `L` / `:log` /
+  `:job` opens `joblog::LogPane` over `App::run_log`. `src/stream.rs` is
+  the pure buffer (`decode`'s byte-to-text rule, partial lines, `\r`
+  rewrites, ANSI stripping, line numbering, the `Activity` word) behind
+  `stream::Handle`, the one locked thing the drain threads fill and the
+  UI thread reads; only an *incomplete* character at a chunk boundary
+  waits for the rest of itself, or one byte that is not UTF-8 stalls
+  every line after it for the rest of the run;
+  `src/joblog.rs` owns the pane, its two pinned header rows, and the
+  follow rule; `ui::draw_job_log` only draws them. `joblog::FRAME_ROWS`
+  is `pager::FRAME_ROWS + HEADER_ROWS` and must match what
+  `draw_job_log` reserves, the same coupling the reader and the picker
+  have. `App::set_viewport` is the once-a-frame hook that re-reads the
+  log, which is why a growing run reaches the screen with no keypress.
+  Following the newest output *is* being at the bottom (`refollow`) -
+  there is no separate mode, so every key that moves the view re-reads
+  it, a committed `/` search included. `App::run_log` outlives the job,
+  including a run that never started, so `L` always has something to
+  show.
+- `session::scan` reads the session a provider announces out of one line
+  of its output (`codex exec` really prints `session id: <uuid>` on
+  stderr; the probe that established that is in `session.rs`'s tests).
+  It is what the header names and what `summarize::sign_once` appends to
+  every Markdown a run produces - summary, saved stdout, or failure
+  note. Once per run: past `TERMINATE_GRACE` the UI thread and the
+  detached worker both reach the same ending, and the flag they share is
+  what keeps one summary from carrying two footers.
+  `Provider::resume_words` is a *second* fixed table with the same rule
+  as `base_argv`: read off each CLI's own `--help`, portable, and never
+  run by Filecraft. It is not uniform - `agy --conversation`,
+  `codex resume` (a subcommand), `kimi --session` - so a guessed
+  `--resume` would be advice that fails in the user's hands.
+- `no_browse_key_ever_mutates_the_filesystem` and its reader and log
+  viewer twins also assert that no key starts an AI run, and the log
+  twin adds that no key in the pane ends or restarts the one running.
+  `S` may open the selector and nothing more; a provider only ever runs
+  after a selection *and* a chosen provider.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping

@@ -33,6 +33,7 @@ use crate::bearings::{
     self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
 };
 use crate::fsops::FsError;
+use crate::joblog::{LogPane, HEADER_ROWS};
 use crate::markdown::{self, Ink, Kind, Row};
 use crate::multiselect::FileSelector;
 use crate::nav::{EntryKind, NavState};
@@ -308,6 +309,7 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
     let bearings = Bearings::from_nav(&app.nav, offset, rows);
     match &app.mode {
         Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager),
+        Mode::JobLog(pane) => draw_job_log(frame, theme, list_area, pane),
         Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker),
         Mode::FileSelector(selector) => draw_selector(frame, theme, list_area, selector),
         Mode::ProviderMenu { files } => draw_provider_menu(frame, theme, list_area, files.len()),
@@ -476,6 +478,65 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
         .map(|row| reader_line(row, theme, &pager.query))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The live log viewer. The reader's frame with two pinned header rows
+/// above the log: what the run is doing, and which session it opened.
+///
+/// The rows it reserves are [`crate::joblog::FRAME_ROWS`], which is what
+/// [`crate::app::App::log_rows`] subtracts. If the two ever disagree the
+/// log scrolls past rows the screen never drew.
+fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let width = inner.width as usize;
+    let view = (inner.height as usize).saturating_sub(HEADER_ROWS);
+
+    let block = frame_only
+        .border_style(theme.banner())
+        .title(Span::styled(
+            format!(" {} ", sanitize(&pane.pager.title)),
+            theme.prompt(),
+        ))
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(" {} ", pane.pager.position(width, view, &glyphs)),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let [header_area, log_area] =
+        Layout::vertical([Constraint::Length(HEADER_ROWS as u16), Constraint::Min(0)]).areas(inner);
+
+    // The header is chrome: it is never scrolled and never operated on.
+    let header: Vec<Line> = pane
+        .header(&glyphs)
+        .iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                pad_to_width_with(&sanitize(row), width, glyphs.ellipsis),
+                theme.meta(),
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(header), header_area);
+
+    let rows = pane.pager.rows(width, &glyphs);
+    let scroll = pane.pager.scroll.min(Pager::max_scroll(rows.len(), view));
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(scroll)
+        .take(view)
+        .map(|row| reader_line(row, theme, &pane.pager.query))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), log_area);
 }
 
 /// The folder picker popup. Same listing-area frame as the reader, so
@@ -713,6 +774,11 @@ fn ink_style(kind: Kind, ink: Ink, theme: &Theme) -> Style {
     match ink {
         Ink::Match => Style::default().add_modifier(Modifier::REVERSED),
         Ink::Marker if matches!(kind, Kind::Bullet) => theme.prompt(),
+        // The one body line that has a marker is a log line, whose
+        // gutter is chrome: it recedes so the provider's own words are
+        // what the eye lands on. Textual either way - the number and the
+        // stream character are there whatever the palette.
+        Ink::Marker if matches!(kind, Kind::Body) => theme.meta(),
         Ink::Marker => base,
         Ink::Code => theme.code(),
         Ink::Strong => base.add_modifier(Modifier::BOLD),
@@ -824,6 +890,25 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
                 )),
             ]),
         },
+        Mode::JobLog(pane) => match &pane.pager.find {
+            Some(input) => Line::from(vec![
+                Span::styled(" find> ", theme.prompt()),
+                Span::raw(sanitize(input)),
+                Span::styled(caret, theme.prompt()),
+            ]),
+            None => Line::from(vec![
+                Span::styled(" watch ", theme.prompt()),
+                Span::raw(sanitize(&format!(
+                    "{} {dot} {}",
+                    pane.activity().label(),
+                    match pane.session() {
+                        Some(id) => format!("session {id}"),
+                        None => "no session reported".to_string(),
+                    },
+                    dot = glyphs.dot
+                ))),
+            ]),
+        },
         Mode::FolderPicker(picker) => Line::from(vec![
             Span::styled(" pick ", theme.prompt()),
             Span::raw(sanitize(&format!(
@@ -918,6 +1003,23 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             "/ find",
             "n/N next/prev",
             "PgUp/PgDn page",
+        ],
+        Mode::JobLog(pane) if pane.pager.find.is_some() => {
+            &["type to find", "Enter search", "Esc keep watching"]
+        }
+        Mode::JobLog(pane) if pane.follow => &[
+            "following new output",
+            "h/q/Esc back to files",
+            "j/k line",
+            "d/u half page",
+            "/ find",
+        ],
+        Mode::JobLog(_) => &[
+            "j/k line",
+            "h/q/Esc back to files",
+            "G follow new output",
+            "d/u half page",
+            "/ find",
         ],
     };
     let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
@@ -1062,6 +1164,25 @@ mod tests {
             crate::summarize::JobSpec::new(crate::summarize::Provider::DEFAULT, files, output)
                 .unwrap();
         app.job = Some(crate::app::ActiveJob::new(spec, Box::new(StalledJob)));
+    }
+
+    /// A job the app is watching: it is running, and its log already has
+    /// `lines` in it. `end` is what a finished run looks like, which is
+    /// also what makes the header's word deterministic.
+    fn with_watched_job(app: &mut App, files: &[&str], lines: &[&str], end: bool) {
+        with_running_job(app, files);
+        let live = crate::stream::Handle::new();
+        for line in lines {
+            live.append(crate::stream::Origin::Out, &format!("{line}\n"));
+        }
+        if end {
+            live.end();
+        }
+        app.run_log = Some(crate::app::RunLog {
+            provider: crate::summarize::Provider::DEFAULT,
+            output: std::path::PathBuf::from("/docs/a-summary.md"),
+            stream: live,
+        });
     }
 
     /// Open the file selector and select every named file.
@@ -1223,7 +1344,7 @@ mod tests {
     #[test]
     fn every_summarizer_screen_keeps_its_frame_at_every_size() {
         let tmp = summary_fixture();
-        for stage in 0..4 {
+        for stage in 0..5 {
             for (width, height) in SIZES {
                 for theme in [
                     Theme::from_no_color_env(None),
@@ -1244,9 +1365,25 @@ mod tests {
                             with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md"]);
                             app.handle_key(KeyInput::Char('q'));
                         }
-                        _ => {
+                        3 => {
                             with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md"]);
                             app.handle_key(KeyInput::Char('?'));
+                        }
+                        // The log viewer, over a run that has printed
+                        // more than fits and one line far too wide.
+                        _ => {
+                            let mut lines: Vec<String> =
+                                (1..=60).map(|i| format!("provider line {i}")).collect();
+                            lines.push("w".repeat(300));
+                            lines.push("session id: 01a04eef-d4a6-7232".to_string());
+                            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+                            with_watched_job(
+                                &mut app,
+                                &["/docs/a.pdf", "/docs/b.md"],
+                                &lines,
+                                false,
+                            );
+                            app.handle_key(KeyInput::Char('L'));
                         }
                     }
                     let screen = render_themed(&mut app, width, height, &theme);
@@ -1287,6 +1424,121 @@ mod tests {
         let screen = render_themed(&mut app, 80, 24, &theme);
         assert!(screen.contains("[Default]"), "{screen}");
         assert!(screen.contains("[1] ag:"), "{screen}");
+    }
+
+    #[test]
+    fn the_log_viewer_draws_the_header_the_stream_marks_and_where_it_is() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        with_watched_job(
+            &mut app,
+            &["/docs/a.pdf"],
+            &["session id: 01a04eef-d4a6-7232", "reading the files"],
+            true,
+        );
+        app.handle_key(KeyInput::Char('L'));
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 90, 30, &theme);
+
+        // The pane names itself, and the two header rows say what the
+        // run is and how to get back into it outside filecraft.
+        assert!(screen.contains("job log: agy"), "{screen}");
+        assert!(screen.contains("agy · finished · 2 lines"), "{screen}");
+        assert!(
+            screen.contains(
+                "session 01a04eef-d4a6-7232 · resume: agy --conversation 01a04eef-d4a6-7232"
+            ),
+            "{screen}"
+        );
+        // Numbered lines, and the position in words like every other pane.
+        assert!(screen.contains("    2 | reading the files"), "{screen}");
+        // stderr's mark, on a line the pane wrapped, still hangs from its
+        // own gutter rather than restarting at the frame's edge.
+        assert!(screen.contains("    1 | session id: 01a04eef"), "{screen}");
+        assert!(screen.contains("line 1 of 2"), "{screen}");
+        // The prompt row says what is being watched, not what to type.
+        assert!(screen.contains("finished · session 01a04eef"), "{screen}");
+    }
+
+    #[test]
+    fn the_log_viewer_keeps_every_signal_in_text_without_color_or_unicode() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        with_watched_job(
+            &mut app,
+            &["/docs/a.pdf"],
+            &["out line", "session_id: abc-123456"],
+            true,
+        );
+        app.handle_key(KeyInput::Char('L'));
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        // stdout and stderr are told apart by a character, the run's
+        // state is a word, and the resume command is spelled out.
+        assert!(screen.contains("    1 | out line"), "{screen}");
+        assert!(screen.contains("agy - finished - 2 lines"), "{screen}");
+        assert!(
+            screen.contains("resume: agy --conversation abc-123456"),
+            "{screen}"
+        );
+        for c in screen.chars().filter(|c| *c != '\n') {
+            assert!((' '..='~').contains(&c), "non-ascii {c:?}:\n{screen}");
+        }
+    }
+
+    /// The coupling `joblog::FRAME_ROWS` exists for: the pane scrolls by
+    /// exactly the rows the frame draws, and wraps at exactly the columns
+    /// it draws in. If they disagree the log scrolls past rows nobody saw.
+    #[test]
+    fn the_log_viewer_is_given_exactly_the_geometry_it_scrolls_by() {
+        let tmp = summary_fixture();
+        let mut app = app_at(tmp.path());
+        let mut lines: Vec<String> = (1..=200).map(|i| format!("entry {i}")).collect();
+        lines.push("x".repeat(300));
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        with_watched_job(&mut app, &["/docs/a.pdf"], &lines, true);
+        app.handle_key(KeyInput::Char('L'));
+
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let (cols, rows) = (app.log_cols(), app.log_rows());
+
+        // Everything the frame drew between its own two borders: the
+        // pinned header, then the log itself and nothing else.
+        let top = screen
+            .lines()
+            .position(|line| line.contains("job log: agy"))
+            .expect(&screen);
+        let Mode::JobLog(pane) = &app.mode else {
+            panic!("expected the log viewer");
+        };
+        let position = pane.pager.position(cols, rows, &app.glyphs);
+        let bottom = screen
+            .lines()
+            .position(|line| line.contains(&position))
+            .expect(&screen);
+        let all: Vec<&str> = screen.lines().collect();
+        let inside = &all[top + 1..bottom];
+        assert_eq!(inside.len(), rows + HEADER_ROWS, "{screen}");
+
+        // The last line is one 300-column word: it wraps at exactly the
+        // width the pane laid it out for - the columns left over once its
+        // own gutter has been paid for - and its rows are all on screen.
+        let gutter = crate::stream::StreamLine {
+            origin: crate::stream::Origin::Out,
+            number: 201,
+            text: String::new(),
+        }
+        .gutter()
+        .chars()
+        .count()
+            + 1;
+        let widest = inside
+            .iter()
+            .map(|line| line.matches('x').count())
+            .max()
+            .unwrap();
+        assert_eq!(widest, cols - gutter, "{screen}");
     }
 
     #[test]

@@ -91,6 +91,12 @@ pub enum Marker {
     },
     /// A line inside a fenced code block.
     Code,
+    /// A fixed gutter the line hangs from - a log line's number and the
+    /// stream it came from. Drawn verbatim, so nothing about it depends
+    /// on the character set; what it buys is the hanging indent, which
+    /// is what keeps a wrapped log line from reading as an unnumbered
+    /// one.
+    Gutter(String),
 }
 
 impl Marker {
@@ -103,6 +109,7 @@ impl Marker {
             Marker::Ordered { depth, label } => format!("{}{label} ", "  ".repeat(*depth)),
             Marker::Quote { depth } => format!("{} ", glyphs.quote_bar).repeat(*depth),
             Marker::Code => "  ".to_string(),
+            Marker::Gutter(label) => format!("{label} "),
         }
     }
 }
@@ -137,6 +144,18 @@ impl DocLine {
         DocLine::new(
             Kind::Body,
             Marker::None,
+            vec![Span::new(clean(&text.into()), Ink::Plain)],
+        )
+    }
+
+    /// A body line hanging from a fixed `label` - what the log viewer
+    /// draws each captured line as. The label is cleaned like the text,
+    /// so a gutter is held to the same invariant every other run of
+    /// characters on the screen is.
+    pub fn gutter(label: impl Into<String>, text: impl Into<String>) -> Self {
+        DocLine::new(
+            Kind::Body,
+            Marker::Gutter(clean(&label.into())),
             vec![Span::new(clean(&text.into()), Ink::Plain)],
         )
     }

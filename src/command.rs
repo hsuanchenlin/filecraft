@@ -28,6 +28,10 @@ pub enum Command {
     /// summary. Takes no argument: files are picked in the selector, and
     /// the provider is chosen in the dialog that follows.
     Summarize,
+    /// `log` / `job` - open the live log of the AI summary run: what the
+    /// provider has printed, and the session it announced. Takes no
+    /// argument - there is one run, and it is the one being watched.
+    Log,
     /// `help` - show the help screen.
     Help,
     /// `quit` - leave Filecraft.
@@ -209,6 +213,13 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             Command::Summarize,
             typed(&head_lower, &["summarize", "summary"]),
             "  (opens the file selector; Space picks files, Enter confirms)",
+        ),
+        // Both names mean the one summary run there can be.
+        "log" | "job" => no_args(
+            args,
+            Command::Log,
+            typed(&head_lower, &["log", "job"]),
+            "  (opens the AI run's own output; there is no path form)",
         ),
         "help" | "?" => no_args(args, Command::Help, typed(&head_lower, &["help", "?"]), ""),
         "quit" | "q" | "exit" => no_args(
@@ -400,6 +411,22 @@ mod tests {
         assert_eq!(parse("help").unwrap(), Command::Help);
         assert!(matches!(parse("edit foo"), Err(ParseError::Usage { .. })));
         assert!(matches!(parse("open foo"), Err(ParseError::Usage { .. })));
+    }
+
+    #[test]
+    fn parse_log_aliases_take_no_argument() {
+        assert_eq!(parse("log").unwrap(), Command::Log);
+        assert_eq!(parse("job").unwrap(), Command::Log);
+        assert_eq!(parse("LOG").unwrap(), Command::Log);
+        // There is one run, so there is nothing to name.
+        assert!(matches!(
+            parse("log run.txt"),
+            Err(ParseError::Usage { command: "log", .. })
+        ));
+        assert!(matches!(
+            parse("job 2"),
+            Err(ParseError::Usage { command: "job", .. })
+        ));
     }
 
     #[test]
