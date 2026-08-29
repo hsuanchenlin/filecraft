@@ -268,6 +268,9 @@ The summary is written **beside the first file you marked**, as
 overwritten: the run falls back to `<first-stem>-summary-<stamp>.md`.
 The provider is asked to write that one path and nothing else; if it
 prints the summary instead of writing it, its stdout is saved there.
+Filecraft reserves the path before starting the provider. If the run fails
+or is terminated, that reserved file instead contains a short Markdown
+failure note with the same reason shown in the message log.
 
 ### Quitting with a summary running
 

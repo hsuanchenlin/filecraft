@@ -90,6 +90,9 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   input; `:summarize` deliberately has no path form for the same reason.
   At most one job runs: `App::job` is the single thing the status row,
   the quit confirmation, and the completion message all refer to.
+  `ProcessRunner` atomically reserves the output before spawning. A failed
+  or terminated run fills that reservation with a Markdown failure note;
+  it is never removed or left empty.
 - A summary run is polled, never waited on. `main.rs` ticks with
   `event::poll(JOB_TICK)` while `App::job_active()`, so the TUI keeps
   answering keys and a finished run is reported without a keypress.

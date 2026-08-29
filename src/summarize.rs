@@ -12,7 +12,7 @@
 //! nothing here runs unless the user selects files, picks a provider, and
 //! the summarizer is handed an explicit, finite list of paths.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -332,6 +332,10 @@ pub fn finish(exit_ok: bool, output_written: bool, stdout: &str, stderr: &str) -
     Finish::Failed(detail)
 }
 
+pub fn failure_note(reason: &str) -> String {
+    format!("# Summary failed\n\n{reason}\n")
+}
+
 /// The last non-blank line of a stream, trimmed and bounded - enough to
 /// name a failure on one message row without pasting a whole backtrace.
 fn last_meaningful_line(text: &str) -> Option<String> {
@@ -377,14 +381,28 @@ pub fn process_runner() -> Box<dyn Runner> {
 impl Runner for ProcessRunner {
     fn start(&self, spec: &JobSpec) -> Result<Box<dyn Job>, String> {
         let argv = spec.argv();
-        let mut child = Command::new(&argv[0])
+        let mut reservation = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&spec.output)
+            .map_err(|e| format!("could not reserve {}: {e}", spec.output.display()))?;
+        let child = Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run '{}': {e}", argv[0]))?;
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                let reason = format!("could not run '{}': {e}", argv[0]);
+                write_reserved(&mut reservation, failure_note(&reason).as_bytes()).map_err(
+                    |write_error| format!("{reason}; could not record failure: {write_error}"),
+                )?;
+                return Err(reason);
+            }
+        };
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -393,7 +411,7 @@ impl Runner for ProcessRunner {
 
         let waiter = Arc::clone(&shared);
         let output = spec.output.clone();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let out_reader = std::thread::spawn(move || drain(stdout));
             let err_reader = std::thread::spawn(move || drain(stderr));
 
@@ -421,19 +439,22 @@ impl Runner for ProcessRunner {
             let outcome = match finish(exit_ok, written, &stdout_text, &stderr_text) {
                 Finish::UseWrittenFile => Outcome::Written(output),
                 Finish::WriteStdout => {
-                    let write = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&output)
-                        .and_then(|mut file| file.write_all(stdout_text.as_bytes()));
-                    match write {
+                    match write_reserved(&mut reservation, stdout_text.as_bytes()) {
                         Ok(()) => Outcome::Written(output),
                         Err(e) => {
                             Outcome::Failed(format!("could not write {}: {e}", output.display()))
                         }
                     }
                 }
-                Finish::Failed(reason) => Outcome::Failed(reason),
+                Finish::Failed(reason) => {
+                    match write_reserved(&mut reservation, failure_note(&reason).as_bytes()) {
+                        Ok(()) => Outcome::Failed(reason),
+                        Err(e) => Outcome::Failed(format!(
+                            "{reason}; could not record failure in {}: {e}",
+                            output.display()
+                        )),
+                    }
+                }
             };
             let _ = tx.send(outcome);
         });
@@ -442,12 +463,20 @@ impl Runner for ProcessRunner {
             child: shared,
             rx,
             done: None,
+            worker: Some(worker),
         }))
     }
 
     fn description(&self) -> String {
         "a child process".to_string()
     }
+}
+
+fn write_reserved(file: &mut std::fs::File, content: &[u8]) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.rewind()?;
+    file.write_all(content)?;
+    file.flush()
 }
 
 /// Read a captured pipe to the end, losing nothing to encoding.
@@ -472,6 +501,7 @@ struct ProcessJob {
     child: Arc<Mutex<Option<Child>>>,
     rx: Receiver<Outcome>,
     done: Option<Outcome>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Job for ProcessJob {
@@ -489,10 +519,15 @@ impl Job for ProcessJob {
     }
 
     fn terminate(&mut self) {
-        let mut guard = self.child.lock().expect("job mutex");
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        {
+            let mut guard = self.child.lock().expect("job mutex");
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -678,6 +713,14 @@ mod tests {
         assert_eq!(
             finish(false, false, "agy: request failed\n", ""),
             Finish::Failed("agy: request failed".to_string())
+        );
+    }
+
+    #[test]
+    fn a_failure_note_carries_the_reported_reason() {
+        assert_eq!(
+            failure_note("agy: request failed"),
+            "# Summary failed\n\nagy: request failed\n"
         );
     }
 

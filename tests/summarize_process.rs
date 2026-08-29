@@ -128,16 +128,15 @@ fn a_provider_that_only_prints_has_its_stdout_saved_as_the_summary() {
 }
 
 #[test]
-fn stdout_fallback_never_overwrites_a_file_created_during_the_run() {
+fn an_existing_output_prevents_the_provider_from_starting() {
     stub_path();
     let tmp = tempfile::tempdir().unwrap();
     let spec = spec_in(&tmp, Provider::Cc);
-    let mut job = ProcessRunner.start(&spec).unwrap();
-    std::fs::File::create(&spec.output).unwrap();
+    std::fs::write(&spec.output, "keep me").unwrap();
 
-    let outcome = wait_for(&mut job);
-    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
-    assert_eq!(std::fs::metadata(&spec.output).unwrap().len(), 0);
+    let error = ProcessRunner.start(&spec).err().unwrap();
+    assert!(error.starts_with("could not reserve"), "{error}");
+    assert_eq!(std::fs::read_to_string(&spec.output).unwrap(), "keep me");
 }
 
 #[test]
@@ -151,7 +150,9 @@ fn a_failing_provider_does_not_save_its_stdout_as_a_summary() {
         wait_for(&mut job),
         Outcome::Failed("codex: not logged in".to_string())
     );
-    assert!(!spec.output.exists(), "a failed run must leave no summary");
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(artifact.contains("Summary failed"), "{artifact}");
+    assert!(artifact.contains("codex: not logged in"), "{artifact}");
 }
 
 #[test]
@@ -165,7 +166,11 @@ fn a_silent_provider_is_a_failure_not_an_empty_summary() {
         wait_for(&mut job),
         Outcome::Failed("the provider wrote nothing".to_string())
     );
-    assert!(!spec.output.exists());
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(
+        artifact.contains("the provider wrote nothing"),
+        "{artifact}"
+    );
 }
 
 #[test]
@@ -190,7 +195,11 @@ fn a_long_run_stays_in_flight_and_terminate_ends_it() {
         matches!(outcome, Outcome::Failed(_)),
         "a terminated run has no summary, got {outcome:?}"
     );
-    assert!(!spec.output.exists());
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(
+        artifact.contains("the provider exited without writing a summary"),
+        "{artifact}"
+    );
 }
 
 #[test]
@@ -207,4 +216,6 @@ fn a_run_that_cannot_be_spawned_is_a_plain_error_and_never_a_job() {
         .err()
         .expect("a spawn that cannot happen is not a running job");
     assert!(error.starts_with("could not run 'agy'"), "{error}");
+    let artifact = std::fs::read_to_string(&spec.output).unwrap();
+    assert!(artifact.contains(&error), "{artifact}");
 }
