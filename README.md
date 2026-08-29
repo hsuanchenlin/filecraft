@@ -298,9 +298,11 @@ overwritten: the run falls back to `<first-stem>-summary-<stamp>.md`.
 The provider is asked to write that one path and nothing else; if it
 exits cleanly having printed the summary instead of writing it, that
 stdout is saved there.
-Filecraft reserves the path before starting the provider. If the run fails
-or is terminated, that reserved file instead contains a short Markdown
-failure note with the same reason shown in the message log.
+Filecraft reserves the path before starting the provider. If the run ends
+with that file still empty - it failed, or you terminated it - the
+reservation is filled with a short Markdown failure note carrying the same
+reason shown in the message log. A summary the provider had already
+written is never replaced by a note.
 
 ### Quitting with a summary running
 
