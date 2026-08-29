@@ -19,6 +19,12 @@
 //!   the position it reports.
 //! - [`picker`] is the folder-only destination picker for `:move` with
 //!   no path: cursor, descend, ascend, and the dest path it reports.
+//! - [`multiselect`] is the cross-directory multi-file selector behind
+//!   `:summarize`: folders and summarizable documents, and the ordered
+//!   set of files Space builds up.
+//! - [`summarize`] decides everything about an AI summary run - which
+//!   files qualify, which provider, where the summary lands, what the
+//!   prompt says - and owns the seam the background job runs behind.
 //! - [`agent`] is the disabled-by-default future AI-agent seam.
 //! - [`app`] is the state machine: keys in, [`app::Effect`]s out.
 //! - [`cli`] parses argv for the binary.
@@ -29,7 +35,10 @@
 //!
 //! Everything above `ui` is free of terminal I/O so behavior is testable
 //! without a TTY. [`update`] talks to `git`/`cargo`/`curl` through a
-//! [`update::Host`] seam so those paths are tested without the network.
+//! [`update::Host`] seam so those paths are tested without the network,
+//! and [`summarize`] spawns its AI provider through a
+//! [`summarize::Runner`] seam so the whole summary flow is tested
+//! without one installed.
 
 pub mod agent;
 pub mod app;
@@ -39,11 +48,13 @@ pub mod command;
 pub mod editor;
 pub mod fsops;
 pub mod markdown;
+pub mod multiselect;
 pub mod nav;
 pub mod pager;
 pub mod pathcheck;
 pub mod picker;
 pub mod preview;
+pub mod summarize;
 pub mod trash;
 pub mod ui;
 pub mod update;

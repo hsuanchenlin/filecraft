@@ -24,6 +24,10 @@ pub enum Command {
     Edit,
     /// `preview` - read-only preview of the selected entry.
     Preview,
+    /// `summarize` / `summary` - open the multi-file selector for an AI
+    /// summary. Takes no argument: files are picked in the selector, and
+    /// the provider is chosen in the dialog that follows.
+    Summarize,
     /// `help` - show the help screen.
     Help,
     /// `quit` - leave Filecraft.
@@ -198,6 +202,14 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "open" => no_args(args, Command::Open, "open", ""),
         "edit" => no_args(args, Command::Edit, "edit", ""),
         "preview" => no_args(args, Command::Preview, "preview", ""),
+        // No path form on purpose: the files are picked in the selector,
+        // so nothing the user types ever reaches the provider's argv.
+        "summarize" | "summary" => no_args(
+            args,
+            Command::Summarize,
+            typed(&head_lower, &["summarize", "summary"]),
+            "  (opens the file selector; Space picks files, Enter confirms)",
+        ),
         "help" | "?" => no_args(args, Command::Help, typed(&head_lower, &["help", "?"]), ""),
         "quit" | "q" | "exit" => no_args(
             args,
@@ -388,6 +400,27 @@ mod tests {
         assert_eq!(parse("help").unwrap(), Command::Help);
         assert!(matches!(parse("edit foo"), Err(ParseError::Usage { .. })));
         assert!(matches!(parse("open foo"), Err(ParseError::Usage { .. })));
+    }
+
+    #[test]
+    fn parse_summarize_aliases_take_no_argument() {
+        assert_eq!(parse("summarize").unwrap(), Command::Summarize);
+        assert_eq!(parse("summary").unwrap(), Command::Summarize);
+        assert_eq!(parse("SUMMARIZE").unwrap(), Command::Summarize);
+        assert!(matches!(
+            parse("summarize a.pdf"),
+            Err(ParseError::Usage {
+                command: "summarize",
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("summary a.pdf"),
+            Err(ParseError::Usage {
+                command: "summary",
+                ..
+            })
+        ));
     }
 
     #[test]

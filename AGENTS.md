@@ -73,7 +73,36 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   help, the README keyboard table, and `help_lines()` ship in the same
   change as any key change - the reader's, folder picker's, and
   confirmation prompt's keys included.
-- `agent` is a disabled seam (`src/agent.rs`, contract in `docs/agent-seam.md`). Do not invoke an LLM, scan a tree for an agent, or enable autonomous changes.
+- `agent` is a disabled seam (`src/agent.rs`, contract in
+  `docs/agent-seam.md`). It stays disabled: do not enable autonomous
+  changes or let anything scan a tree "for context".
+- The AI summarizer is the separate, shipped, fully explicit flow:
+  `src/summarize.rs` decides everything (eligible extensions, the fixed
+  provider table and its argv, the output path, the prompt, and what a
+  finished child meant), `src/multiselect.rs` owns the cross-directory
+  file selection, `ui.rs` only draws them. A provider is spawned through
+  the `summarize::Runner` seam, so `app.rs` tests script a fake and
+  `tests/summarize_process.rs` exercises the real `ProcessRunner`
+  against stub programs on a `$PATH` that test binary controls - no AI
+  CLI and no network are ever needed. `multiselect::FRAME_ROWS` must
+  match the selector popup's borders plus header in `ui::draw_selector`.
+  A provider's argv is a fixed table and never assembled from user
+  input; `:summarize` deliberately has no path form for the same reason.
+  At most one job runs: `App::job` is the single thing the status row,
+  the quit confirmation, and the completion message all refer to.
+  `ProcessRunner` atomically reserves the output before spawning. A failed
+  or terminated run fills that reservation with a Markdown failure note;
+  it is never removed or left empty.
+- A summary run is polled, never waited on. `main.rs` ticks with
+  `event::poll(JOB_TICK)` while `App::job_active()`, so the TUI keeps
+  answering keys and a finished run is reported without a keypress.
+  `q` / Ctrl-C with a job alive raises `Mode::ConfirmQuit`, and only
+  `y` terminates the child - Enter is not an answer there, same rule as
+  a trash.
+- `no_browse_key_ever_mutates_the_filesystem` and its reader twin also
+  assert that no key starts an AI run. `S` may open the selector and
+  nothing more; a provider only ever runs after a selection *and* a
+  chosen provider.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping

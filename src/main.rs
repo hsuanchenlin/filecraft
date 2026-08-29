@@ -6,6 +6,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -109,6 +110,11 @@ fn run_tui(directory: PathBuf) -> io::Result<()> {
     result
 }
 
+/// How often the loop wakes to check on a running summary. Short enough
+/// that a finished run is reported at once, long enough that an idle
+/// summary costs nothing worth measuring.
+const JOB_TICK: Duration = Duration::from_millis(200);
+
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -122,12 +128,22 @@ fn event_loop(
         );
         terminal.draw(|frame| ui::draw(frame, app, theme))?;
 
+        // With a summary running the loop ticks instead of blocking, so
+        // its status stays live and its result lands on the screen the
+        // moment it arrives - without a keypress to prompt it.
+        if app.job_active() && !event::poll(JOB_TICK)? {
+            app.poll_job();
+            continue;
+        }
+
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let Some(input) = map_key(key.code, key.modifiers) else {
                     continue;
                 };
-                match app.handle_key(input) {
+                let effect = app.handle_key(input);
+                app.poll_job();
+                match effect {
                     Effect::None => {}
                     Effect::Quit => return Ok(()),
                     Effect::RunInteractive { argv } => {
