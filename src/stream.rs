@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::i18n::Lang;
 use crate::session;
 
 /// Lines kept before the oldest are forgotten. A long run can print more
@@ -314,12 +315,12 @@ pub enum Activity {
 impl Activity {
     /// The word the header shows. Never a spinner: the header is read the
     /// same way the status row is.
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Activity::Waiting => "waiting for output",
-            Activity::Thinking => "thinking",
-            Activity::Streaming => "streaming",
-            Activity::Ended => "finished",
+            Activity::Waiting => lang.activity_waiting(),
+            Activity::Thinking => lang.activity_thinking(),
+            Activity::Streaming => lang.activity_streaming(),
+            Activity::Ended => lang.activity_ended(),
         }
     }
 }
@@ -677,7 +678,7 @@ mod tests {
             Activity::Streaming,
             Activity::Ended,
         ] {
-            assert!(!state.label().is_empty());
+            assert!(!state.label(Lang::En).is_empty());
         }
     }
 

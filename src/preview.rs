@@ -6,7 +6,9 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::bearings::pad_to_width;
 use crate::fsops::{self, FsError};
+use crate::i18n::{Lang, PreviewField, PreviewKind};
 
 /// How many bytes are sniffed to decide text vs. binary.
 pub const SNIFF_BYTES: usize = 8192;
@@ -91,57 +93,70 @@ pub fn sniff(path: &Path) -> Result<Vec<u8>, FsError> {
 
 /// Build the built-in preview for any path: metadata header for
 /// everything, followed by text content for readable text files.
-pub fn build_preview(path: &Path) -> Result<PreviewData, FsError> {
+///
+/// The label column is measured, not counted: a Han label owns two cells
+/// per character, so it is padded to [`Lang::preview_label_width`]
+/// display columns and the values line up in either language.
+pub fn build_preview(path: &Path, lang: Lang) -> Result<PreviewData, FsError> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| fsops::io_error(path, &e))?;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut lines = vec![format!("path      {}", path.display())];
+    let label =
+        |field: PreviewField| pad_to_width(lang.preview_label(field), lang.preview_label_width());
+    let row = |field: PreviewField, value: &str| format!("{}{value}", label(field));
+
+    let mut lines = vec![row(PreviewField::Path, &path.display().to_string())];
 
     let (kind, target_meta) = if meta.is_symlink() {
         let target = std::fs::read_link(path)
             .map(|t| t.display().to_string())
             .unwrap_or_else(|_| "?".to_string());
-        lines.push(format!("symlink   -> {target}"));
+        lines.push(row(PreviewField::Symlink, &format!("-> {target}")));
         match std::fs::metadata(path) {
             Ok(t) => (
                 if t.is_dir() {
-                    "symlink to directory"
+                    PreviewKind::SymlinkDir
                 } else if t.is_file() {
-                    "symlink to file"
+                    PreviewKind::SymlinkFile
                 } else {
-                    "symlink to special file"
+                    PreviewKind::SymlinkSpecial
                 },
                 Some(t),
             ),
-            Err(_) => ("broken symlink", None),
+            Err(_) => (PreviewKind::BrokenSymlink, None),
         }
     } else if meta.is_dir() {
-        ("directory", Some(meta.clone()))
+        (PreviewKind::Directory, Some(meta.clone()))
     } else if meta.is_file() {
-        ("regular file", Some(meta.clone()))
+        (PreviewKind::RegularFile, Some(meta.clone()))
     } else {
-        ("special file", Some(meta.clone()))
+        (PreviewKind::SpecialFile, Some(meta.clone()))
     };
 
-    lines.push(format!("type      {kind}"));
+    lines.push(row(PreviewField::Type, lang.preview_kind(kind)));
     if let Some(ref m) = target_meta {
         if m.is_file() {
-            lines.push(format!(
-                "size      {} ({} bytes)",
-                format_size(m.len()),
-                m.len()
+            lines.push(row(
+                PreviewField::Size,
+                &lang.preview_size(&format_size(m.len()), m.len()),
             ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            lines.push(format!("mode      {}", format_mode(m.permissions().mode())));
+            lines.push(row(
+                PreviewField::Mode,
+                &format_mode(m.permissions().mode()),
+            ));
         }
         if let Ok(modified) = m.modified() {
-            lines.push(format!("modified  {}", format_timestamp(modified)));
+            lines.push(row(
+                PreviewField::Modified,
+                &format_timestamp_in(modified, lang),
+            ));
         }
     }
 
@@ -149,19 +164,19 @@ pub fn build_preview(path: &Path) -> Result<PreviewData, FsError> {
         Some(ref m) if m.is_dir() => {
             if let Ok(children) = std::fs::read_dir(path) {
                 let count = children.count();
-                lines.push(format!("entries   {count}"));
+                lines.push(row(PreviewField::Entries, &count.to_string()));
             }
         }
         Some(ref m) if m.is_file() => {
             lines.push(String::new());
             let sample = sniff(path)?;
             if sample.is_empty() {
-                lines.push("(empty file)".to_string());
+                lines.push(lang.empty_file().to_string());
             } else if is_probably_text(&sample) {
-                lines.push("--- content ---".to_string());
+                lines.push(lang.preview_content_rule().to_string());
                 append_text_preview(path, m.len(), &mut lines)?;
             } else {
-                lines.push("(binary file - content not shown)".to_string());
+                lines.push(lang.binary_not_shown().to_string());
             }
         }
         _ => {}
@@ -249,12 +264,22 @@ pub fn format_mode(mode: u32) -> String {
 }
 
 /// Format a timestamp as `YYYY-MM-DD HH:MM UTC` without any date crate.
-pub fn format_timestamp(time: SystemTime) -> String {
+///
+/// The stamp itself is digits and `UTC` in every language; only the one
+/// case that has no stamp to show - a time before the epoch the clock is
+/// counted from - is a phrase, and it is said in `lang`.
+pub fn format_timestamp_in(time: SystemTime, lang: Lang) -> String {
     let Ok(since_epoch) = time.duration_since(UNIX_EPOCH) else {
-        return "before 1970".to_string();
+        return lang.before_the_epoch().to_string();
     };
     let (year, month, day, hour, minute) = civil_from_duration(since_epoch);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+/// [`format_timestamp_in`] in English, for callers with no language of
+/// their own to pass.
+pub fn format_timestamp(time: SystemTime) -> String {
+    format_timestamp_in(time, Lang::En)
 }
 
 /// Days-since-epoch to civil date (Howard Hinnant's algorithm), plus time
@@ -282,6 +307,7 @@ fn civil_from_duration(d: Duration) -> (i64, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use std::fs;
 
     #[test]
@@ -298,7 +324,7 @@ mod tests {
         let file = tmp.path().join("näme with space.txt");
         fs::write(&file, "line one\nline two\n").unwrap();
 
-        let preview = build_preview(&file).unwrap();
+        let preview = build_preview(&file, Lang::En).unwrap();
         assert_eq!(preview.title, "näme with space.txt");
         let text = preview.lines.join("\n");
         assert!(text.contains("regular file"));
@@ -313,7 +339,7 @@ mod tests {
         let file = tmp.path().join("blob.bin");
         fs::write(&file, [0u8, 159, 146, 150]).unwrap();
 
-        let preview = build_preview(&file).unwrap();
+        let preview = build_preview(&file, Lang::En).unwrap();
         let text = preview.lines.join("\n");
         assert!(text.contains("binary file"));
         assert!(!text.contains("\u{0}"));
@@ -324,7 +350,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("empty");
         fs::write(&file, "").unwrap();
-        let preview = build_preview(&file).unwrap();
+        let preview = build_preview(&file, Lang::En).unwrap();
         assert!(preview.lines.join("\n").contains("(empty file)"));
     }
 
@@ -333,7 +359,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a"), "").unwrap();
         fs::write(tmp.path().join("b"), "").unwrap();
-        let preview = build_preview(tmp.path()).unwrap();
+        let preview = build_preview(tmp.path(), Lang::En).unwrap();
         let text = preview.lines.join("\n");
         assert!(text.contains("directory"));
         assert!(text.contains("entries   2"));
@@ -342,7 +368,7 @@ mod tests {
     #[test]
     fn preview_missing_path_is_error() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(build_preview(&tmp.path().join("ghost")).is_err());
+        assert!(build_preview(&tmp.path().join("ghost"), Lang::En).is_err());
     }
 
     #[cfg(unix)]
@@ -351,7 +377,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let link = tmp.path().join("dangling");
         std::os::unix::fs::symlink("/nonexistent/target", &link).unwrap();
-        let preview = build_preview(&link).unwrap();
+        let preview = build_preview(&link, Lang::En).unwrap();
         let text = preview.lines.join("\n");
         assert!(text.contains("broken symlink"));
         assert!(text.contains("/nonexistent/target"));
@@ -363,7 +389,7 @@ mod tests {
         let file = tmp.path().join("long.txt");
         let body: String = (0..1000).map(|i| format!("line {i}\n")).collect();
         fs::write(&file, body).unwrap();
-        let preview = build_preview(&file).unwrap();
+        let preview = build_preview(&file, Lang::En).unwrap();
         let text = preview.lines.join("\n");
         assert!(text.contains("truncated"));
         assert!(text.contains("line 499"));
@@ -375,7 +401,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("evil.txt");
         fs::write(&file, "safe\x1b[31mred\x07bell\tkeep-tab\n").unwrap();
-        let preview = build_preview(&file).unwrap();
+        let preview = build_preview(&file, Lang::En).unwrap();
         let text = preview.lines.join("\n");
         assert!(!text.contains('\x1b'));
         assert!(!text.contains('\x07'));

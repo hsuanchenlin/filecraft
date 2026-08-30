@@ -17,6 +17,7 @@
 use std::time::Instant;
 
 use crate::bearings::Glyphs;
+use crate::i18n::Lang;
 use crate::markdown::DocLine;
 use crate::pager::{self, Pager};
 use crate::stream::{self, Activity, Handle};
@@ -54,9 +55,9 @@ pub struct LogPane {
 impl LogPane {
     /// A pane over `provider`'s run. The document is empty until
     /// [`LogPane::sync`] fills it, which the caller does immediately.
-    pub fn new(provider: Provider) -> Self {
+    pub fn new(provider: Provider, lang: Lang) -> Self {
         LogPane {
-            pager: Pager::plain(format!("job log: {}", provider.program()), Vec::new()),
+            pager: Pager::plain(lang.job_log_title(&provider.program()), Vec::new()),
             follow: true,
             seen: 0,
             provider,
@@ -89,6 +90,7 @@ impl LogPane {
         width: usize,
         view_rows: usize,
         glyphs: &Glyphs,
+        lang: Lang,
     ) {
         let state = handle.state(now);
         self.activity = state.activity;
@@ -97,7 +99,7 @@ impl LogPane {
 
         if let Some(snapshot) = handle.snapshot_since(self.seen) {
             self.seen = snapshot.version;
-            self.pager.replace_doc(document(&snapshot));
+            self.pager.replace_doc(document(&snapshot, lang));
         }
         if self.follow {
             self.pager.scroll_to_end(width, view_rows, glyphs);
@@ -122,21 +124,17 @@ impl LogPane {
     /// and how much it has printed. The second says which session it is
     /// and how to reopen it, or says plainly that the provider never
     /// announced one - never a command that would not work.
-    pub fn header(&self, glyphs: &Glyphs) -> [String; HEADER_ROWS] {
+    pub fn header(&self, glyphs: &Glyphs, lang: Lang) -> [String; HEADER_ROWS] {
         let dot = glyphs.dot;
-        let unit = if self.total == 1 { "line" } else { "lines" };
-        let top = format!(
-            "{} {dot} {} {dot} {} {unit}",
-            self.provider.program(),
-            self.activity.label(),
-            self.total
+        let top = lang.log_header_activity(
+            &self.provider.program(),
+            self.activity.label(lang),
+            self.total,
+            dot,
         );
         let bottom = match self.session.as_deref() {
-            Some(id) => format!(
-                "session {id} {dot} resume: {}",
-                self.provider.resume_command(id)
-            ),
-            None => format!("session: not reported by {}", self.provider.program()),
+            Some(id) => lang.log_header_session(id, &self.provider.resume_command(id), dot),
+            None => lang.log_header_no_session(&self.provider.program()),
         };
         [top, bottom]
     }
@@ -148,22 +146,15 @@ impl LogPane {
 /// The note is a line of its own rather than a change to the numbering,
 /// so line 4001 is still called line 4001 and the gap is stated instead
 /// of implied.
-fn document(snapshot: &stream::Snapshot) -> Vec<DocLine> {
+fn document(snapshot: &stream::Snapshot, lang: Lang) -> Vec<DocLine> {
     let mut doc: Vec<DocLine> = Vec::with_capacity(snapshot.lines.len() + 1);
     if snapshot.dropped > 0 {
-        doc.push(DocLine::meta(format!(
-            "({} earlier {} dropped - the log keeps the last {})",
-            snapshot.dropped,
-            if snapshot.dropped == 1 {
-                "line"
-            } else {
-                "lines"
-            },
-            stream::MAX_LINES
-        )));
+        doc.push(DocLine::meta(
+            lang.lines_dropped(snapshot.dropped, stream::MAX_LINES),
+        ));
     }
     if snapshot.lines.is_empty() {
-        doc.push(DocLine::meta("(no output yet)"));
+        doc.push(DocLine::meta(lang.no_output_yet()));
         return doc;
     }
     doc.extend(
@@ -178,6 +169,7 @@ fn document(snapshot: &stream::Snapshot) -> Vec<DocLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use crate::stream::Origin;
 
     const W: usize = 60;
@@ -193,8 +185,8 @@ mod tests {
     }
 
     fn pane_over(handle: &Handle) -> LogPane {
-        let mut pane = LogPane::new(Provider::Co);
-        pane.sync(handle, Instant::now(), W, H, &Glyphs::UNICODE);
+        let mut pane = LogPane::new(Provider::Co, Lang::En);
+        pane.sync(handle, Instant::now(), W, H, &Glyphs::UNICODE, Lang::En);
         pane
     }
 
@@ -213,7 +205,7 @@ mod tests {
         for i in 1..=40 {
             handle.append(Origin::Out, &format!("line {i}\n"));
         }
-        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE);
+        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE, Lang::En);
         assert!(pane.follow);
         assert_eq!(pane.pager.scroll, Pager::max_scroll(40, H));
 
@@ -226,7 +218,7 @@ mod tests {
         for i in 41..=60 {
             handle.append(Origin::Out, &format!("line {i}\n"));
         }
-        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE);
+        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE, Lang::En);
         assert_eq!(pane.pager.scroll, held);
 
         // Going back to the bottom re-arms it.
@@ -271,7 +263,7 @@ mod tests {
         handle.append(Origin::Err, "session id: 01a04eef-d4a6-7232\n");
         let pane = pane_over(&handle);
         assert_eq!(pane.session(), Some("01a04eef-d4a6-7232"));
-        let [top, bottom] = pane.header(&Glyphs::UNICODE);
+        let [top, bottom] = pane.header(&Glyphs::UNICODE, Lang::En);
         assert_eq!(top, "codex · streaming · 1 line");
         assert_eq!(
             bottom,
@@ -285,7 +277,7 @@ mod tests {
         handle.append(Origin::Out, "just some output\n");
         handle.end();
         let pane = pane_over(&handle);
-        let [top, bottom] = pane.header(&Glyphs::UNICODE);
+        let [top, bottom] = pane.header(&Glyphs::UNICODE, Lang::En);
         assert_eq!(top, "codex · finished · 1 line");
         assert_eq!(bottom, "session: not reported by codex");
     }
@@ -297,8 +289,8 @@ mod tests {
         let handle = Handle::new();
         handle.append(Origin::Out, "a\n");
         let pane = pane_over(&handle);
-        assert!(pane.header(&Glyphs::ASCII)[0].contains(Glyphs::ASCII.dot));
-        assert!(!pane.header(&Glyphs::ASCII)[0].contains(Glyphs::UNICODE.dot));
+        assert!(pane.header(&Glyphs::ASCII, Lang::En)[0].contains(Glyphs::ASCII.dot));
+        assert!(!pane.header(&Glyphs::ASCII, Lang::En)[0].contains(Glyphs::UNICODE.dot));
     }
 
     #[test]
@@ -328,14 +320,14 @@ mod tests {
         assert_eq!(pane.activity(), Activity::Streaming);
         let before = pane.pager.rows(W, &Glyphs::UNICODE);
 
-        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE);
+        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE, Lang::En);
         assert!(std::rc::Rc::ptr_eq(
             &before,
             &pane.pager.rows(W, &Glyphs::UNICODE)
         ));
 
         handle.end();
-        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE);
+        pane.sync(&handle, Instant::now(), W, H, &Glyphs::UNICODE, Lang::En);
         assert_eq!(pane.activity(), Activity::Ended);
     }
 

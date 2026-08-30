@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::i18n::Lang;
 use crate::session;
 use crate::stream;
 
@@ -250,12 +251,12 @@ pub const MENU_INDENT: usize = 8;
 
 /// The provider dialog as drawn: one row per provider, the default
 /// marked in words so the choice never rests on position or color.
-pub fn menu_lines() -> Vec<String> {
+pub fn menu_lines(lang: Lang) -> Vec<String> {
     Provider::ALL
         .iter()
         .map(|provider| {
             let mark = if *provider == Provider::DEFAULT {
-                "  [Default]"
+                lang.provider_default_mark()
             } else {
                 ""
             };
@@ -353,12 +354,15 @@ pub struct JobSpec {
 
 impl JobSpec {
     /// Build a spec for `files`, refusing an empty selection.
-    pub fn new(provider: Provider, files: Vec<PathBuf>, output: PathBuf) -> Result<Self, String> {
-        let Some(first) = files.first() else {
-            return Err("no files selected".to_string());
-        };
+    ///
+    /// `None` rather than an error string: there is exactly one way to
+    /// fail here, and the caller already has a phrase for it
+    /// ([`crate::i18n::Lang::summarize_no_files`]) in the screen's own
+    /// language.
+    pub fn new(provider: Provider, files: Vec<PathBuf>, output: PathBuf) -> Option<Self> {
+        let first = files.first()?;
         let cwd = first.parent().unwrap_or(Path::new(".")).to_path_buf();
-        Ok(JobSpec {
+        Some(JobSpec {
             provider,
             files,
             output,
@@ -414,13 +418,91 @@ impl JobSpec {
     }
 
     /// The live status the screen shows while this job runs.
-    pub fn status_line(&self) -> String {
-        let count = self.files.len();
-        let unit = if count == 1 { "file" } else { "files" };
-        format!(
-            "[AI: summarizing {count} {unit} with {}]",
-            self.provider.program()
-        )
+    pub fn status_line(&self, lang: Lang) -> String {
+        lang.job_status(self.files.len(), &self.provider.program())
+    }
+}
+
+/// Why a run produced no summary.
+///
+/// A value, not a sentence, for the same reason [`crate::fsops::FsError`]
+/// is one - but here the split matters twice over, because the same
+/// failure is said in two places for two audiences. On screen it is a
+/// message in the user's language ([`Failure::message`]); in the
+/// Markdown file the run reserved it is [`Failure`]'s `Display`, which
+/// is always English, because that file outlives the session and is read
+/// by whoever the summary is shared with.
+///
+/// [`Failure::Provider`] is the exception that proves the split: it
+/// carries the provider's own last line, which is evidence and is never
+/// translated in either place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// What the provider itself last said.
+    Provider(String),
+    /// It exited cleanly having produced nothing at all.
+    NoOutput,
+    /// It exited without writing a summary.
+    NoSummary,
+    /// It was terminated at the quit prompt.
+    Stopped,
+    /// The run went away without saying how it ended.
+    NoResult,
+    /// The output file could not be claimed before the run started.
+    Reserve { path: PathBuf, detail: String },
+    /// The provider could not be started at all.
+    Spawn { program: String, detail: String },
+    /// The summary itself could not be written.
+    Write { path: PathBuf, detail: String },
+    /// A failure that could not even be written down.
+    Unrecorded {
+        reason: Box<Failure>,
+        path: Option<PathBuf>,
+        detail: String,
+    },
+}
+
+impl Failure {
+    /// Why the run failed, in `lang`.
+    pub fn message(&self, lang: Lang) -> String {
+        match self {
+            Failure::Provider(detail) => detail.clone(),
+            Failure::NoOutput => lang.provider_wrote_nothing().to_string(),
+            Failure::NoSummary => lang.provider_wrote_no_summary().to_string(),
+            Failure::Stopped => lang.run_stopped().to_string(),
+            Failure::NoResult => lang.run_without_result().to_string(),
+            Failure::Reserve { path, detail } => {
+                lang.could_not_reserve(&path.display().to_string(), detail)
+            }
+            Failure::Spawn { program, detail } => lang.could_not_run(program, detail),
+            Failure::Write { path, detail } => {
+                lang.could_not_write(&path.display().to_string(), detail)
+            }
+            Failure::Unrecorded {
+                reason,
+                path,
+                detail,
+            } => lang.could_not_record(
+                &reason.message(lang),
+                path.as_ref().map(|p| p.display().to_string()).as_deref(),
+                detail,
+            ),
+        }
+    }
+
+    /// This failure, wrapped in the one that stopped it being recorded.
+    fn unrecorded(self, path: Option<&Path>, detail: String) -> Failure {
+        Failure::Unrecorded {
+            reason: Box::new(self),
+            path: path.map(Path::to_path_buf),
+            detail,
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(Lang::En))
     }
 }
 
@@ -430,7 +512,7 @@ pub enum Outcome {
     /// The summary is on disk at this path.
     Written(PathBuf),
     /// Nothing usable came back; this is what to tell the user.
-    Failed(String),
+    Failed(Failure),
 }
 
 /// How a finished child is turned into an [`Outcome`], as a pure rule.
@@ -440,7 +522,7 @@ pub enum Finish {
     UseWrittenFile,
     /// It printed the summary instead; save stdout as the summary.
     WriteStdout,
-    Failed(String),
+    Failed(Failure),
 }
 
 /// The rule: the file the provider was asked to write wins, its stdout is
@@ -453,19 +535,23 @@ pub fn finish(exit_ok: bool, output_written: bool, stdout: &str, stderr: &str) -
     if exit_ok && !stdout.trim().is_empty() {
         return Finish::WriteStdout;
     }
-    let detail = last_meaningful_line(stderr)
+    let failure = last_meaningful_line(stderr)
         .or_else(|| last_meaningful_line(stdout))
-        .unwrap_or_else(|| {
-            if exit_ok {
-                "the provider wrote nothing".to_string()
-            } else {
-                "the provider exited without writing a summary".to_string()
-            }
+        .map(Failure::Provider)
+        .unwrap_or(if exit_ok {
+            Failure::NoOutput
+        } else {
+            Failure::NoSummary
         });
-    Finish::Failed(detail)
+    Finish::Failed(failure)
 }
 
-pub fn failure_note(reason: &str) -> String {
+/// The Markdown a failed run leaves in the file it reserved.
+///
+/// Always English: the file outlives the session that wrote it, and it
+/// is read by whoever the summary was going to be shared with rather
+/// than only by the person at the terminal.
+pub fn failure_note(reason: &Failure) -> String {
     format!("# Summary failed\n\n{reason}\n")
 }
 
@@ -500,11 +586,7 @@ pub trait Job: Send {
 /// still be opened over a run that has already finished; a runner that
 /// has nothing to say into it simply never appends.
 pub trait Runner: Send {
-    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, String>;
-    /// What this runner is, for the message log.
-    fn description(&self) -> String {
-        "a child process".to_string()
-    }
+    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, Failure>;
 }
 
 /// The runner the binary ships: an actual child process.
@@ -517,13 +599,16 @@ pub fn process_runner() -> Box<dyn Runner> {
 }
 
 impl Runner for ProcessRunner {
-    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, String> {
+    fn start(&self, spec: &JobSpec, stream: &stream::Handle) -> Result<Box<dyn Job>, Failure> {
         let argv = spec.argv();
         let mut reservation = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&spec.output)
-            .map_err(|e| format!("could not reserve {}: {e}", spec.output.display()))?;
+            .map_err(|e| Failure::Reserve {
+                path: spec.output.clone(),
+                detail: e.to_string(),
+            })?;
         let child = Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(&spec.cwd)
@@ -534,11 +619,16 @@ impl Runner for ProcessRunner {
         let mut child = match child {
             Ok(child) => child,
             Err(e) => {
-                let reason = format!("could not run '{}': {e}", argv[0]);
+                let reason = Failure::Spawn {
+                    program: argv[0].clone(),
+                    detail: e.to_string(),
+                };
+                // The log gets the English rendering, because the log is
+                // a transcript of the run beside the provider's own output.
                 stream.append(stream::Origin::Err, &format!("{reason}\n"));
                 stream.end();
                 write_reserved(&mut reservation, failure_note(&reason).as_bytes()).map_err(
-                    |write_error| format!("{reason}; could not record failure: {write_error}"),
+                    |write_error| reason.clone().unrecorded(None, write_error.to_string()),
                 )?;
                 return Err(reason);
             }
@@ -600,18 +690,16 @@ impl Runner for ProcessRunner {
                 Finish::WriteStdout => {
                     match write_reserved(&mut hold(&writer), stdout_text.as_bytes()) {
                         Ok(()) => Outcome::Written(output.clone()),
-                        Err(e) => {
-                            Outcome::Failed(format!("could not write {}: {e}", output.display()))
-                        }
+                        Err(e) => Outcome::Failed(Failure::Write {
+                            path: output.clone(),
+                            detail: e.to_string(),
+                        }),
                     }
                 }
                 Finish::Failed(reason) => {
                     match write_reserved(&mut hold(&writer), failure_note(&reason).as_bytes()) {
                         Ok(()) => Outcome::Failed(reason),
-                        Err(e) => Outcome::Failed(format!(
-                            "{reason}; could not record failure in {}: {e}",
-                            output.display()
-                        )),
+                        Err(e) => Outcome::Failed(reason.unrecorded(Some(&output), e.to_string())),
                     }
                 }
             };
@@ -630,10 +718,6 @@ impl Runner for ProcessRunner {
             done: None,
             worker: Some(worker),
         }))
-    }
-
-    fn description(&self) -> String {
-        "a child process".to_string()
     }
 }
 
@@ -768,7 +852,9 @@ fn non_empty_file(path: &Path) -> bool {
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 
 /// What a run stopped at the quit prompt is called in its own summary
-/// file, when it did not wind up inside [`TERMINATE_GRACE`].
+/// file, when it did not wind up inside [`TERMINATE_GRACE`]. The English
+/// rendering of [`Failure::Stopped`], because that is what goes into the
+/// file.
 pub const STOPPED_REASON: &str = "the summary run was stopped before it could finish";
 
 struct ProcessJob {
@@ -808,13 +894,12 @@ impl ProcessJob {
                 self.live.session().as_deref(),
             )
         };
-        let reason = match finish(false, non_empty_file(&self.output), "", STOPPED_REASON) {
+        let reason = match finish(false, non_empty_file(&self.output), "", "") {
             Finish::UseWrittenFile => {
                 sign_it();
                 return Outcome::Written(self.output.clone());
             }
-            Finish::WriteStdout => STOPPED_REASON.to_string(),
-            Finish::Failed(reason) => reason,
+            Finish::WriteStdout | Finish::Failed(_) => Failure::Stopped,
         };
         let written = write_reserved(
             &mut hold(&self.reservation),
@@ -823,10 +908,7 @@ impl ProcessJob {
         sign_it();
         match written {
             Ok(()) => Outcome::Failed(reason),
-            Err(e) => Outcome::Failed(format!(
-                "{reason}; could not record failure in {}: {e}",
-                self.output.display()
-            )),
+            Err(e) => Outcome::Failed(reason.unrecorded(Some(&self.output), e.to_string())),
         }
     }
 }
@@ -839,9 +921,7 @@ impl Job for ProcessJob {
         match self.rx.try_recv() {
             Ok(outcome) => Some(outcome),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Outcome::Failed(
-                "the summary run ended without a result".to_string(),
-            )),
+            Err(TryRecvError::Disconnected) => Some(Outcome::Failed(Failure::NoResult)),
         }
     }
 
@@ -889,7 +969,7 @@ mod tests {
     fn spec(files: &[&str]) -> JobSpec {
         let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
         let output = output_path_with(&files[0], "20260829-101500", &|_| false);
-        JobSpec::new(Provider::DEFAULT, files, output).unwrap()
+        JobSpec::new(Provider::DEFAULT, files, output).expect("a spec over at least one file")
     }
 
     #[test]
@@ -1307,7 +1387,7 @@ mod tests {
     /// the column a continuation is indented to.
     #[test]
     fn every_menu_row_starts_its_command_at_the_indent() {
-        for (line, provider) in menu_lines().iter().zip(Provider::ALL) {
+        for (line, provider) in menu_lines(Lang::En).iter().zip(Provider::ALL) {
             let prefix = format!("[{}] {}: ", provider.digit(), provider.code());
             assert_eq!(prefix.chars().count(), MENU_INDENT, "{prefix:?}");
             assert!(line.starts_with(&prefix), "{line:?}");
@@ -1317,7 +1397,7 @@ mod tests {
 
     #[test]
     fn the_menu_marks_exactly_one_default() {
-        let lines = menu_lines();
+        let lines = menu_lines(Lang::En);
         assert_eq!(lines.len(), 5);
         assert_eq!(
             lines[0],
@@ -1390,7 +1470,7 @@ mod tests {
     fn a_spec_needs_at_least_one_file() {
         assert_eq!(
             JobSpec::new(Provider::Ag, vec![], PathBuf::from("/x/s.md")),
-            Err("no files selected".to_string())
+            None
         );
     }
 
@@ -1462,11 +1542,11 @@ mod tests {
     #[test]
     fn the_status_line_counts_the_files_and_names_the_program() {
         assert_eq!(
-            spec(&["/docs/one.pdf", "/docs/two.md", "/docs/three.txt"]).status_line(),
+            spec(&["/docs/one.pdf", "/docs/two.md", "/docs/three.txt"]).status_line(Lang::En),
             "[AI: summarizing 3 files with agy]"
         );
         assert_eq!(
-            spec(&["/docs/one.pdf"]).status_line(),
+            spec(&["/docs/one.pdf"]).status_line(Lang::En),
             "[AI: summarizing 1 file with agy]"
         );
     }
@@ -1489,15 +1569,21 @@ mod tests {
     fn stdout_from_a_failed_provider_is_a_diagnostic() {
         assert_eq!(
             finish(false, false, "agy: request failed\n", ""),
-            Finish::Failed("agy: request failed".to_string())
+            Finish::Failed(Failure::Provider("agy: request failed".to_string()))
         );
     }
 
     #[test]
     fn a_failure_note_carries_the_reported_reason() {
         assert_eq!(
-            failure_note("agy: request failed"),
+            failure_note(&Failure::Provider("agy: request failed".to_string())),
             "# Summary failed\n\nagy: request failed\n"
+        );
+        // The note in the file is always English, whatever the screen is
+        // saying: the file outlives the session that wrote it.
+        assert_eq!(
+            failure_note(&Failure::NoOutput),
+            "# Summary failed\n\nthe provider wrote nothing\n"
         );
     }
 
@@ -1505,23 +1591,23 @@ mod tests {
     fn a_run_with_nothing_to_show_reports_what_the_provider_said() {
         assert_eq!(
             finish(false, false, "", "agy: not logged in\n"),
-            Finish::Failed("agy: not logged in".to_string())
+            Finish::Failed(Failure::Provider("agy: not logged in".to_string()))
         );
         assert_eq!(
             finish(false, false, "   \n", "  \n"),
-            Finish::Failed("the provider exited without writing a summary".to_string())
+            Finish::Failed(Failure::NoSummary)
         );
         assert_eq!(
             finish(true, false, "", ""),
-            Finish::Failed("the provider wrote nothing".to_string())
+            Finish::Failed(Failure::NoOutput)
         );
     }
 
     #[test]
     fn a_long_failure_line_is_bounded() {
         let noisy = "x".repeat(500);
-        let Finish::Failed(detail) = finish(false, false, "", &noisy) else {
-            panic!("expected a failure");
+        let Finish::Failed(Failure::Provider(detail)) = finish(false, false, "", &noisy) else {
+            panic!("expected a failure naming what the provider said");
         };
         assert_eq!(detail.chars().count(), 161);
         assert!(detail.ends_with('…'));

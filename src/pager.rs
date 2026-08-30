@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::bearings::Glyphs;
+use crate::i18n::Lang;
 use crate::markdown::{self, DocLine, Row};
 
 /// Rows the reader's own frame costs inside the listing area.
@@ -229,22 +230,20 @@ impl Pager {
     /// The position footer: the line at the top of the view, how many
     /// there are, and how far down the document that is. Words, not a
     /// scrollbar, so it can be read aloud like the status row.
-    pub fn position(&self, width: usize, view_rows: usize, glyphs: &Glyphs) -> String {
+    pub fn position(&self, width: usize, view_rows: usize, glyphs: &Glyphs, lang: Lang) -> String {
         let total_lines = self.doc.len().max(1);
         let rows = self.rows(width, glyphs).len();
         let max = Pager::max_scroll(rows, view_rows);
         let percent = (self.scroll.min(max) * 100).checked_div(max).unwrap_or(100);
         let line = self.top_line(width, glyphs) + 1;
-        format!(
-            "line {line} of {total_lines} {dot} {percent}%",
-            dot = glyphs.dot
-        )
+        lang.reader_position(line, total_lines, percent, glyphs.dot)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use crate::markdown;
 
     const W: usize = 40;
@@ -287,15 +286,18 @@ mod tests {
     #[test]
     fn the_position_reads_as_a_sentence() {
         let mut pager = numbered(30);
-        assert_eq!(pager.position(W, H, &Glyphs::UNICODE), "line 1 of 30 · 0%");
+        assert_eq!(
+            pager.position(W, H, &Glyphs::UNICODE, Lang::En),
+            "line 1 of 30 · 0%"
+        );
         pager.scroll_to_end(W, H, &Glyphs::UNICODE);
         assert_eq!(
-            pager.position(W, H, &Glyphs::UNICODE),
+            pager.position(W, H, &Glyphs::UNICODE, Lang::En),
             "line 21 of 30 · 100%"
         );
         // Everything on screen is 100% read.
         assert_eq!(
-            numbered(3).position(W, H, &Glyphs::UNICODE),
+            numbered(3).position(W, H, &Glyphs::UNICODE, Lang::En),
             "line 1 of 3 · 100%"
         );
     }
@@ -333,7 +335,7 @@ mod tests {
         let pager = numbered(200);
         let first = pager.rows(W, &Glyphs::UNICODE);
         assert!(Rc::ptr_eq(&first, &pager.rows(W, &Glyphs::UNICODE)));
-        pager.position(W, H, &Glyphs::UNICODE);
+        pager.position(W, H, &Glyphs::UNICODE, Lang::En);
         pager.top_line(W, &Glyphs::UNICODE);
         assert!(Rc::ptr_eq(&first, &pager.rows(W, &Glyphs::UNICODE)));
         // A new width or character set is a new geometry, so it re-lays.
@@ -406,7 +408,7 @@ mod tests {
         // The position is honest against the wider screen, not stuck at
         // the top of the file.
         assert_eq!(
-            pager.position(60, H, &Glyphs::UNICODE),
+            pager.position(60, H, &Glyphs::UNICODE, Lang::En),
             "line 21 of 30 · 100%"
         );
     }

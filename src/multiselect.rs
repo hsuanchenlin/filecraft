@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::fsops::{self, FsError};
+use crate::i18n::Lang;
 use crate::nav::{self, EntryKind};
 use crate::summarize;
 
@@ -70,16 +71,19 @@ pub enum ToggleError {
     NothingFocused,
 }
 
+impl ToggleError {
+    /// Why the press did nothing, in `lang`.
+    pub fn message(&self, lang: Lang) -> String {
+        match self {
+            ToggleError::NotAFile => lang.only_files_selectable(&summarize::summarizable_note()),
+            ToggleError::NothingFocused => lang.nothing_focused().to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for ToggleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToggleError::NotAFile => write!(
-                f,
-                "only files can be selected ({} documents)",
-                summarize::summarizable_note()
-            ),
-            ToggleError::NothingFocused => write!(f, "nothing focused"),
-        }
+        f.write_str(&self.message(Lang::En))
     }
 }
 
@@ -141,15 +145,8 @@ impl FileSelector {
 
     /// The header: how many files are selected right now, and where the
     /// summary would land.
-    pub fn header_line(&self) -> String {
-        match self.chosen.len() {
-            0 => format!(
-                "selected: 0 files - Space to select ({})",
-                summarize::summarizable_note()
-            ),
-            1 => "selected: 1 file".to_string(),
-            n => format!("selected: {n} files"),
-        }
+    pub fn header_line(&self, lang: Lang) -> String {
+        lang.selector_header(self.chosen.len(), &summarize::summarizable_note())
     }
 
     /// The count the status bar shows while the selector is open.
@@ -298,6 +295,7 @@ impl FileSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use std::fs;
 
     fn fixture() -> (tempfile::TempDir, FileSelector) {
@@ -422,14 +420,16 @@ mod tests {
     #[test]
     fn the_header_counts_what_is_selected() {
         let (_tmp, mut selector) = fixture();
-        assert!(selector.header_line().starts_with("selected: 0 files"));
-        assert!(selector.header_line().contains(".pdf"));
+        assert!(selector
+            .header_line(Lang::En)
+            .starts_with("selected: 0 files"));
+        assert!(selector.header_line(Lang::En).contains(".pdf"));
         focus(&mut selector, "readme.md");
         selector.toggle_focused().unwrap();
-        assert_eq!(selector.header_line(), "selected: 1 file");
+        assert_eq!(selector.header_line(Lang::En), "selected: 1 file");
         focus(&mut selector, "log.txt");
         selector.toggle_focused().unwrap();
-        assert_eq!(selector.header_line(), "selected: 2 files");
+        assert_eq!(selector.header_line(Lang::En), "selected: 2 files");
     }
 
     #[test]

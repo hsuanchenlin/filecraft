@@ -160,6 +160,82 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   twin adds that no key in the pane ends or restarts the one running.
   `S` may open the selector and nothing more; a provider only ever runs
   after a selection *and* a chosen provider.
+- Language is `src/i18n.rs` and only that: `Lang` is which language,
+  and every phrase Filecraft says is a total function of it. Nothing in
+  the module reads the environment or a file - `i18n::resolve` is handed
+  a `Request` of borrowed strings, `main.rs` fills it, and
+  `src/config.rs` reads the file, so resolution is tested without
+  setting a variable in the test process. Order: `FILECRAFT_LANG`, then
+  the config file, then `LC_ALL`/`LC_MESSAGES`/`LANG`, then English; a
+  value naming no language Filecraft has is skipped, not fatal.
+  `Lang::from_locale` is stricter than `Lang::parse` in exactly one
+  place - `zh_CN`/`zh_SG`/`zh-Hans` resolve to nothing, because
+  Simplified is a different written language and Traditional characters
+  would be a wrong answer rather than an approximate one.
+  A fixed phrase goes in the `phrases!` table (one line, both languages)
+  and a parameterized one in an `impl Lang` method that matches on
+  `self`; either way the compiler refuses a language that is not written
+  everywhere. `Lang::phrases`/`Lang::hint_rows` are the tables' own
+  index, which is what lets a test assert something about *all* of them
+  rather than the handful somebody listed.
+- `App::lang` is the single source of truth: `ui.rs` reads it off the app
+  rather than resolving again, so `:lang` changes the whole screen at the
+  next frame. A module that says something takes `lang` as a parameter -
+  `bearings::speakable`, `Pager::position`, `LogPane::header`,
+  `JobSpec::status_line` - and an *error* carries a value rather than a
+  sentence (`FsError` + `i18n::Reason`, `ParseError` + `i18n::Usage`,
+  `CliError`) with `Display` pinned to English for `std::error::Error`
+  and test failures. Errors are localized through `e.message(lang)`, not
+  `e.to_string()`.
+- CJK is measured, never counted. A Han character owns two cells, so a
+  translated phrase that lands in a fixed-width column changes the
+  column: `Lang::age_width` and `Lang::preview_label_width` are those
+  columns, and `ui::listing_furniture(lang)` is the listing arithmetic
+  that follows from the first. `every_frame_size_keeps_its_border_and_row_width`,
+  `every_summarizer_screen_keeps_its_frame_at_every_size`, and
+  `a_long_cjk_filter_never_breaks_the_frame` run at all four sizes in
+  every language - that trio is what catches a phrase padded by
+  character count. `FILECRAFT_ASCII` governs the characters Filecraft
+  *draws*, not the language it writes in, so only the English screen can
+  be asserted to be all-ASCII.
+- A message-log line names the operation it came from, and that prefix
+  comes from `i18n::Op` / `Lang::op_says` rather than being written into
+  each string - `every_message_prefix_comes_from_one_table` refuses a
+  phrase that hard-codes `move:` beside a translated `op_name`. In
+  English the prefix happens to be the command word; in another language
+  it is that language's word, and the help screen's COMMANDS block is
+  where what you *type* is learned.
+- `summarize::Failure` is the same split seen twice, and it is why the
+  type exists: `Failure::message(lang)` is the screen and `Display` is
+  the Markdown note written into the file the run reserved, which is
+  always English because that file outlives the session.
+  `Failure::Provider` carries the provider's own last line untranslated
+  in both, because that is evidence rather than prose.
+- What is **not** localized, on purpose: anything Filecraft writes to a
+  *file* (the provider prompt, `session::footer`, `failure_note`,
+  `STOPPED_REASON` as it reaches the log stream), an OS message inside
+  `FsError::Io`, the `filecraft update` report (its PATH advice must stay
+  byte-identical with `install.sh` -
+  `install_script_and_update_advice_agree_on_the_path_line`), and markers
+  that are not words: `<DIR>`, `/`, `@`, `@!`, `Level::prefix`, flag
+  names, and argv.
+- `src/config.rs` is `~/.config/filecraft/config.toml` (or
+  `$XDG_CONFIG_HOME`). Deliberately not a TOML library: a line-oriented
+  reader and rewriter whose one job is that **anything Filecraft does not
+  understand survives a `:lang`**. A top-level key added to a file that
+  already has a `[table]` must go in *ahead* of the first header or
+  `read_language` will never see it again - that is what `with_language`
+  is careful about, and it has a test.
+- `:lang <code>` / `:language` is the only command that writes outside
+  the browsed tree, and it writes one key. `App::config_path` is `None`
+  when there is nowhere to write; the session still switches and says so
+  rather than pretending it saved. Adding or changing a key or command
+  still means `?` help, `help_lines`, the README table, and both
+  languages in the same change.
+- `tests/cli.rs` pins `FILECRAFT_LANG` on every invocation (`bin()` is
+  English, `bin_in`/`bin_with_locale` choose deliberately). Without it a
+  machine whose `LANG` is `zh_TW.UTF-8` fails every English assertion for
+  a reason that has nothing to do with the code.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping

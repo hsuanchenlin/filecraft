@@ -5,6 +5,8 @@
 //! expansion, no globbing, no command substitution. Quoting exists only so
 //! file names containing spaces can be written on the prompt.
 
+use crate::i18n::{Lang, Usage};
+
 /// A parsed BBS command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -32,6 +34,10 @@ pub enum Command {
     /// provider has printed, and the session it announced. Takes no
     /// argument - there is one run, and it is the one being watched.
     Log,
+    /// `lang [code]` / `language [code]` - the screen's language. No
+    /// argument reports the current one; a code switches to it and
+    /// remembers the choice.
+    Language { code: Option<String> },
     /// `help` - show the help screen.
     Help,
     /// `quit` - leave Filecraft.
@@ -48,29 +54,31 @@ pub enum ParseError {
     /// The first word is not a known command.
     Unknown(String),
     /// A known command was given the wrong arguments.
-    Usage {
-        command: &'static str,
-        usage: &'static str,
-    },
+    Usage { command: &'static str, usage: Usage },
     /// A quote was opened but never closed.
     UnterminatedQuote,
     /// A trailing backslash with nothing to escape.
     TrailingEscape,
 }
 
+impl ParseError {
+    /// Why the line failed, in `lang`. Command names and the word the
+    /// user typed are quoted as typed - only the explanation around them
+    /// is translated.
+    pub fn message(&self, lang: Lang) -> String {
+        match self {
+            ParseError::Empty => lang.empty_command().to_string(),
+            ParseError::Unknown(word) => lang.unknown_command(word),
+            ParseError::Usage { command, usage } => lang.usage_line(command, *usage),
+            ParseError::UnterminatedQuote => lang.unterminated_quote().to_string(),
+            ParseError::TrailingEscape => lang.trailing_escape().to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParseError::Empty => write!(f, "empty command"),
-            ParseError::Unknown(word) => {
-                write!(f, "unknown command '{word}' (try 'help')")
-            }
-            ParseError::Usage { command, usage } => {
-                write!(f, "usage: {command} {usage}")
-            }
-            ParseError::UnterminatedQuote => write!(f, "unterminated quote"),
-            ParseError::TrailingEscape => write!(f, "trailing backslash"),
-        }
+        f.write_str(&self.message(Lang::En))
     }
 }
 
@@ -174,7 +182,7 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             }),
             _ => Err(ParseError::Usage {
                 command: "cd",
-                usage: "[path]   (quote paths containing spaces)",
+                usage: Usage::Cd,
             }),
         },
         "move" | "mv" => match args {
@@ -184,14 +192,14 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             }),
             _ => Err(ParseError::Usage {
                 command: typed(&head_lower, &["move", "mv"]),
-                usage: "[destination]   (no path opens the folder picker; quote spaces)",
+                usage: Usage::Move,
             }),
         },
         "rename" => match args {
             [name] => Ok(Command::Rename { name: name.clone() }),
             _ => Err(ParseError::Usage {
                 command: "rename",
-                usage: "<new-name>   (renames the selected entry; quote spaces)",
+                usage: Usage::Rename,
             }),
         },
         // Both names mean the same recoverable move-to-Trash. `rm`,
@@ -201,32 +209,50 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
             args,
             Command::Trash,
             typed(&head_lower, &["delete", "trash"]),
-            "  (moves the selected entry to the Trash; there is no path form)",
+            Usage::Trash,
         ),
-        "open" => no_args(args, Command::Open, "open", ""),
-        "edit" => no_args(args, Command::Edit, "edit", ""),
-        "preview" => no_args(args, Command::Preview, "preview", ""),
+        "open" => no_args(args, Command::Open, "open", Usage::None),
+        "edit" => no_args(args, Command::Edit, "edit", Usage::None),
+        "preview" => no_args(args, Command::Preview, "preview", Usage::None),
         // No path form on purpose: the files are picked in the selector,
         // so nothing the user types ever reaches the provider's argv.
         "summarize" | "summary" => no_args(
             args,
             Command::Summarize,
             typed(&head_lower, &["summarize", "summary"]),
-            "  (opens the file selector; Space picks files, Enter confirms)",
+            Usage::Summarize,
         ),
         // Both names mean the one summary run there can be.
         "log" | "job" => no_args(
             args,
             Command::Log,
             typed(&head_lower, &["log", "job"]),
-            "  (opens the AI run's own output; there is no path form)",
+            Usage::Log,
         ),
-        "help" | "?" => no_args(args, Command::Help, typed(&head_lower, &["help", "?"]), ""),
+        // The screen's language. One argument at most, and it is a
+        // language code rather than a path: nothing typed here ever
+        // reaches a filesystem call or a child process.
+        "lang" | "language" => match args {
+            [] => Ok(Command::Language { code: None }),
+            [code] => Ok(Command::Language {
+                code: Some(code.clone()),
+            }),
+            _ => Err(ParseError::Usage {
+                command: typed(&head_lower, &["lang", "language"]),
+                usage: Usage::Language,
+            }),
+        },
+        "help" | "?" => no_args(
+            args,
+            Command::Help,
+            typed(&head_lower, &["help", "?"]),
+            Usage::None,
+        ),
         "quit" | "q" | "exit" => no_args(
             args,
             Command::Quit,
             typed(&head_lower, &["quit", "q", "exit"]),
-            "",
+            Usage::None,
         ),
         "agent" => Ok(Command::Agent {
             args: args.to_vec(),
@@ -250,7 +276,7 @@ fn no_args(
     args: &[String],
     ok: Command,
     command: &'static str,
-    usage: &'static str,
+    usage: Usage,
 ) -> Result<Command, ParseError> {
     if args.is_empty() {
         Ok(ok)

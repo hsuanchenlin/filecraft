@@ -12,19 +12,55 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use filecraft::app::{App, Effect, KeyInput, Level};
 use filecraft::cli::{self, CliAction};
+use filecraft::config;
 use filecraft::editor;
+use filecraft::i18n::{self, Lang};
 use filecraft::nav::NavState;
 use filecraft::ui::{self, Theme};
 
+/// Read the language the user asked for, and where they asked for it.
+///
+/// The one place the environment and the config file are touched:
+/// [`i18n::resolve`] decides, and it is handed strings so the decision
+/// itself stays testable. The config path comes back too, because it is
+/// also where `:lang` writes a change - a path Filecraft could not work
+/// out is a session that can switch language but not remember it, and
+/// [`App::cmd_language`] says so rather than pretending it saved.
+fn resolve_language(home: Option<&PathBuf>) -> (Lang, Option<PathBuf>) {
+    let config_path = config::path(
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .as_deref(),
+        home.map(PathBuf::as_path),
+    );
+    let configured = config_path.as_deref().and_then(config::load);
+    let env = std::env::var("FILECRAFT_LANG").ok();
+    let lc_all = std::env::var("LC_ALL").ok();
+    let lc_messages = std::env::var("LC_MESSAGES").ok();
+    let lang_env = std::env::var("LANG").ok();
+    let (lang, _source) = i18n::resolve(&i18n::Request {
+        env: env.as_deref(),
+        config: configured.as_deref().and_then(config::read_language),
+        lc_all: lc_all.as_deref(),
+        lc_messages: lc_messages.as_deref(),
+        lang: lang_env.as_deref(),
+    });
+    (lang, config_path)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Resolved before argv is even interpreted, because `--help` and a
+    // usage error are the first things filecraft can say.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (lang, config_path) = resolve_language(home.as_ref());
     let cli = match cli::parse_args(&args) {
         Ok(CliAction::Help) => {
-            print!("{}", cli::USAGE);
+            print!("{}", lang.cli_usage());
             return ExitCode::SUCCESS;
         }
         Ok(CliAction::HelpUpdate) => {
-            print!("{}", cli::UPDATE_USAGE);
+            print!("{}", lang.cli_update_usage());
             return ExitCode::SUCCESS;
         }
         Ok(CliAction::Version) => {
@@ -44,9 +80,9 @@ fn main() -> ExitCode {
             };
         }
         Ok(CliAction::Run(cli)) => cli,
-        Err(message) => {
-            eprintln!("filecraft: {message}");
-            eprintln!("try 'filecraft --help'");
+        Err(error) => {
+            eprintln!("filecraft: {}", error.message(lang));
+            eprintln!("{}", lang.cli_try_help());
             return ExitCode::from(2);
         }
     };
@@ -55,12 +91,9 @@ fn main() -> ExitCode {
 
     if !interactive {
         if !cli.force_list {
-            eprintln!(
-                "filecraft: no TTY detected; printing a static listing \
-                 (run in a real terminal for the interactive screen)"
-            );
+            eprintln!("{}", lang.no_tty_warning());
         }
-        return match ui::render_static_listing(&cli.directory) {
+        return match ui::render_static_listing(&cli.directory, lang) {
             Ok(listing) => {
                 let mut stdout = io::stdout().lock();
                 if stdout.write_all(listing.as_bytes()).is_err() {
@@ -69,13 +102,13 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("filecraft: {error}");
+                eprintln!("filecraft: {}", error.message(lang));
                 ExitCode::FAILURE
             }
         };
     }
 
-    match run_tui(cli.directory) {
+    match run_tui(cli.directory, home, lang, config_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("filecraft: {error}");
@@ -84,13 +117,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_tui(directory: PathBuf) -> io::Result<()> {
-    let nav = NavState::new(&directory).map_err(|e| io::Error::other(e.to_string()))?;
+fn run_tui(
+    directory: PathBuf,
+    home: Option<PathBuf>,
+    lang: Lang,
+    config_path: Option<PathBuf>,
+) -> io::Result<()> {
+    let nav = NavState::new(&directory).map_err(|e| io::Error::other(e.message(lang)))?;
     let editor_env = std::env::var("EDITOR").ok();
     let path_env = std::env::var("PATH").ok();
     let nvim_on_path = editor::find_in_path("nvim", path_env.as_deref()).is_some();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut app = App::new(nav, editor_env, nvim_on_path, home);
+    let mut app = App::new(nav, editor_env, nvim_on_path, home, lang);
+    app.config_path = config_path;
     let no_color = std::env::var("NO_COLOR").ok();
     let ascii = std::env::var("FILECRAFT_ASCII").ok();
     let theme = Theme::from_env(no_color.as_deref(), ascii.as_deref());
@@ -198,21 +236,22 @@ fn run_interactive(
 
     match status {
         Ok(exit) if exit.success() => {
-            app.push_msg(Level::Ok, format!("{} closed", argv[0]));
+            let text = app.lang.program_closed(&argv[0]);
+            app.push_msg(Level::Ok, text);
         }
         Ok(exit) => {
-            app.push_msg(Level::Info, format!("{} exited with {exit}", argv[0]));
+            let text = app.lang.program_exited(&argv[0], &exit.to_string());
+            app.push_msg(Level::Info, text);
         }
         Err(error) => {
-            app.push_msg(
-                Level::Error,
-                format!("failed to run '{}': {error}", argv[0]),
-            );
+            let text = app.lang.failed_to_run(&argv[0], &error.to_string());
+            app.push_msg(Level::Error, text);
         }
     }
     // The editor may have created or changed files.
     if let Err(error) = app.nav.refresh() {
-        app.push_msg(Level::Error, error.to_string());
+        let text = error.message(app.lang);
+        app.push_msg(Level::Error, text);
     }
     Ok(())
 }
@@ -234,10 +273,8 @@ fn spawn_detached(app: &mut App, argv: &[String]) {
             });
         }
         Err(error) => {
-            app.push_msg(
-                Level::Error,
-                format!("failed to run '{}': {error}", argv[0]),
-            );
+            let text = app.lang.failed_to_run(&argv[0], &error.to_string());
+            app.push_msg(Level::Error, text);
         }
     }
 }

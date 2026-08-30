@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use filecraft::stream::{Handle, StreamLine};
 use filecraft::summarize::{
-    output_path_with, Job, JobSpec, Outcome, ProcessRunner, Provider, Runner, STOPPED_REASON,
+    output_path_with, Failure, Job, JobSpec, Outcome, ProcessRunner, Provider, Runner,
+    STOPPED_REASON,
 };
 
 /// Longest a stub run may take before the test gives up. Generous: it is
@@ -407,7 +408,11 @@ fn an_existing_output_prevents_the_provider_from_starting() {
     std::fs::write(&spec.output, "keep me").unwrap();
 
     let error = ProcessRunner.start(&spec, &Handle::new()).err().unwrap();
-    assert!(error.starts_with("could not reserve"), "{error}");
+    assert!(matches!(error, Failure::Reserve { .. }), "{error:?}");
+    assert!(
+        error.to_string().starts_with("could not reserve"),
+        "{error}"
+    );
     assert_eq!(std::fs::read_to_string(&spec.output).unwrap(), "keep me");
 }
 
@@ -420,7 +425,7 @@ fn a_failing_provider_does_not_save_its_stdout_as_a_summary() {
 
     assert_eq!(
         wait_for(&mut job),
-        Outcome::Failed("codex: not logged in".to_string())
+        Outcome::Failed(Failure::Provider("codex: not logged in".to_string()))
     );
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
     assert!(artifact.contains("Summary failed"), "{artifact}");
@@ -434,10 +439,7 @@ fn a_silent_provider_is_a_failure_not_an_empty_summary() {
     let spec = spec_in(&tmp, Provider::Ki);
     let mut job = ProcessRunner.start(&spec, &Handle::new()).unwrap();
 
-    assert_eq!(
-        wait_for(&mut job),
-        Outcome::Failed("the provider wrote nothing".to_string())
-    );
+    assert_eq!(wait_for(&mut job), Outcome::Failed(Failure::NoOutput));
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
     assert!(
         artifact.contains("the provider wrote nothing"),
@@ -504,7 +506,7 @@ fn terminate_returns_even_while_a_grandchild_holds_the_pipes() {
     // and the app drops the job the moment `terminate` returns.
     assert_eq!(
         job.poll(),
-        Some(Outcome::Failed(STOPPED_REASON.to_string())),
+        Some(Outcome::Failed(Failure::Stopped)),
         "a stopped run has to report a failure"
     );
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
@@ -553,9 +555,13 @@ fn a_run_that_cannot_be_spawned_is_a_plain_error_and_never_a_job() {
         .start(&spec, &Handle::new())
         .err()
         .expect("a spawn that cannot happen is not a running job");
-    assert!(error.starts_with("could not run 'agy'"), "{error}");
+    assert!(matches!(error, Failure::Spawn { .. }), "{error:?}");
+    assert!(
+        error.to_string().starts_with("could not run 'agy'"),
+        "{error}"
+    );
     let artifact = std::fs::read_to_string(&spec.output).unwrap();
-    assert!(artifact.contains(&error), "{artifact}");
+    assert!(artifact.contains(&error.to_string()), "{artifact}");
 }
 
 /// The live log: what the provider prints reaches the log *while it is

@@ -124,6 +124,8 @@ reported and do not crash.
   Set `FILECRAFT_ASCII` to any non-empty value to draw the screen using
   printable ASCII only, for braille displays, serial terminals, and
   locales where the box-drawing range is unreliable.
+- **Language:** English and Traditional Chinese (繁體中文). See
+  [Language](#language) below.
 - **Reader:** built in and read-only, for Markdown (`.md`, `.markdown`)
   and any other file that looks like text. No external pager is needed
   and none is launched.
@@ -142,6 +144,71 @@ filecraft --list ~/Documents
 filecraft ~/Documents
 filecraft update --check
 ```
+
+## Language
+
+Filecraft speaks **English** (`en`) and **Traditional Chinese**
+(`zh-TW`, 繁體中文). Everything on screen is translated: the ladder and
+status rows, the listing, every dialog and confirmation, the reader and
+the log viewer, the help screen, and `filecraft --help`.
+
+The language is resolved once at startup, in the order you can predict -
+what you said, then what your system said, then English:
+
+| Order | Source | Example |
+| --- | --- | --- |
+| 1 | `FILECRAFT_LANG` | `FILECRAFT_LANG=zh-TW filecraft` |
+| 2 | `language` in `~/.config/filecraft/config.toml` | `language = "zh-TW"` |
+| 3 | `LC_ALL`, then `LC_MESSAGES`, then `LANG` | `LANG=zh_TW.UTF-8` |
+| 4 | English | nothing set |
+
+A value naming a language Filecraft does not have is skipped rather than
+fatal, so a `LANG` of `fr_FR.UTF-8` falls through to English exactly as
+an unset one would. `zh_TW`, `zh_HK`, `zh_MO`, and `zh-Hant` all select
+Traditional Chinese. `zh_CN`, `zh_SG`, and `zh-Hans` deliberately do
+**not**: Simplified Chinese is a different written language, and
+answering it with Traditional characters would be a wrong answer rather
+than an approximate one. Ask for it explicitly with `:lang zh` if you
+want it anyway.
+
+Change it from inside Filecraft at the `:` prompt:
+
+```
+:lang            report the current language
+:lang zh         switch to Traditional Chinese
+:lang en         switch to English
+:language zh-TW  the long name and the full code both work
+```
+
+The switch takes effect on the next frame and is written to
+`~/.config/filecraft/config.toml` (or
+`$XDG_CONFIG_HOME/filecraft/config.toml`) so
+the next session starts in it. Only the `language` key is touched -
+comments, blank lines, and any other key in the file are preserved. If
+the preference could not be written down, Filecraft says so: the session
+still switches, and you know the next one will not.
+
+The message log is a record of what was said, so lines written before a
+switch stay in the language they were written in; everything said after
+it is in the new one. Each line is named after the operation it came
+from - `move:`, `delete:`, `summarize:` in English, `移動:`, `刪除:`,
+`摘要:` in Traditional Chinese. What you *type* at the `:` prompt is
+always the English command; the help screen's COMMANDS block is the list.
+
+Two things stay in English on purpose. A path, a file name, a flag, and
+whatever the operating system or the AI provider itself said are
+evidence, not prose, and are passed through untouched under a translated
+prefix. And anything Filecraft writes to a *file* - the prompt handed to
+a provider, the session footer on a finished summary, the note left when
+a run fails - stays stable, because that file outlives the session and is
+read by whoever the summary is shared with.
+
+Traditional Chinese is measured, not counted: a Han character owns two
+terminal cells, so the listing's age column, the preview's label column,
+every padded status segment, and every hint row are fitted in display
+columns. `NO_COLOR` and `FILECRAFT_ASCII` work exactly as they do in
+English - `FILECRAFT_ASCII` governs the characters Filecraft *draws*
+(borders, rails, bullets), not the language it writes in.
 
 ## Keyboard
 
@@ -455,7 +522,17 @@ listing is the single thing commands act on.
   never `rows A-B of N` - the rail always has its words.
 - **Relative times** - `2d`, `11m`, `1h` in the listing instead of a
   20-column UTC stamp, which needs no timezone and returns those columns
-  to the filename. Absolute times stay in `preview`.
+  to the filename. Absolute times stay in `preview`. In Traditional
+  Chinese the same column reads `2天前`, `11分鐘前`, `1小時前`, and it is
+  two cells wider because a Han character is two cells wide.
+
+The same row in Traditional Chinese:
+
+```
+║ 0·~ ▸ … ▸ 4·docs ▸ 5·notes                                  階層 5 · 74 個項目 ║
+║█> file_061.txt                                                    0B  2天前   ║
+║ 第 61 列，共 74 列 · 第 47-61 列，共 74 列 · file_061.txt · 檔案 · 0B · 2天前  ║
+```
 
 ## Commands
 
@@ -474,6 +551,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `summarize`, `summary` | AI summary of files you pick (same as `S`) |
 | `log`, `job` | the AI run's own output and session (same as `L`) |
 | `agent [...]` | future AI seam; disabled in v0 (see [docs/agent-seam.md](docs/agent-seam.md)) |
+| `lang [en\|zh]`, `language` | screen language; no code reports the current one. The choice is saved for next time |
 | `help` | help screen |
 | `quit` | leave Filecraft |
 

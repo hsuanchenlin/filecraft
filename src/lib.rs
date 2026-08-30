@@ -6,6 +6,12 @@
 //! - [`bearings`] computes the read-only orientation chrome (ladder, rail,
 //!   speakable status, relative time) from state already in memory.
 //! - [`command`] parses BBS command lines (never shell-evaluated).
+//! - [`i18n`] is the language Filecraft speaks and every phrase it
+//!   says: resolution from the user's setting and the system locale,
+//!   and the per-language catalog every other module reads.
+//! - [`config`] is the user's own settings file - today just the
+//!   language - read and rewritten without disturbing anything else
+//!   in it.
 //! - [`fsops`] canonicalizes/validates paths and performs safe move/rename.
 //! - [`trash`] is the only removal Filecraft has: a recoverable move into
 //!   the system Trash, behind a seam so the flow is testable.
@@ -51,8 +57,10 @@ pub mod app;
 pub mod bearings;
 pub mod cli;
 pub mod command;
+pub mod config;
 pub mod editor;
 pub mod fsops;
+pub mod i18n;
 pub mod joblog;
 pub mod markdown;
 pub mod multiselect;

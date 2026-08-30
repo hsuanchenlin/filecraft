@@ -12,11 +12,13 @@ use std::time::{Instant, SystemTime};
 use crate::agent::{self, Agent, AgentRequest};
 use crate::bearings::{self, Glyphs, Ladder};
 use crate::command::{self, Command};
+use crate::config;
 use crate::editor;
 use crate::fsops::{self, FsError};
+use crate::i18n::{Lang, Op};
 use crate::joblog::{self, LogPane};
 use crate::markdown::{self, DocLine};
-use crate::multiselect::{self, FileSelector, ToggleError, Toggled};
+use crate::multiselect::{self, FileSelector, Toggled};
 use crate::nav::NavState;
 use crate::pager::{self, Pager};
 use crate::picker::{self, FolderPicker};
@@ -111,17 +113,16 @@ pub enum PendingOp {
 impl PendingOp {
     /// One-line description shown in the confirmation prompt; always shows
     /// the canonical destination.
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, lang: Lang) -> String {
         match self {
             PendingOp::Move { src, dst } => {
-                format!("move '{}' -> '{}'", src.display(), dst.display())
+                lang.describe_move(&src.display().to_string(), &dst.display().to_string())
             }
-            PendingOp::Rename { src, dst } => format!(
-                "rename '{}' -> '{}'",
-                src.file_name().unwrap_or_default().to_string_lossy(),
-                dst.file_name().unwrap_or_default().to_string_lossy()
+            PendingOp::Rename { src, dst } => lang.describe_rename(
+                &src.file_name().unwrap_or_default().to_string_lossy(),
+                &dst.file_name().unwrap_or_default().to_string_lossy(),
             ),
-            PendingOp::Trash { name, .. } => format!("trash '{name}'"),
+            PendingOp::Trash { name, .. } => lang.describe_trash(name),
         }
     }
 
@@ -170,10 +171,6 @@ pub struct Message {
 
 const MAX_MESSAGES: usize = 100;
 
-/// The question the quit confirmation asks. One string, shared by the
-/// prompt row and the message log, so the two cannot drift.
-pub const QUIT_QUESTION: &str = "task in progress: terminate AI summary and quit?";
-
 /// A path as the message log names it: the file name alone, because the
 /// selector header already says where the summary will land.
 fn display_name(path: &Path) -> String {
@@ -194,6 +191,16 @@ pub struct App {
     pub nvim_on_path: bool,
     /// Home directory captured at startup, for `~` and bare `cd`.
     pub home: Option<PathBuf>,
+    /// The language every phrase on screen is said in.
+    ///
+    /// One source of truth: the renderer reads it from here rather than
+    /// resolving it again, so `:lang` changes the whole screen at the
+    /// next frame and nothing can be left speaking the old language.
+    pub lang: Lang,
+    /// Where a language change is remembered, when there is anywhere to
+    /// remember it. `None` means this session only, and `:lang` says so
+    /// rather than silently forgetting.
+    pub config_path: Option<PathBuf>,
     /// Rows available to the file list; the UI updates this every frame so
     /// PageUp/PageDown match what is on screen.
     pub viewport_rows: usize,
@@ -254,8 +261,8 @@ impl ActiveJob {
     }
 
     /// The live status the screen shows while this runs.
-    pub fn status_line(&self) -> String {
-        self.spec.status_line()
+    pub fn status_line(&self, lang: Lang) -> String {
+        self.spec.status_line(lang)
     }
 }
 
@@ -265,6 +272,7 @@ impl App {
         editor_env: Option<String>,
         nvim_on_path: bool,
         home: Option<PathBuf>,
+        lang: Lang,
     ) -> Self {
         let mut app = App {
             nav,
@@ -274,6 +282,8 @@ impl App {
             editor_env,
             nvim_on_path,
             home,
+            lang,
+            config_path: None,
             viewport_rows: 20,
             viewport_cols: 80,
             glyphs: Glyphs::UNICODE,
@@ -282,10 +292,7 @@ impl App {
             job: None,
             run_log: None,
         };
-        app.push_msg(
-            Level::Info,
-            "welcome to filecraft - press ? for help, : for commands".to_string(),
-        );
+        app.push_msg(Level::Info, lang.welcome().to_string());
         app
     }
 
@@ -378,21 +385,22 @@ impl App {
             KeyInput::Char('?') => self.show_help(),
             KeyInput::Char('.') => {
                 if let Err(e) = self.nav.toggle_hidden() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
-                let state = if self.nav.show_hidden {
-                    "shown"
+                let note = if self.nav.show_hidden {
+                    self.lang.dotfiles_now_shown()
                 } else {
-                    "hidden"
+                    self.lang.dotfiles_now_hidden()
                 };
-                self.push_msg(Level::Info, format!("dotfiles {state}"));
+                self.push_msg(Level::Info, note.to_string());
                 Effect::None
             }
             KeyInput::Char('r') => {
                 if let Err(e) = self.nav.refresh() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
-                self.push_msg(Level::Info, "refreshed".to_string());
+                let refreshed = self.lang.refreshed().to_string();
+                self.push_msg(Level::Info, refreshed);
                 Effect::None
             }
             // `S`, like `:summarize`, only opens the file selector.
@@ -414,7 +422,8 @@ impl App {
             return Effect::None;
         }
         self.nav.set_filter(String::new());
-        self.push_msg(Level::Info, "filter cleared".to_string());
+        let cleared = self.lang.filter_cleared().to_string();
+        self.push_msg(Level::Info, cleared);
         Effect::None
     }
 
@@ -468,7 +477,8 @@ impl App {
             KeyInput::Esc => {
                 self.nav.set_filter(String::new());
                 self.mode = Mode::Browse;
-                self.push_msg(Level::Info, "filter cleared".to_string());
+                let cleared = self.lang.filter_cleared().to_string();
+                self.push_msg(Level::Info, cleared);
                 Effect::None
             }
             KeyInput::Enter => {
@@ -490,20 +500,18 @@ impl App {
             // `q` cancels here, as it does in the reader and the folder
             // picker: the back-out key never means "go ahead".
             KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Char('q') | KeyInput::Esc => {
+                let lang = self.lang;
                 let description = self
                     .pending
                     .take()
-                    .map(|op| op.describe())
+                    .map(|op| op.describe(lang))
                     .unwrap_or_default();
                 self.mode = Mode::Browse;
-                self.push_msg(Level::Info, format!("cancelled: {description}"));
+                self.push_msg(Level::Info, lang.cancelled(&description));
                 Effect::None
             }
             _ => {
-                self.push_msg(
-                    Level::Info,
-                    "press y to confirm, or n / q / Esc to cancel".to_string(),
-                );
+                self.push_msg(Level::Info, self.lang.press_y_or_cancel().to_string());
                 Effect::None
             }
         }
@@ -516,14 +524,14 @@ impl App {
         let Some(job) = &self.job else {
             return Effect::Quit;
         };
-        let status = job.status_line();
+        let status = job.status_line(self.lang);
         if matches!(self.mode, Mode::ConfirmQuit) {
             return Effect::None;
         }
         self.mode = Mode::ConfirmQuit;
         // The prompt row asks the question; the log says which run it is
         // about, which is the part the prompt has no room for.
-        self.push_msg(Level::Info, format!("confirm: quit and terminate {status}"));
+        self.push_msg(Level::Info, self.lang.confirm_quit_line(&status));
         Effect::None
     }
 
@@ -540,17 +548,13 @@ impl App {
             // slip away, and terminating a run is not undone by retrying.
             KeyInput::Char('n') | KeyInput::Char('N') | KeyInput::Esc => {
                 self.mode = Mode::Browse;
-                self.push_msg(
-                    Level::Info,
-                    "cancelled: the summary is still running".to_string(),
-                );
+                let note = self.lang.summary_still_running().to_string();
+                self.push_msg(Level::Info, note);
                 Effect::None
             }
             _ => {
-                self.push_msg(
-                    Level::Info,
-                    "press y to terminate the summary and quit, or n / Esc to stay".to_string(),
-                );
+                let note = self.lang.press_y_to_terminate().to_string();
+                self.push_msg(Level::Info, note);
                 Effect::None
             }
         }
@@ -568,27 +572,26 @@ impl App {
     /// is read or sent here; this only lists folders and documents.
     fn cmd_summarize(&mut self) -> Effect {
         if let Some(job) = &self.job {
-            let status = job.status_line();
-            return self.err(format!("summarize: already running {status}"));
+            let status = job.status_line(self.lang);
+            return self.err(self.lang.already_running(&status));
         }
         match FileSelector::open(&self.nav.cwd, self.nav.show_hidden) {
             Ok(selector) => {
-                self.push_msg(
-                    Level::Info,
-                    format!(
-                        "summarize: Space selects, Enter or c confirms, Esc cancels ({})",
-                        summarize::summarizable_note()
-                    ),
-                );
+                let opened = self.lang.summarize_opened(&summarize::summarizable_note());
+                self.push_msg(Level::Info, opened);
                 self.mode = Mode::FileSelector(selector);
                 Effect::None
             }
-            Err(e) => self.err(format!("summarize: {e}")),
+            Err(e) => {
+                let text = self.lang.summarize_error(&e.message(self.lang));
+                self.err(text)
+            }
         }
     }
 
     fn handle_selector_key(&mut self, key: KeyInput) -> Effect {
         let rows = self.selector_rows();
+        let lang = self.lang;
         let mut confirm = false;
         let mut cancel = false;
         let mut err: Option<String> = None;
@@ -606,35 +609,24 @@ impl App {
                 KeyInput::Char('G') | KeyInput::End => selector.cursor_to_end(),
                 KeyInput::Char('l') | KeyInput::Right => {
                     if let Err(e) = selector.enter_focused() {
-                        err = Some(format!("summarize: {e}"));
+                        err = Some(lang.summarize_error(&e.message(lang)));
                     }
                 }
                 KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => {
                     match selector.go_up() {
                         Ok(true) => {}
-                        Ok(false) => info = Some("already at the filesystem root".to_string()),
-                        Err(e) => err = Some(format!("summarize: {e}")),
+                        Ok(false) => info = Some(lang.at_filesystem_root().to_string()),
+                        Err(e) => err = Some(lang.summarize_error(&e.message(lang))),
                     }
                 }
                 KeyInput::Char(' ') => match selector.toggle_focused() {
                     Ok(Toggled::Added(path)) => {
-                        info = Some(format!(
-                            "selected '{}' ({} total)",
-                            display_name(&path),
-                            selector.count()
-                        ));
+                        info = Some(lang.file_selected(&display_name(&path), selector.count()));
                     }
                     Ok(Toggled::Removed(path)) => {
-                        info = Some(format!(
-                            "unselected '{}' ({} total)",
-                            display_name(&path),
-                            selector.count()
-                        ));
+                        info = Some(lang.file_unselected(&display_name(&path), selector.count()));
                     }
-                    Err(ToggleError::NothingFocused) => {
-                        err = Some("summarize: nothing focused".to_string())
-                    }
-                    Err(e @ ToggleError::NotAFile) => err = Some(format!("summarize: {e}")),
+                    Err(e) => err = Some(lang.summarize_error(&e.message(lang))),
                 },
                 KeyInput::Enter | KeyInput::Char('c') => confirm = true,
                 KeyInput::Esc | KeyInput::Char('q') => cancel = true,
@@ -643,7 +635,7 @@ impl App {
         }
         if cancel {
             self.mode = Mode::Browse;
-            self.push_msg(Level::Info, "cancelled: summarize".to_string());
+            self.push_msg(Level::Info, lang.cancelled_summarize().to_string());
             return Effect::None;
         }
         if confirm {
@@ -667,15 +659,11 @@ impl App {
             _ => return Effect::None,
         };
         if files.is_empty() {
-            return self
-                .err("summarize: no files selected - press Space on a file first".to_string());
+            let text = self.lang.summarize_nothing_selected().to_string();
+            return self.err(text);
         }
-        let count = files.len();
-        let unit = if count == 1 { "file" } else { "files" };
-        self.push_msg(
-            Level::Info,
-            format!("summarize: {count} {unit} - choose a provider (Enter takes the default)"),
-        );
+        let line = self.lang.choose_a_provider(files.len());
+        self.push_msg(Level::Info, line);
         self.mode = Mode::ProviderMenu { files };
         Effect::None
     }
@@ -687,13 +675,12 @@ impl App {
             KeyInput::Enter => summarize::resolve(None),
             KeyInput::Char(c) if c.is_ascii_digit() => match summarize::resolve(Some(c)) {
                 Some(provider) => Some(provider),
-                None => {
-                    return self.err(format!("summarize: no provider '{c}' - press 1-5 or Enter"))
-                }
+                None => return self.err(self.lang.no_such_provider(c)),
             },
             KeyInput::Esc | KeyInput::Char('q') => {
                 self.mode = Mode::Browse;
-                self.push_msg(Level::Info, "cancelled: summarize".to_string());
+                let note = self.lang.cancelled_summarize().to_string();
+                self.push_msg(Level::Info, note);
                 return Effect::None;
             }
             _ => return Effect::None,
@@ -713,12 +700,13 @@ impl App {
         };
         self.mode = Mode::Browse;
         let Some(first) = files.first().cloned() else {
-            return self.err("summarize: no files selected".to_string());
+            let text = self.lang.summarize_no_files().to_string();
+            return self.err(text);
         };
         let output = summarize::output_path(&first, &summarize::stamp(SystemTime::now()));
-        let spec = match JobSpec::new(provider, files, output) {
-            Ok(spec) => spec,
-            Err(e) => return self.err(format!("summarize: {e}")),
+        let Some(spec) = JobSpec::new(provider, files, output) else {
+            let text = self.lang.summarize_no_files();
+            return self.err(text);
         };
         // The log is the app's, not the job's: the runner fills it while
         // it runs, and it is still here to read once the job is gone.
@@ -731,15 +719,14 @@ impl App {
         });
         match started {
             Ok(handle) => {
-                self.push_msg(Level::Ok, spec.status_line());
-                self.push_msg(
-                    Level::Info,
-                    format!("summarize: will write {}", spec.output.display()),
+                let (status, will_write, watch) = (
+                    spec.status_line(self.lang),
+                    self.lang.will_write(&spec.output.display().to_string()),
+                    self.lang.watch_the_provider().to_string(),
                 );
-                self.push_msg(
-                    Level::Info,
-                    "press L to watch what the provider is doing".to_string(),
-                );
+                self.push_msg(Level::Ok, status);
+                self.push_msg(Level::Info, will_write);
+                self.push_msg(Level::Info, watch);
                 self.job = Some(ActiveJob { spec, handle });
                 Effect::None
             }
@@ -749,7 +736,7 @@ impl App {
                 if let Some(run) = &self.run_log {
                     run.stream.end();
                 }
-                self.err(format!("summarize: {e}"))
+                self.err(self.lang.summarize_error(&e.message(self.lang)))
             }
         }
     }
@@ -762,7 +749,8 @@ impl App {
 
     /// The live status the status row shows, if anything is running.
     pub fn job_status(&self) -> Option<String> {
-        self.job.as_ref().map(ActiveJob::status_line)
+        let lang = self.lang;
+        self.job.as_ref().map(|job| job.status_line(lang))
     }
 
     /// Ask the running summary whether it is done, and report it if so.
@@ -783,7 +771,8 @@ impl App {
         }
         match outcome {
             Outcome::Written(path) => {
-                self.push_msg(Level::Ok, format!("summary written to {}", path.display()));
+                let written = self.lang.summary_written(&path.display().to_string());
+                self.push_msg(Level::Ok, written);
                 let Some(parent) = path.parent() else {
                     return;
                 };
@@ -797,14 +786,13 @@ impl App {
                     self.nav.refresh()
                 };
                 if let Err(e) = result {
-                    self.push_msg(Level::Error, e.to_string());
+                    let text = e.message(self.lang);
+                    self.push_msg(Level::Error, text);
                     return;
                 }
                 if moved {
-                    self.push_msg(
-                        Level::Info,
-                        format!("listing moved to {}", parent.display()),
-                    );
+                    let note = self.lang.listing_moved_to(&parent.display().to_string());
+                    self.push_msg(Level::Info, note);
                 }
                 if let Some(name) = name {
                     let visible = self.nav.visible();
@@ -813,12 +801,18 @@ impl App {
                         .position(|&i| self.nav.entries[i].name == name)
                     {
                         self.nav.cursor = pos;
-                        self.push_msg(Level::Info, "press l to read it".to_string());
+                        let note = self.lang.press_l_to_read().to_string();
+                        self.push_msg(Level::Info, note);
                     }
                 }
             }
             Outcome::Failed(reason) => {
-                self.push_msg(Level::Error, format!("summarize: {reason}"));
+                // A run's own account of what went wrong, in the screen's
+                // language - except for the one part that is evidence
+                // rather than prose, the provider's own last line, which
+                // `Failure::Provider` carries through untranslated.
+                let text = self.lang.summarize_error(&reason.message(self.lang));
+                self.push_msg(Level::Error, text);
             }
         }
     }
@@ -851,9 +845,10 @@ impl App {
         let Some(live) = self.run_log.as_ref().map(|run| run.stream.clone()) else {
             return;
         };
-        let (width, view, glyphs) = (self.log_cols(), self.log_rows(), self.glyphs);
+        let (width, view, glyphs, lang) =
+            (self.log_cols(), self.log_rows(), self.glyphs, self.lang);
         if let Mode::JobLog(pane) = &mut self.mode {
-            pane.sync(&live, Instant::now(), width, view, &glyphs);
+            pane.sync(&live, Instant::now(), width, view, &glyphs, lang);
         }
     }
 
@@ -894,13 +889,14 @@ impl App {
     /// session a provider announced.
     fn cmd_log(&mut self) -> Effect {
         let Some(run) = &self.run_log else {
-            return self
-                .err("log: no AI summary has run yet - press S to pick files for one".to_string());
+            let text = self.lang.log_never_ran().to_string();
+            return self.err(text);
         };
         let (provider, live) = (run.provider, run.stream.clone());
-        let mut pane = LogPane::new(provider);
-        let (width, view, glyphs) = (self.log_cols(), self.log_rows(), self.glyphs);
-        pane.sync(&live, Instant::now(), width, view, &glyphs);
+        let mut pane = LogPane::new(provider, self.lang);
+        let (width, view, glyphs, lang) =
+            (self.log_cols(), self.log_rows(), self.glyphs, self.lang);
+        pane.sync(&live, Instant::now(), width, view, &glyphs, lang);
         self.mode = Mode::JobLog(pane);
         Effect::None
     }
@@ -927,7 +923,7 @@ impl App {
             return self.handle_find_key(key);
         }
         let (width, view) = self.pane_geometry();
-        let glyphs = self.glyphs;
+        let (glyphs, lang) = (self.glyphs, self.lang);
         let page = view as isize;
         let half = (view as isize / 2).max(1);
         let mut close = false;
@@ -957,9 +953,9 @@ impl App {
                 KeyInput::Char('n') | KeyInput::Char('N') => {
                     let forward = key == KeyInput::Char('n');
                     if pager.query.is_empty() {
-                        missed = Some((Level::Info, "no search yet - press / to find".to_string()));
+                        missed = Some((Level::Info, lang.no_search_yet().to_string()));
                     } else if !pager.step_match(forward, width, view, &glyphs) {
-                        missed = Some((Level::Error, format!("no match for '{}'", pager.query)));
+                        missed = Some((Level::Error, lang.no_match_for(&pager.query)));
                     }
                 }
                 KeyInput::Char('q')
@@ -992,7 +988,7 @@ impl App {
     /// reader - backing out is always exactly one level.
     fn handle_find_key(&mut self, key: KeyInput) -> Effect {
         let (width, view) = self.pane_geometry();
-        let glyphs = self.glyphs;
+        let (glyphs, lang) = (self.glyphs, self.lang);
         let mut missed: Option<String> = None;
         {
             let Some(pager) = self.pane() else {
@@ -1014,7 +1010,7 @@ impl App {
                     if pager.query.is_empty() {
                         // An empty query clears the highlight, nothing else.
                     } else if !pager.seek_match(width, view, &glyphs) {
-                        missed = Some(format!("no match for '{}'", pager.query));
+                        missed = Some(lang.no_match_for(&pager.query));
                     }
                 }
                 _ => {}
@@ -1037,7 +1033,8 @@ impl App {
     /// handed to the editor. Never automatic - always this explicit key.
     fn activate_selection(&mut self) -> Effect {
         let Some(entry) = self.nav.selected().cloned() else {
-            return self.err("nothing selected".to_string());
+            let text = self.lang.nothing_selected().to_string();
+            return self.err(text);
         };
         if entry.is_parent {
             return self.go_up();
@@ -1049,10 +1046,8 @@ impl App {
             return self.cmd_edit();
         }
         match entry.kind {
-            crate::nav::EntryKind::SymlinkBroken => {
-                self.err(format!("broken symlink: '{}' points nowhere", entry.name))
-            }
-            _ => self.err(format!("cannot open special file '{}'", entry.name)),
+            crate::nav::EntryKind::SymlinkBroken => self.err(self.lang.broken_symlink(&entry.name)),
+            _ => self.err(self.lang.cannot_open_special(&entry.name)),
         }
     }
 
@@ -1061,7 +1056,8 @@ impl App {
     /// launches an editor and never touches the file.
     fn open_selected(&mut self) -> Effect {
         let Some(entry) = self.nav.selected().cloned() else {
-            return self.err("nothing selected".to_string());
+            let text = self.lang.nothing_selected().to_string();
+            return self.err(text);
         };
         if entry.is_parent {
             return self.go_up();
@@ -1073,10 +1069,8 @@ impl App {
             return self.open_pager_for_file();
         }
         match entry.kind {
-            crate::nav::EntryKind::SymlinkBroken => {
-                self.err(format!("broken symlink: '{}' points nowhere", entry.name))
-            }
-            _ => self.err(format!("cannot read special file '{}'", entry.name)),
+            crate::nav::EntryKind::SymlinkBroken => self.err(self.lang.broken_symlink(&entry.name)),
+            _ => self.err(self.lang.cannot_read_special(&entry.name)),
         }
     }
 
@@ -1084,31 +1078,29 @@ impl App {
     /// structure drawn; anything else readable is shown as it is; a
     /// binary is refused in words rather than painted on the screen.
     fn open_pager_for_file(&mut self) -> Effect {
+        let lang = self.lang;
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("read: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Read, &e)),
         };
         let source = match preview::read_view(&path) {
             Ok(source) => source,
-            Err(e) => return self.err(format!("read: {e}")),
+            Err(e) => return self.err(lang.op_says(Op::Read, &e.message(lang))),
         };
         let ViewSource::Text { text, truncated } = source else {
-            return self.err(format!(
-                "cannot read '{name}' as text - it is binary; try ':' then open"
-            ));
+            return self.err(lang.not_text(&name));
         };
         let mut doc = if text.is_empty() {
-            vec![DocLine::meta("(empty file)")]
+            vec![DocLine::meta(lang.empty_file())]
         } else if markdown::is_markdown(&path) {
             markdown::parse_markdown(&text)
         } else {
             markdown::parse_plain(&text)
         };
         if truncated {
-            doc.push(DocLine::meta(format!(
-                "(truncated at {} lines / {} KiB)",
+            doc.push(DocLine::meta(lang.truncated(
                 preview::MAX_VIEW_LINES,
-                preview::MAX_VIEW_BYTES / 1024
+                preview::MAX_VIEW_BYTES / 1024,
             )));
         }
         self.mode = Mode::Pager(Pager::document(name, doc));
@@ -1117,22 +1109,23 @@ impl App {
 
     fn enter_selected_dir(&mut self) -> Effect {
         let Some(entry) = self.nav.selected().cloned() else {
-            return self.err("nothing selected".to_string());
+            let text = self.lang.nothing_selected().to_string();
+            return self.err(text);
         };
         if entry.is_parent {
             return self.go_up();
         }
         if !entry.is_enterable() {
-            return self.err(format!("'{}' is not a directory", entry.name));
+            return self.err(self.lang.not_a_directory(&entry.name));
         }
         let path = self.nav.cwd.join(&entry.name);
         let canonical = match std::fs::canonicalize(&path) {
             Ok(c) => c,
-            Err(e) => return self.err(fsops::io_error(&path, &e).to_string()),
+            Err(e) => return self.err(fsops::io_error(&path, &e).message(self.lang)),
         };
         match self.nav.change_dir(canonical, None) {
             Ok(()) => Effect::None,
-            Err(e) => self.err(e.to_string()),
+            Err(e) => self.err(e.message(self.lang)),
         }
     }
 
@@ -1169,8 +1162,7 @@ impl App {
     pub fn ladder_summary_with(&self, glyphs: &Glyphs) -> String {
         let depth = bearings::depth_of(&self.nav.cwd, self.home.as_deref());
         let items = self.nav.entries.iter().filter(|e| !e.is_parent).count();
-        let unit = if items == 1 { "item" } else { "items" };
-        format!("depth {depth} {} {items} {unit}", glyphs.dot)
+        self.lang.ladder_summary(depth, items, glyphs.dot)
     }
 
     /// Jump to a visible ancestor. Pure navigation: it goes through
@@ -1179,11 +1171,12 @@ impl App {
     fn jump_to_rung(&mut self, digit: u8) -> Effect {
         let ladder = self.ladder();
         let Some(rung) = ladder.rung(digit) else {
-            return self.err(format!("no ancestor '{digit}' on the ladder"));
+            return self.err(self.lang.no_such_rung(digit));
         };
         let (target, label) = (rung.path.clone(), rung.label.clone());
         if target == self.nav.cwd {
-            self.push_msg(Level::Info, format!("already at {label}"));
+            let note = self.lang.already_at(&label);
+            self.push_msg(Level::Info, note);
             return Effect::None;
         }
         let select = self
@@ -1195,11 +1188,11 @@ impl App {
             .map(|c| c.as_os_str().to_string_lossy().into_owned());
         match self.nav.change_dir(target, select.as_deref()) {
             Ok(()) => {
-                let cwd = self.nav.cwd.display().to_string();
-                self.push_msg(Level::Ok, format!("cwd: {cwd}"));
+                let cwd = self.lang.cwd_line(&self.nav.cwd.display().to_string());
+                self.push_msg(Level::Ok, cwd);
                 Effect::None
             }
-            Err(e) => self.err(e.to_string()),
+            Err(e) => self.err(e.message(self.lang)),
         }
     }
 
@@ -1208,17 +1201,15 @@ impl App {
     /// ninety-seven are reachable.
     fn show_messages(&mut self) -> Effect {
         let lines: Vec<String> = if self.messages.is_empty() {
-            vec!["(no messages yet)".to_string()]
+            vec![self.lang.no_messages_yet().to_string()]
         } else {
             self.messages
                 .iter()
                 .map(|message| format!("{} {}", message.level.prefix(&self.glyphs), message.text))
                 .collect()
         };
-        self.mode = Mode::Pager(Pager::plain(
-            format!("messages ({} of {MAX_MESSAGES})", self.messages.len()),
-            lines,
-        ));
+        let title = self.lang.messages_title(self.messages.len(), MAX_MESSAGES);
+        self.mode = Mode::Pager(Pager::plain(title, lines));
         Effect::None
     }
 
@@ -1226,10 +1217,11 @@ impl App {
         match self.nav.go_up() {
             Ok(true) => Effect::None,
             Ok(false) => {
-                self.push_msg(Level::Info, "already at the filesystem root".to_string());
+                let note = self.lang.at_filesystem_root().to_string();
+                self.push_msg(Level::Info, note);
                 Effect::None
             }
-            Err(e) => self.err(e.to_string()),
+            Err(e) => self.err(e.message(self.lang)),
         }
     }
 
@@ -1238,7 +1230,7 @@ impl App {
     pub fn execute_line(&mut self, line: &str) -> Effect {
         match command::parse(line) {
             Ok(cmd) => self.execute(cmd),
-            Err(e) => self.err(e.to_string()),
+            Err(e) => self.err(e.message(self.lang)),
         }
     }
 
@@ -1256,6 +1248,7 @@ impl App {
             Command::Preview => self.cmd_preview(),
             Command::Summarize => self.cmd_summarize(),
             Command::Log => self.cmd_log(),
+            Command::Language { code } => self.cmd_language(code.as_deref()),
             Command::Help => self.show_help(),
             Command::Quit => self.quit_or_confirm(),
             Command::Agent { args } => self.cmd_agent(args),
@@ -1267,20 +1260,23 @@ impl App {
             Some(p) => p,
             None => match &self.home {
                 Some(home) => home.display().to_string(),
-                None => return self.err("cd: home directory unknown".to_string()),
+                None => {
+                    let text = self.lang.home_unknown().to_string();
+                    return self.err(text);
+                }
             },
         };
         let dir = match fsops::canonical_dir(&self.nav.cwd, &target, self.home.as_deref()) {
             Ok(d) => d,
-            Err(e) => return self.err(format!("cd: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Cd, &e.message(self.lang))),
         };
         match self.nav.change_dir(dir, None) {
             Ok(()) => {
-                let cwd = self.nav.cwd.display().to_string();
-                self.push_msg(Level::Ok, format!("cwd: {cwd}"));
+                let cwd = self.lang.cwd_line(&self.nav.cwd.display().to_string());
+                self.push_msg(Level::Ok, cwd);
                 Effect::None
             }
-            Err(e) => self.err(format!("cd: {e}")),
+            Err(e) => self.err(self.lang.op_says(Op::Cd, &e.message(self.lang))),
         }
     }
 
@@ -1288,10 +1284,10 @@ impl App {
     /// never a valid target.
     fn selected_operand(&self) -> Result<(String, PathBuf), String> {
         let Some(entry) = self.nav.selected() else {
-            return Err("nothing selected".to_string());
+            return Err(self.lang.nothing_selected().to_string());
         };
         if entry.is_parent {
-            return Err("cannot operate on '..' - select a real entry".to_string());
+            return Err(self.lang.cannot_operate_on_parent().to_string());
         }
         Ok((entry.name.clone(), self.nav.cwd.join(&entry.name)))
     }
@@ -1300,14 +1296,14 @@ impl App {
     fn open_move_picker(&mut self) -> Effect {
         let (name, src) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("move: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Move, &e)),
         };
         match FolderPicker::open(&self.nav.cwd, name, src, self.nav.show_hidden) {
             Ok(picker) => {
                 self.mode = Mode::FolderPicker(picker);
                 Effect::None
             }
-            Err(e) => self.err(format!("move: {e}")),
+            Err(e) => self.err(self.lang.op_says(Op::Move, &e.message(self.lang))),
         }
     }
 
@@ -1320,6 +1316,7 @@ impl App {
 
     fn handle_picker_key(&mut self, key: KeyInput) -> Effect {
         let rows = self.picker_rows();
+        let lang = self.lang;
         let mut select = false;
         let mut cancel = false;
         let mut err: Option<String> = None;
@@ -1337,16 +1334,16 @@ impl App {
                 KeyInput::Char('G') | KeyInput::End => picker.cursor_to_end(),
                 KeyInput::Char('l') | KeyInput::Right => {
                     if let Err(e) = picker.enter_focused() {
-                        err = Some(format!("move: {e}"));
+                        err = Some(lang.op_says(Op::Move, &e.message(lang)));
                     }
                 }
                 KeyInput::Backspace | KeyInput::Left | KeyInput::Char('h') => {
                     match picker.go_up() {
                         Ok(true) => {}
                         Ok(false) => {
-                            info = Some("already at the filesystem root".to_string());
+                            info = Some(lang.at_filesystem_root().to_string());
                         }
-                        Err(e) => err = Some(format!("move: {e}")),
+                        Err(e) => err = Some(lang.op_says(Op::Move, &e.message(lang))),
                     }
                 }
                 KeyInput::Enter | KeyInput::Char('m') => select = true,
@@ -1356,7 +1353,7 @@ impl App {
         }
         if cancel {
             self.mode = Mode::Browse;
-            self.push_msg(Level::Info, "cancelled: folder picker".to_string());
+            self.push_msg(Level::Info, lang.cancelled_folder_picker().to_string());
             return Effect::None;
         }
         if select {
@@ -1382,7 +1379,7 @@ impl App {
     fn cmd_move(&mut self, destination: &str) -> Effect {
         let (name, src) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("move: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Move, &e)),
         };
         let dst = match fsops::canonical_move_target(
             &self.nav.cwd,
@@ -1391,22 +1388,28 @@ impl App {
             self.home.as_deref(),
         ) {
             Ok(d) => d,
-            Err(e) => return self.err(format!("move: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Move, &e.message(self.lang))),
         };
         if src == dst {
-            return self.err("move: source and destination are the same".to_string());
+            let text = self.lang.move_same_place().to_string();
+            return self.err(text);
         }
         if std::fs::symlink_metadata(&dst).is_ok() && !fsops::same_file(&src, &dst) {
-            return self.err(format!("move: {}", FsError::AlreadyExists(dst)));
+            let text = self
+                .lang
+                .op_says(Op::Move, &FsError::AlreadyExists(dst).message(self.lang));
+            return self.err(text);
         }
         let src_is_dir = std::fs::symlink_metadata(&src)
             .map(|m| m.is_dir())
             .unwrap_or(false);
         if src_is_dir && dst.starts_with(&src) {
-            return self.err("move: cannot move a directory into itself".to_string());
+            let text = self.lang.move_into_itself().to_string();
+            return self.err(text);
         }
         let op = PendingOp::Move { src, dst };
-        self.push_msg(Level::Info, format!("confirm: {} (y/n)", op.describe()));
+        let line = self.lang.confirm_line(&op.describe(self.lang));
+        self.push_msg(Level::Info, line);
         self.pending = Some(op);
         self.mode = Mode::ConfirmOp;
         Effect::None
@@ -1415,20 +1418,25 @@ impl App {
     fn cmd_rename(&mut self, new_name: &str) -> Effect {
         let (name, src) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("rename: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Rename, &e)),
         };
         if let Err(e) = fsops::validate_new_name(new_name) {
-            return self.err(format!("rename: {e}"));
+            return self.err(self.lang.op_says(Op::Rename, &e.message(self.lang)));
         }
         if new_name == name {
-            return self.err("rename: that is already the current name".to_string());
+            let text = self.lang.rename_same_name().to_string();
+            return self.err(text);
         }
         let dst = self.nav.cwd.join(new_name);
         if std::fs::symlink_metadata(&dst).is_ok() && !fsops::same_file(&src, &dst) {
-            return self.err(format!("rename: {}", FsError::AlreadyExists(dst)));
+            let text = self
+                .lang
+                .op_says(Op::Rename, &FsError::AlreadyExists(dst).message(self.lang));
+            return self.err(text);
         }
         let op = PendingOp::Rename { src, dst };
-        self.push_msg(Level::Info, format!("confirm: {} (y/n)", op.describe()));
+        let line = self.lang.confirm_line(&op.describe(self.lang));
+        self.push_msg(Level::Info, line);
         self.pending = Some(op);
         self.mode = Mode::ConfirmOp;
         Effect::None
@@ -1440,16 +1448,20 @@ impl App {
     fn cmd_trash(&mut self) -> Effect {
         let (name, src) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("delete: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Delete, &e)),
         };
         if let Err(e) = trash::check_trashable(&src) {
-            return self.err(format!("delete: {e}"));
+            return self.err(self.lang.op_says(Op::Delete, &e.message(self.lang)));
         }
         if let Err(e) = std::fs::symlink_metadata(&src) {
-            return self.err(format!("delete: {}", fsops::io_error(&src, &e)));
+            let text = self
+                .lang
+                .op_says(Op::Delete, &fsops::io_error(&src, &e).message(self.lang));
+            return self.err(text);
         }
         let op = PendingOp::Trash { src, name };
-        self.push_msg(Level::Info, format!("confirm: {} (y/n)", op.describe()));
+        let line = self.lang.confirm_line(&op.describe(self.lang));
+        self.push_msg(Level::Info, line);
         self.pending = Some(op);
         self.mode = Mode::ConfirmOp;
         Effect::None
@@ -1462,23 +1474,21 @@ impl App {
         // Re-checked at the moment of execution, not only when armed:
         // between the two the listing may have been refreshed.
         if let Err(e) = trash::check_trashable(src) {
-            return self.err(format!("delete: {e}"));
+            return self.err(self.lang.op_says(Op::Delete, &e.message(self.lang)));
         }
         match self.trasher.trash(src) {
             Ok(()) => {
-                let where_to = self.trasher.destination();
-                self.push_msg(
-                    Level::Ok,
-                    format!("trashed '{name}' -> {where_to} (recoverable from there)"),
-                );
+                let where_to = self.trasher.destination(self.lang);
+                let done = self.lang.trashed(name, &where_to);
+                self.push_msg(Level::Ok, done);
                 if let Err(e) = self.nav.refresh() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
                 Effect::None
             }
             Err(e) => {
                 let _ = self.nav.refresh();
-                self.err(format!("delete: {e}"))
+                self.err(self.lang.op_says(Op::Delete, &e.message(self.lang)))
             }
         }
     }
@@ -1486,11 +1496,14 @@ impl App {
     fn perform_pending(&mut self) -> Effect {
         self.mode = Mode::Browse;
         let Some(op) = self.pending.take() else {
-            return self.err("nothing to confirm".to_string());
+            let text = self.lang.nothing_to_confirm().to_string();
+            return self.err(text);
         };
-        let (src, dst, verb) = match &op {
-            PendingOp::Move { src, dst } => (src.clone(), dst.clone(), "moved"),
-            PendingOp::Rename { src, dst } => (src.clone(), dst.clone(), "renamed"),
+        let renaming = matches!(op, PendingOp::Rename { .. });
+        let (src, dst) = match &op {
+            PendingOp::Move { src, dst } | PendingOp::Rename { src, dst } => {
+                (src.clone(), dst.clone())
+            }
             PendingOp::Trash { src, name } => {
                 let (src, name) = (src.clone(), name.clone());
                 return self.perform_trash(&src, &name);
@@ -1498,12 +1511,15 @@ impl App {
         };
         match fsops::safe_move(&src, &dst) {
             Ok(()) => {
-                self.push_msg(
-                    Level::Ok,
-                    format!("{verb} '{}' -> '{}'", src.display(), dst.display()),
-                );
+                let (from, to) = (src.display().to_string(), dst.display().to_string());
+                let done = if renaming {
+                    self.lang.renamed(&from, &to)
+                } else {
+                    self.lang.moved(&from, &to)
+                };
+                self.push_msg(Level::Ok, done);
                 if let Err(e) = self.nav.refresh() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
                 // Keep the selection on the result when it landed in the
                 // current directory.
@@ -1523,7 +1539,7 @@ impl App {
             }
             Err(e) => {
                 let _ = self.nav.refresh();
-                self.err(e.to_string())
+                self.err(e.message(self.lang))
             }
         }
     }
@@ -1531,12 +1547,14 @@ impl App {
     fn cmd_open(&mut self) -> Effect {
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("open: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Open, &e)),
         };
         if !cfg!(target_os = "macos") {
-            return self.err("open: only supported on macOS (uses /usr/bin/open)".to_string());
+            let text = self.lang.open_macos_only().to_string();
+            return self.err(text);
         }
-        self.push_msg(Level::Ok, format!("open: handing '{name}' to macOS open"));
+        let note = self.lang.opening_with_macos(&name);
+        self.push_msg(Level::Ok, note);
         Effect::SpawnDetached {
             argv: vec![
                 "/usr/bin/open".to_string(),
@@ -1549,47 +1567,47 @@ impl App {
     fn cmd_edit(&mut self) -> Effect {
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("edit: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Edit, &e)),
         };
         let Some(entry) = self.nav.selected() else {
-            return self.err("edit: nothing selected".to_string());
+            return self.err(self.lang.op_says(Op::Edit, self.lang.nothing_selected()));
         };
         if !entry.is_file_like() {
-            return self.err(format!("edit: '{name}' is not a regular file"));
+            return self.err(self.lang.not_a_regular_file(&name));
         }
         let argv = editor::build_edit_command(self.editor_env.as_deref(), &path);
-        self.push_msg(Level::Ok, format!("edit: opening '{name}' in {}", argv[0]));
+        let note = self.lang.opening_in_editor(&name, &argv[0]);
+        self.push_msg(Level::Ok, note);
         Effect::RunInteractive { argv }
     }
 
     fn cmd_preview(&mut self) -> Effect {
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
-            Err(e) => return self.err(format!("preview: {e}")),
+            Err(e) => return self.err(self.lang.op_says(Op::Preview, &e)),
         };
         let Some(entry) = self.nav.selected() else {
-            return self.err("preview: nothing selected".to_string());
+            return self.err(self.lang.op_says(Op::Preview, self.lang.nothing_selected()));
         };
         if entry.is_file_like() && self.nvim_on_path {
             match preview::sniff(&path) {
                 Ok(sample) if !sample.is_empty() && preview::is_probably_text(&sample) => {
                     let argv = editor::build_preview_command(&path);
-                    self.push_msg(
-                        Level::Ok,
-                        format!("preview: opening '{name}' read-only in nvim"),
-                    );
+                    let note = self.lang.opening_preview(&name);
+                    self.push_msg(Level::Ok, note);
                     return Effect::RunInteractive { argv };
                 }
                 Ok(_) => {}
-                Err(e) => return self.err(format!("preview: {e}")),
+                Err(e) => return self.err(self.lang.op_says(Op::Preview, &e.message(self.lang))),
             }
         }
-        match preview::build_preview(&path) {
+        match preview::build_preview(&path, self.lang) {
             Ok(PreviewData { title, lines }) => {
-                self.mode = Mode::Pager(Pager::plain(format!("preview: {title}"), lines));
+                let heading = self.lang.preview_title(&title);
+                self.mode = Mode::Pager(Pager::plain(heading, lines));
                 Effect::None
             }
-            Err(e) => self.err(format!("preview: {e}")),
+            Err(e) => self.err(self.lang.op_says(Op::Preview, &e.message(self.lang))),
         }
     }
 
@@ -1606,152 +1624,86 @@ impl App {
         };
         debug_assert!(!seam.is_enabled(), "v0 must never ship an enabled agent");
         let reply = seam.handle(&request);
-        self.push_msg(Level::Info, "agent: not configured in v0".to_string());
-        self.mode = Mode::Pager(Pager::plain("agent (not configured)", reply.lines));
+        let note = self.lang.agent_disabled().to_string();
+        self.push_msg(Level::Info, note);
+        self.mode = Mode::Pager(Pager::plain(self.lang.agent_title(), reply.lines));
         Effect::None
     }
 
     fn show_help(&mut self) -> Effect {
-        self.mode = Mode::Pager(Pager::plain("help", help_lines()));
+        self.mode = Mode::Pager(Pager::plain(self.lang.help_title(), help_lines(self.lang)));
+        Effect::None
+    }
+
+    /// `:lang` / `:language` - the screen's language.
+    ///
+    /// With no code it reports the current one, so a user who cannot
+    /// read the screen still has a way to find out what to type. With a
+    /// code it switches every phrase at the next frame and writes the
+    /// choice down, and a preference that could not be written down is
+    /// said out loud rather than swallowed: the session is still in the
+    /// new language, and the user knows the next one will not be.
+    fn cmd_language(&mut self, code: Option<&str>) -> Effect {
+        let Some(code) = code else {
+            let line = self.lang.language_is(self.lang.endonym(), self.lang.code());
+            self.push_msg(Level::Info, line);
+            return Effect::None;
+        };
+        let Some(lang) = Lang::parse(code) else {
+            let codes = Lang::ALL
+                .iter()
+                .map(|l| format!("{} ({})", l.code(), l.endonym()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return self.err(self.lang.unknown_language(code, &codes));
+        };
+        // The confirmation is already in the new language: it is the
+        // first evidence that the switch took.
+        self.lang = lang;
+        let set = lang.language_set(lang.endonym(), lang.code());
+        self.push_msg(Level::Ok, set);
+        match &self.config_path {
+            Some(path) => {
+                let path = path.clone();
+                match config::save(&path, lang) {
+                    Ok(()) => {
+                        let saved = lang.language_saved(&path.display().to_string());
+                        self.push_msg(Level::Info, saved);
+                    }
+                    Err(e) => {
+                        let note = lang.language_not_saved(&e.to_string());
+                        self.push_msg(Level::Error, note);
+                    }
+                }
+            }
+            None => {
+                let note = lang.language_not_saved(lang.fs_home_not_found());
+                self.push_msg(Level::Error, note);
+            }
+        }
         Effect::None
     }
 }
 
 /// The full help text, shared by the `?` key and the `help` command.
-pub fn help_lines() -> Vec<String> {
-    [
-        "FILECRAFT - keyboard-first BBS file navigator",
-        "",
-        "KEYS (browse)",
-        "  j / k, Down / Up     move focus",
-        "  PgUp / PgDn          move focus a page",
-        "  g / G                first / last entry",
-        "  Enter                enter directory, or edit selected file",
-        "  l, Right             enter directory, or read the selected file",
-        "  h, Left, Backspace   go to parent directory",
-        "  0-9                  jump to that ancestor on the ladder",
-        "  d                    move selected entry to the Trash (asks y/n)",
-        "  S                    AI summary: pick files, then a provider",
-        "  /                    filter the listing (Esc clears)",
-        "  :                    command prompt",
-        "  .                    show/hide dotfiles",
-        "  r                    refresh listing",
-        "  M                    message history",
-        "  L                    live log of the AI run (also after it ends)",
-        "  ?                    this help",
-        "  Esc                  back out one level (clears a filter)",
-        "  q, Ctrl-C            quit",
-        "",
-        "KEYS (reader - l on a text or Markdown file)",
-        "  j / k, Down / Up     scroll one line",
-        "  d / u                scroll half a page",
-        "  f / b, PgDn / PgUp   scroll a page",
-        "  g / G, Home / End    top / bottom",
-        "  /                    find in this file (Enter searches)",
-        "  n / N                next / previous match",
-        "  h, q, Esc            back to the listing, on the same row",
-        "",
-        "KEYS (log viewer - L, :log or :job)",
-        "  j / k, Down / Up     scroll one line",
-        "  d / u                scroll half a page",
-        "  f / b, PgDn / PgUp   scroll a page",
-        "  g / G, Home / End    top / bottom",
-        "  /                    find in the log (Enter searches)",
-        "  n / N                next / previous match",
-        "  h, q, Esc            back to the listing - the run keeps going",
-        "  (new output follows the view while you are at the bottom;",
-        "   scroll up to hold your place, G to follow again)",
-        "  (NNN | is stdout, NNN ! is stderr; the header names the",
-        "   session and the command that reopens it in the provider)",
-        "",
-        "KEYS (confirmation prompt)",
-        "  y                    go ahead",
-        "  Enter                go ahead - move and rename only, not trash",
-        "  n, q, Esc            cancel - nothing is touched",
-        "",
-        "KEYS (file selector - S or :summarize)",
-        "  j / k, Down / Up     move focus",
-        "  PgUp / PgDn          move focus a page",
-        "  Space                select / unselect the focused file",
-        "  l, Right             enter the focused folder",
-        "  h, Left, Backspace   go to parent directory",
-        "  g / G                first / last row",
-        "  Enter, c             confirm the selection, then pick a provider",
-        "  q, Esc               cancel, back to the listing",
-        "  (.pdf .md .markdown .txt only; the selection spans folders)",
-        "",
-        "KEYS (provider dialog)",
-        "  1 - 5                run that provider",
-        "  Enter                run the default, ag (agy)",
-        "  q, Esc               cancel, nothing is run",
-        "",
-        "KEYS (quit with a summary running)",
-        "  y                    terminate the summary and quit",
-        "  n, Esc               keep it running, stay in filecraft",
-        "",
-        "KEYS (folder picker - :move with no path)",
-        "  j / k, Down / Up     move focus",
-        "  PgUp / PgDn          move focus a page",
-        "  l, Right             enter the focused folder",
-        "  h, Left, Backspace   go to parent directory",
-        "  g / G                first / last folder",
-        "  Enter, m             choose the focused folder (then y/n)",
-        "  q, Esc               cancel, back to the listing",
-        "",
-        "COMMANDS (at the : prompt)",
-        "  cd [path]            change directory (~ ok; quote spaces)",
-        "  move [destination]   folder picker, or a path (asks y/n first)",
-        "  rename <new-name>    rename selected entry (asks y/n first)",
-        "  delete, trash        move selected entry to the Trash (asks y/n)",
-        "  open                 open selected entry with macOS 'open'",
-        "  edit                 edit selected file in $EDITOR (or nvim)",
-        "  preview              read-only preview (nvim -R, or built-in)",
-        "  summarize, summary   AI summary of files you pick (same as S)",
-        "  log, job             the AI run's own output (same as L)",
-        "  agent [...]          future AI seam - disabled in v0",
-        "  help                 this help",
-        "  quit                 leave filecraft",
-        "",
-        "SAFETY",
-        "  - the reader is read-only: no key in it can change a file",
-        "  - moves and renames never overwrite and always ask first",
-        "  - delete is a move to the Trash: recoverable, never an unlink",
-        "  - nothing is ever removed permanently, recursively or otherwise",
-        "  - commands are parsed directly; nothing touches a shell",
-        "  - filecraft itself opens no network connection and keeps no",
-        "    telemetry; 'summarize' runs an AI CLI you already have, on",
-        "    files you picked, and that program may use the network",
-        "  - a summary is never started, and no file is read for one,",
-        "    until you select files and choose a provider",
-        "  - the summary is a new .md file; it never overwrites one",
-        "  - the log viewer only reads: closing it never stops a run,",
-        "    and no key in it starts, resumes, or answers one",
-        "  - the resume command is printed for you to run yourself;",
-        "    filecraft never runs it",
-        "",
-        "MARKERS   name/ directory   name@ symlink   name@! broken symlink",
-        "",
-        "BEARINGS",
-        "  - the ladder row is read-only: digits jump, nothing else acts there",
-        "  - the rail column shows where the viewport sits in the listing",
-        "  - the status row says the same thing in words, for speech",
-        "",
-        "press h, q, or Esc to close this help",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+///
+/// A thin forward to [`Lang::help_lines`]: the words live with every
+/// other phrase, and this is the name the rest of the crate knows.
+pub fn help_lines(lang: Lang) -> Vec<String> {
+    lang.help_lines()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
+    use crate::summarize::Failure;
     use std::fs;
     use std::sync::Mutex;
 
     fn app_in(tmp: &tempfile::TempDir) -> App {
         let nav = NavState::new(tmp.path()).unwrap();
-        App::new(nav, None, false, None)
+        App::new(nav, None, false, None, Lang::En)
     }
 
     /// An app whose Trash is a directory under a fixture, so `delete`
@@ -1837,11 +1789,11 @@ mod tests {
         terminated: std::sync::Arc<std::sync::atomic::AtomicBool>,
         streams: std::sync::Arc<Mutex<Vec<stream::Handle>>>,
         outcome: Option<Outcome>,
-        fail: Option<String>,
+        fail: Option<Failure>,
     }
 
     impl Runner for FakeRunner {
-        fn start(&self, spec: &JobSpec, live: &stream::Handle) -> Result<Box<dyn Job>, String> {
+        fn start(&self, spec: &JobSpec, live: &stream::Handle) -> Result<Box<dyn Job>, Failure> {
             if let Some(reason) = &self.fail {
                 return Err(reason.clone());
             }
@@ -1950,11 +1902,11 @@ mod tests {
         app.handle_key(KeyInput::Char(' '));
         assert_eq!(selector(&app).count(), 1);
         assert!(last_msg(&app).text.contains("selected 'notes.md'"));
-        assert_eq!(selector(&app).header_line(), "selected: 1 file");
+        assert_eq!(selector(&app).header_line(Lang::En), "selected: 1 file");
 
         focus_row(&mut app, "report.pdf");
         app.handle_key(KeyInput::Char(' '));
-        assert_eq!(selector(&app).header_line(), "selected: 2 files");
+        assert_eq!(selector(&app).header_line(Lang::En), "selected: 2 files");
 
         // Down into a folder, and the selection comes along.
         focus_row(&mut app, "deep");
@@ -2157,7 +2109,9 @@ mod tests {
         let (mut app, _runner) = app_with_runner(
             &tmp,
             FakeRunner {
-                outcome: Some(Outcome::Failed("agy: not logged in".to_string())),
+                outcome: Some(Outcome::Failed(Failure::Provider(
+                    "agy: not logged in".to_string(),
+                ))),
                 ..FakeRunner::default()
             },
         );
@@ -2174,7 +2128,10 @@ mod tests {
         let (mut app, _runner) = app_with_runner(
             &tmp,
             FakeRunner {
-                fail: Some("could not run 'agy': No such file or directory".to_string()),
+                fail: Some(Failure::Spawn {
+                    program: "agy".to_string(),
+                    detail: "No such file or directory".to_string(),
+                }),
                 ..FakeRunner::default()
             },
         );
@@ -2274,9 +2231,250 @@ mod tests {
         assert_eq!(app.mode, Mode::ConfirmQuit);
     }
 
+    /// A run that fails is where a half-finished localization shows: the
+    /// screen says why in the user's language, and the one part that is
+    /// evidence rather than prose - the provider's own last line - comes
+    /// through exactly as the provider said it.
+    #[test]
+    fn a_failed_run_is_reported_in_the_screens_language() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Failed(Failure::NoOutput)),
+                ..FakeRunner::default()
+            },
+        );
+        app.lang = Lang::ZhTw;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        app.poll_job();
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert_eq!(last_msg(&app).text, "摘要: AI 模型沒有輸出任何內容");
+
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                outcome: Some(Outcome::Failed(Failure::Provider(
+                    "agy: not logged in".to_string(),
+                ))),
+                ..FakeRunner::default()
+            },
+        );
+        app.lang = Lang::ZhTw;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        app.poll_job();
+        assert_eq!(last_msg(&app).text, "摘要: agy: not logged in");
+    }
+
+    #[test]
+    fn a_run_that_could_not_start_says_why_in_the_screens_language() {
+        let tmp = docs_fixture();
+        let (mut app, _runner) = app_with_runner(
+            &tmp,
+            FakeRunner {
+                fail: Some(Failure::Spawn {
+                    program: "agy".to_string(),
+                    detail: "No such file or directory".to_string(),
+                }),
+                ..FakeRunner::default()
+            },
+        );
+        app.lang = Lang::ZhTw;
+        run_summary(&mut app, &["notes.md"], KeyInput::Enter);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert_eq!(
+            last_msg(&app).text,
+            "摘要: 無法執行 'agy'：No such file or directory"
+        );
+        // The same failure, in English, is what the Markdown note in the
+        // reserved file would carry.
+        assert_eq!(
+            crate::summarize::failure_note(&Failure::Spawn {
+                program: "agy".to_string(),
+                detail: "No such file or directory".to_string(),
+            }),
+            "# Summary failed\n\ncould not run 'agy': No such file or directory\n"
+        );
+    }
+
+    /// `:lang` with no code: a user who cannot read the screen still
+    /// has a way to find out what to type.
+    #[test]
+    fn lang_with_no_code_reports_the_current_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.execute_line("lang"), Effect::None);
+        assert_eq!(app.lang, Lang::En);
+        let text = &last_msg(&app).text;
+        assert!(text.contains("English"), "{text}");
+        assert!(text.contains("(en)"), "{text}");
+    }
+
+    #[test]
+    fn lang_switches_the_whole_screen_and_says_so_in_the_new_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.execute_line("lang zh"), Effect::None);
+        assert_eq!(app.lang, Lang::ZhTw);
+        // The confirmation is the first evidence that the switch took,
+        // so it is already in the language that was asked for.
+        let confirmed = app
+            .messages
+            .iter()
+            .any(|m| m.text.contains("語言已設定為 繁體中文 (zh-TW)"));
+        assert!(confirmed, "{:?}", app.messages);
+        // And so is everything the screen goes on to say.
+        app.execute_line("help");
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected the help reader");
+        };
+        assert_eq!(pager.title, "說明");
+        assert!(pager.text().contains("鍵盤優先"));
+    }
+
+    #[test]
+    fn language_is_the_alias_and_every_spelling_of_the_code_is_taken() {
+        for code in ["zh", "zh-TW", "zh_TW", "ZH-tw", "zh-Hant"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = app_in(&tmp);
+            app.execute_line(&format!("language {code}"));
+            assert_eq!(app.lang, Lang::ZhTw, "'{code}' should select zh-TW");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.lang = Lang::ZhTw;
+        app.execute_line("lang en");
+        assert_eq!(app.lang, Lang::En);
+    }
+
+    #[test]
+    fn an_unknown_language_changes_nothing_and_lists_the_ones_there_are() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.execute_line("lang klingon"), Effect::None);
+        assert_eq!(app.lang, Lang::En, "an unknown code must change nothing");
+        let text = &last_msg(&app).text;
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(text.contains("klingon"), "{text}");
+        for lang in Lang::ALL {
+            assert!(text.contains(lang.code()), "{text}");
+            assert!(text.contains(lang.endonym()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_language_change_is_written_down_for_next_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("cfg").join("config.toml");
+        let mut app = app_in(&tmp);
+        app.config_path = Some(config.clone());
+
+        app.execute_line("lang zh-TW");
+        let text = std::fs::read_to_string(&config).expect("the preference was not saved");
+        assert_eq!(crate::config::read_language(&text), Some("zh-TW"));
+        assert!(
+            app.messages.iter().any(|m| m.text.contains("已儲存至")),
+            "{:?}",
+            app.messages
+        );
+
+        // Switching back rewrites the same file rather than appending.
+        app.execute_line("lang en");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(crate::config::read_language(&text), Some("en"));
+        assert_eq!(text.matches("language =").count(), 1, "{text}");
+    }
+
+    /// A preference that could not be written down is said out loud: the
+    /// session is in the new language, and the user knows the next one
+    /// will not be.
+    #[test]
+    fn a_language_change_that_cannot_be_saved_says_so_rather_than_pretending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.config_path, None);
+        app.execute_line("lang zh");
+        assert_eq!(app.lang, Lang::ZhTw, "the session still switched");
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.contains("僅套用於本次執行"));
+    }
+
+    #[test]
+    fn lang_takes_at_most_one_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.execute_line("lang en zh");
+        assert_eq!(app.lang, Lang::En);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(last_msg(&app).text.starts_with("usage: lang"));
+    }
+
+    /// Switching language is a screen change and nothing else: it moves
+    /// no file, and it does not touch a run in flight.
+    #[test]
+    fn switching_language_touches_nothing_but_the_screen() {
+        let tmp = docs_fixture();
+        let can = tempfile::tempdir().unwrap();
+        let before = snapshot(tmp.path());
+        let mut app = app_with_can(&tmp, &can);
+        let (cwd, cursor) = (app.nav.cwd.clone(), app.nav.cursor);
+        app.execute_line("lang zh");
+        app.execute_line("lang en");
+        assert_eq!(snapshot(tmp.path()), before);
+        assert!(can_contents(&can).is_empty());
+        assert_eq!(app.nav.cwd, cwd);
+        assert_eq!(app.nav.cursor, cursor);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.pending.is_none());
+        assert!(app.job.is_none(), "no key or command here starts a run");
+    }
+
+    /// Everything the message log says after a switch is in the new
+    /// language: the log is a record, so lines written before it stay as
+    /// they were said.
+    #[test]
+    fn a_switch_changes_what_is_said_next_not_what_was_already_said() {
+        let tmp = docs_fixture();
+        let mut app = app_in(&tmp);
+        app.handle_key(KeyInput::Char('.'));
+        assert!(last_msg(&app).text.contains("dotfiles"));
+        app.execute_line("lang zh");
+        app.handle_key(KeyInput::Char('.'));
+        assert!(
+            last_msg(&app).text.contains("隱藏檔"),
+            "{:?}",
+            last_msg(&app)
+        );
+        assert!(
+            app.messages.iter().any(|m| m.text.contains("dotfiles")),
+            "the log must keep what it already said"
+        );
+    }
+
+    #[test]
+    fn browse_refresh_errors_use_the_screen_language() {
+        for key in [KeyInput::Char('.'), KeyInput::Char('r')] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = app_in(&tmp);
+            app.lang = Lang::ZhTw;
+            let file = tmp.path().join("not-a-directory");
+            fs::write(&file, "plain file").unwrap();
+            app.nav.cwd = file;
+
+            app.handle_key(key);
+
+            assert_eq!(last_msg(&app).level, Level::Error);
+            assert!(
+                last_msg(&app).text.contains("不是目錄"),
+                "{:?}",
+                last_msg(&app)
+            );
+        }
+    }
+
     #[test]
     fn the_help_documents_every_key_the_summarizer_adds() {
-        let help = help_lines().join("\n");
+        let help = help_lines(Lang::En).join("\n");
         for needed in [
             "S ",
             "Space",
@@ -2386,7 +2584,7 @@ mod tests {
             .live()
             .append(stream::Origin::Err, "session id: 01a04eef-d4a6\n");
         app.handle_key(KeyInput::Char('L'));
-        let [top, bottom] = log_pane(&app).header(&app.glyphs);
+        let [top, bottom] = log_pane(&app).header(&app.glyphs, Lang::En);
         assert!(top.starts_with("codex "), "{top:?}");
         assert_eq!(
             bottom,
@@ -2538,7 +2736,10 @@ mod tests {
         let (mut app, _) = app_with_runner(
             &tmp,
             FakeRunner {
-                fail: Some("could not run 'agy': No such file".to_string()),
+                fail: Some(Failure::Spawn {
+                    program: "agy".to_string(),
+                    detail: "No such file".to_string(),
+                }),
                 ..FakeRunner::default()
             },
         );
@@ -2598,7 +2799,7 @@ mod tests {
 
     #[test]
     fn help_documents_the_log_viewer_and_both_its_commands() {
-        let help = help_lines().join("\n");
+        let help = help_lines(Lang::En).join("\n");
         for needed in [
             "L ",
             "KEYS (log viewer",
@@ -2667,8 +2868,8 @@ mod tests {
         app.execute_line("move archive");
         assert_eq!(app.mode, Mode::ConfirmOp);
         let pending = app.pending.clone().unwrap();
-        assert!(pending.describe().contains("note.txt"));
-        assert!(pending.describe().contains("archive"));
+        assert!(pending.describe(Lang::En).contains("note.txt"));
+        assert!(pending.describe(Lang::En).contains("archive"));
         // Not moved yet.
         assert!(tmp.path().join("note.txt").exists());
 
@@ -2742,7 +2943,7 @@ mod tests {
         assert_eq!(picker(&app).cursor, picker(&app).entries.len() - 1);
         app.handle_key(KeyInput::Char('g'));
         assert_eq!(picker(&app).cursor, 0);
-        assert!(picker(&app).dest_line().starts_with("dest: "));
+        assert!(picker(&app).dest_line(Lang::En).starts_with("dest: "));
     }
 
     #[test]
@@ -2799,8 +3000,8 @@ mod tests {
         app.handle_key(KeyInput::Enter);
         assert_eq!(app.mode, Mode::ConfirmOp);
         let pending = app.pending.clone().unwrap();
-        assert!(pending.describe().contains("note.txt"));
-        assert!(pending.describe().contains("archive"));
+        assert!(pending.describe(Lang::En).contains("note.txt"));
+        assert!(pending.describe(Lang::En).contains("archive"));
         assert!(tmp.path().join("note.txt").exists());
 
         app.handle_key(KeyInput::Char('y'));
@@ -2830,7 +3031,12 @@ mod tests {
         }
         app.handle_key(KeyInput::Char('m'));
         assert_eq!(app.mode, Mode::ConfirmOp);
-        assert!(app.pending.as_ref().unwrap().describe().contains("docs"));
+        assert!(app
+            .pending
+            .as_ref()
+            .unwrap()
+            .describe(Lang::En)
+            .contains("docs"));
         assert!(tmp.path().join("note.txt").exists());
     }
 
@@ -2983,7 +3189,7 @@ mod tests {
         assert_eq!(app.mode, Mode::ConfirmOp);
         assert!(tmp.path().join("notes.md").exists(), "armed is not done");
         assert_eq!(
-            app.pending.as_ref().unwrap().describe(),
+            app.pending.as_ref().unwrap().describe(Lang::En),
             "trash 'notes.md'",
             "the prompt names the entry the listing names"
         );
@@ -3015,7 +3221,10 @@ mod tests {
         select(&mut app, "a.txt");
 
         app.execute_line("trash");
-        assert_eq!(app.pending.as_ref().unwrap().describe(), "trash 'a.txt'");
+        assert_eq!(
+            app.pending.as_ref().unwrap().describe(Lang::En),
+            "trash 'a.txt'"
+        );
     }
 
     #[test]
@@ -3028,7 +3237,10 @@ mod tests {
 
         app.handle_key(KeyInput::Char('d'));
         assert_eq!(app.mode, Mode::ConfirmOp);
-        assert_eq!(app.pending.as_ref().unwrap().describe(), "trash 'a.txt'");
+        assert_eq!(
+            app.pending.as_ref().unwrap().describe(Lang::En),
+            "trash 'a.txt'"
+        );
         assert!(
             tmp.path().join("a.txt").exists(),
             "d alone must touch nothing"
@@ -3225,7 +3437,7 @@ mod tests {
 
     #[test]
     fn the_help_documents_delete_everywhere_it_is_bound() {
-        let help = help_lines().join("\n");
+        let help = help_lines(Lang::En).join("\n");
         assert!(help.contains("  d  "), "the browse key is missing:\n{help}");
         assert!(help.contains("delete, trash"), "the commands are missing");
         assert!(
@@ -3363,7 +3575,13 @@ mod tests {
         fs::write(tmp.path().join("doc.md"), "d").unwrap();
         fs::create_dir(tmp.path().join("dir")).unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let mut app = App::new(nav, Some("myedit --fast".to_string()), false, None);
+        let mut app = App::new(
+            nav,
+            Some("myedit --fast".to_string()),
+            false,
+            None,
+            Lang::En,
+        );
 
         select(&mut app, "doc.md");
         let effect = app.execute_line("edit");
@@ -3535,6 +3753,7 @@ mod tests {
             None,
             false,
             None,
+            Lang::En,
         );
         let Some(pos) = app
             .nav
@@ -3610,7 +3829,9 @@ mod tests {
         assert_eq!(pager.scroll, Pager::max_scroll(100, view));
         // The footer reports the last page, not line 1 of the file.
         assert_eq!(pager.top_line(width, &glyphs), 100 - view);
-        assert!(pager.position(width, view, &glyphs).ends_with("100%"));
+        assert!(pager
+            .position(width, view, &glyphs, Lang::En)
+            .ends_with("100%"));
 
         // A search resumes from the visible position: "line 9" also
         // matches source line 9, and a stale offset would have landed
@@ -3625,7 +3846,7 @@ mod tests {
 
     #[test]
     fn the_help_documents_every_reader_key_that_is_bound() {
-        let help = help_lines().join("\n");
+        let help = help_lines(Lang::En).join("\n");
         for key in ["j / k", "d / u", "f / b", "PgDn / PgUp", "g / G", "n / N"] {
             assert!(help.contains(key), "help never mentions {key}");
         }
@@ -3633,7 +3854,7 @@ mod tests {
 
     #[test]
     fn the_help_documents_the_folder_picker() {
-        let help = help_lines().join("\n");
+        let help = help_lines(Lang::En).join("\n");
         assert!(help.contains("KEYS (folder picker"));
         assert!(help.contains("choose the focused folder"));
         assert!(help.contains("move [destination]"));
@@ -3878,6 +4099,7 @@ mod tests {
             None,
             false,
             Some(root.clone()),
+            Lang::En,
         );
 
         let ladder = app.ladder();
@@ -3907,6 +4129,7 @@ mod tests {
             None,
             false,
             Some(root.clone()),
+            Lang::En,
         );
         app.nav.set_filter("nothing".to_string());
         app.handle_key(KeyInput::Char('3'));
@@ -3922,7 +4145,13 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("keep.txt"), "k").unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let mut app = App::new(NavState::new(&deep).unwrap(), None, false, Some(root));
+        let mut app = App::new(
+            NavState::new(&deep).unwrap(),
+            None,
+            false,
+            Some(root),
+            Lang::En,
+        );
         for digit in '0'..='9' {
             app.handle_key(KeyInput::Char(digit));
         }
@@ -3937,7 +4166,13 @@ mod tests {
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::write(tmp.path().join("one.txt"), "1").unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        let app = App::new(NavState::new(&root).unwrap(), None, false, Some(root));
+        let app = App::new(
+            NavState::new(&root).unwrap(),
+            None,
+            false,
+            Some(root),
+            Lang::En,
+        );
         assert_eq!(app.ladder_summary(), "depth 0 · 2 items");
     }
 
@@ -4088,7 +4323,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("doc.txt"), "text").unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let mut app = App::new(nav, None, true, None);
+        let mut app = App::new(nav, None, true, None, Lang::En);
         select(&mut app, "doc.txt");
         let effect = app.execute_line("preview");
         let Effect::RunInteractive { argv } = effect else {
@@ -4102,7 +4337,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("blob.bin"), [0u8, 1, 2]).unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let mut app = App::new(nav, None, true, None);
+        let mut app = App::new(nav, None, true, None, Lang::En);
         select(&mut app, "blob.bin");
         assert_eq!(app.execute_line("preview"), Effect::None);
         let Mode::Pager(pager) = &app.mode else {
@@ -4137,7 +4372,7 @@ mod tests {
         let home = tmp.path().join("home");
         fs::create_dir(&home).unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let mut app = App::new(nav, None, false, Some(home.clone()));
+        let mut app = App::new(nav, None, false, Some(home.clone()), Lang::En);
         app.execute_line("cd ~");
         assert_eq!(app.nav.cwd, home.canonicalize().unwrap());
         app.execute_line("cd");
