@@ -10,10 +10,11 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 
 - `cargo test` is the full local test command (module tests plus `tests/cli.rs`).
 - `cargo run -- --list [DIR]` is the non-TTY listing path.
-- `src/bearings.rs` owns every pure display computation (ladder, rail,
-  scroll margin, relative time, speakable status, width padding,
-  sanitizing, hanging-indent wrapping). Put new rendering arithmetic
-  there, not in `ui.rs`, so it stays testable without a TTY.
+- `src/bearings.rs` owns the shared pure display primitives (ladder,
+  rail, scroll margin, relative time, speakable status, width padding,
+  sanitizing, hanging-indent wrapping). Pane-specific modules build on
+  them; keep rendering arithmetic out of `ui.rs` so it stays testable
+  without a TTY.
 - The reader (`l` on a text/Markdown file) splits the same way:
   `src/markdown.rs` classifies lines and wraps them to a column budget,
   `src/pager.rs` owns scroll/search/position, `ui.rs` only turns a
