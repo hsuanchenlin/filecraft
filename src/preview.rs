@@ -256,11 +256,20 @@ pub fn format_mode(mode: u32) -> String {
     };
     let mut out = String::with_capacity(10);
     out.push(file_type);
-    for shift in [6u32, 3, 0] {
+    for (shift, special, enabled, disabled) in [
+        (6u32, 0o4000, 's', 'S'),
+        (3, 0o2000, 's', 'S'),
+        (0, 0o1000, 't', 'T'),
+    ] {
         let bits = (mode >> shift) & 0o7;
         out.push(if bits & 0o4 != 0 { 'r' } else { '-' });
         out.push(if bits & 0o2 != 0 { 'w' } else { '-' });
-        out.push(if bits & 0o1 != 0 { 'x' } else { '-' });
+        out.push(match (mode & special != 0, bits & 0o1 != 0) {
+            (true, true) => enabled,
+            (true, false) => disabled,
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
     }
     out
 }
@@ -420,12 +429,17 @@ mod tests {
         assert_eq!(format_size(1_181_116_006), "1.1G");
     }
 
-    #[cfg(unix)]
     #[test]
     fn mode_formatting() {
         assert_eq!(format_mode(0o100644), "-rw-r--r--");
         assert_eq!(format_mode(0o040755), "drwxr-xr-x");
         assert_eq!(format_mode(0o120777), "lrwxrwxrwx");
+        assert_eq!(format_mode(0o104700), "-rws------");
+        assert_eq!(format_mode(0o104600), "-rwS------");
+        assert_eq!(format_mode(0o102070), "----rws---");
+        assert_eq!(format_mode(0o102060), "----rwS---");
+        assert_eq!(format_mode(0o101007), "-------rwt");
+        assert_eq!(format_mode(0o101006), "-------rwT");
     }
 
     #[test]
