@@ -2464,7 +2464,11 @@ mod tests {
             app.handle_key(key);
 
             assert_eq!(last_msg(&app).level, Level::Error);
-            assert!(last_msg(&app).text.contains("不是目錄"), "{:?}", last_msg(&app));
+            assert!(
+                last_msg(&app).text.contains("不是目錄"),
+                "{:?}",
+                last_msg(&app)
+            );
         }
     }
 

@@ -181,7 +181,8 @@ Change it from inside Filecraft at the `:` prompt:
 ```
 
 The switch takes effect on the next frame and is written to
-`~/.config/filecraft/config.toml` (or `$XDG_CONFIG_HOME/filecraft/`) so
+`~/.config/filecraft/config.toml` (or
+`$XDG_CONFIG_HOME/filecraft/config.toml`) so
 the next session starts in it. Only the `language` key is touched -
 comments, blank lines, and any other key in the file are preserved. If
 the preference could not be written down, Filecraft says so: the session
