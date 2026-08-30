@@ -271,6 +271,48 @@ phrases! {
     /// language, exactly as `/`, `@`, and `@!` are.
     dir_marker => "<DIR>" | "<DIR>",
 
+    // ---- Listing column headers ----------------------------------------
+    // Drawn above the rows and measured, never counted: `修改時間` is the
+    // same eight cells `MODIFIED` is, because a Han character owns two.
+    column_name => "NAME" | "名稱",
+    column_size => "SIZE" | "大小",
+    column_modified => "MODIFIED" | "修改時間",
+    column_created => "CREATED" | "建立時間",
+    column_kind => "KIND" | "種類",
+    column_permissions => "PERMISSIONS" | "權限",
+    column_owner => "OWNER" | "擁有者",
+    /// The `:columns` picker's last row: the header switch itself, so
+    /// everything the command governs is in one list.
+    column_header_row => "column header row" | "欄位標題列",
+
+    // ---- What kind of document a `kind` cell names ----------------------
+    // A file format's own name is a marker, not a word: `Markdown` and
+    // `PDF` are spelled the same in both languages, exactly as `<DIR>`
+    // is. Everything that *is* a word is translated.
+    filekind_directory => "Directory" | "目錄",
+    filekind_symlink => "Symlink" | "符號連結",
+    filekind_broken_link => "Broken" | "失效連結",
+    filekind_special => "Special" | "特殊檔案",
+    filekind_markdown => "Markdown" | "Markdown",
+    filekind_text => "Text" | "文字",
+    filekind_pdf => "PDF" | "PDF",
+    filekind_rust => "Rust" | "Rust",
+    filekind_toml => "TOML" | "TOML",
+    filekind_json => "JSON" | "JSON",
+    filekind_yaml => "YAML" | "YAML",
+    filekind_html => "HTML" | "HTML",
+    filekind_css => "CSS" | "CSS",
+    filekind_javascript => "JavaScript" | "JavaScript",
+    filekind_typescript => "TypeScript" | "TypeScript",
+    filekind_python => "Python" | "Python",
+    filekind_shell => "Shell" | "Shell",
+    filekind_image => "Image" | "圖片",
+    filekind_audio => "Audio" | "音訊",
+    filekind_video => "Video" | "影片",
+    filekind_archive => "Archive" | "壓縮檔",
+    filekind_binary => "Binary" | "二進位",
+    filekind_data => "Data" | "資料",
+
     // ---- Entry kinds, spoken -------------------------------------------
     kind_parent => "parent directory" | "上層目錄",
     kind_dir => "directory" | "目錄",
@@ -303,6 +345,13 @@ phrases! {
     selector_title => " summarize: pick files " | " 摘要：選擇檔案 ",
     selector_keys => " Space pick {dot} l in {dot} h up {dot} Enter/c confirm {dot} q cancel "
         | " Space 選取 {dot} l 進入 {dot} h 上層 {dot} Enter/c 確認 {dot} q 取消 ",
+    columns_title => " listing columns " | " 列表欄位 ",
+    columns_keys => " Space toggle {dot} j/k move {dot} Enter/c apply {dot} q cancel "
+        | " Space 切換 {dot} j/k 移動 {dot} Enter/c 套用 {dot} q 取消 ",
+    /// The `:columns` picker's note: what the list is actually for.
+    /// Short enough to fit the popup at the documented 80x24 minimum.
+    columns_picker_note => "name is always shown; a narrow terminal drops the rest from the bottom up"
+        | "名稱欄位一律顯示；終端機太窄時會由下往上捨棄其餘欄位",
     provider_title => " summarize: pick a provider " | " 選擇 AI 模型 ",
     provider_keys => " 1-5 choose {dot} Enter default {dot} q cancel "
         | " 1-5 選擇 {dot} Enter 使用預設 (ag) {dot} q 取消 ",
@@ -398,6 +447,11 @@ hint_rows! {
         "1-5 choose", "Enter default (ag)", "q/Esc cancel",
     ] | [
         "1-5 選擇", "Enter 使用預設 (ag)", "q/Esc 取消",
+    ],
+    hints_column_picker => [
+        "Space toggle", "j/k move", "Enter/c apply", "q/Esc cancel", "name is always shown",
+    ] | [
+        "Space 切換", "j/k 移動", "Enter/c 套用", "q/Esc 取消", "名稱欄位一律顯示",
     ],
     hints_folder_picker => [
         "j/k focus", "l in", "h up", "Enter/m select", "q/Esc cancel",
@@ -549,6 +603,107 @@ impl Lang {
         match self {
             Lang::En => format!("{age} ago"),
             Lang::ZhTw => age.to_string(),
+        }
+    }
+
+    // ---- `:columns` / `:header` -------------------------------------------
+
+    /// The prompt row while the picker is open: the list as it stands in
+    /// the copy being edited, in the syntax `:columns` is typed in.
+    pub fn columns_prompt(self, spec: &str) -> String {
+        match self {
+            Lang::En => format!("columns: {spec}"),
+            Lang::ZhTw => format!("欄位：{spec}"),
+        }
+    }
+
+    /// What a `:columns <list>` reports once the listing has changed.
+    pub fn columns_set(self, spec: &str) -> String {
+        self.op_says(Op::Columns, &self.columns_set_detail(spec))
+    }
+
+    fn columns_set_detail(self, spec: &str) -> String {
+        match self {
+            Lang::En => format!("columns set to {spec}"),
+            Lang::ZhTw => format!("欄位已設定為 {spec}"),
+        }
+    }
+
+    /// Whether the column header row is being drawn.
+    pub fn header_is(self, on: bool) -> String {
+        match (self, on) {
+            (Lang::En, true) => "column header row: on".to_string(),
+            (Lang::En, false) => "column header row: off".to_string(),
+            (Lang::ZhTw, true) => "欄位標題列：顯示".to_string(),
+            (Lang::ZhTw, false) => "欄位標題列：隱藏".to_string(),
+        }
+    }
+
+    /// A word at the prompt or in the config file that names no column.
+    pub fn unknown_column(self, value: &str, known: &str) -> String {
+        self.op_says(Op::Columns, &self.unknown_column_detail(value, known))
+    }
+
+    fn unknown_column_detail(self, value: &str, known: &str) -> String {
+        match self {
+            Lang::En => format!("unknown column '{value}' - try one of: {known}"),
+            Lang::ZhTw => format!("不支援的欄位 '{value}' - 可用: {known}"),
+        }
+    }
+
+    /// A list that named nothing at all. Refused rather than read as the
+    /// default, because `:columns ,,` is a typo and not a request.
+    pub fn empty_column_list(self, known: &str) -> String {
+        self.op_says(Op::Columns, &self.empty_column_list_detail(known))
+    }
+
+    fn empty_column_list_detail(self, known: &str) -> String {
+        match self {
+            Lang::En => format!("no columns named - try one or more of: {known}"),
+            Lang::ZhTw => format!("沒有指定任何欄位 - 可用: {known}"),
+        }
+    }
+
+    /// A `:set` whose left-hand side is not a setting Filecraft has.
+    pub fn unknown_setting(self, value: &str, known: &str) -> String {
+        match self {
+            Lang::En => format!("unknown setting '{value}' - try one of: {known}"),
+            Lang::ZhTw => format!("不支援的設定 '{value}' - 可用: {known}"),
+        }
+    }
+
+    /// A `header=` value that is neither on nor off.
+    pub fn unknown_switch(self, value: &str) -> String {
+        match self {
+            Lang::En => format!("expected 'on' or 'off', got '{value}'"),
+            Lang::ZhTw => format!("預期為 'on' 或 'off'，實際為 '{value}'"),
+        }
+    }
+
+    /// A column choice written to the settings file.
+    pub fn columns_saved(self, path: &str) -> String {
+        self.op_says(Op::Columns, &self.language_saved_detail(path))
+    }
+
+    /// A column choice that could not be written down. The session still
+    /// has it; the next one will not.
+    pub fn columns_not_saved(self, error: &str) -> String {
+        self.op_says(Op::Columns, &self.language_not_saved_detail(error))
+    }
+
+    /// The `:columns` picker's own note, once it has been applied.
+    pub fn columns_picker_cancelled(self) -> &'static str {
+        match self {
+            Lang::En => "cancelled: columns unchanged",
+            Lang::ZhTw => "已取消：欄位未變更",
+        }
+    }
+
+    /// Space on the name row, which is the one row that never toggles.
+    pub fn name_column_is_always_shown(self) -> &'static str {
+        match self {
+            Lang::En => "the name column is always shown",
+            Lang::ZhTw => "名稱欄位一律顯示",
         }
     }
 
@@ -889,6 +1044,9 @@ pub enum Usage {
     Summarize,
     Log,
     Language,
+    Columns,
+    Header,
+    Set,
     /// The command takes nothing at all, so there is nothing to explain.
     None,
 }
@@ -941,6 +1099,11 @@ impl Lang {
             }
             (Lang::En, Usage::Log) => "  (opens the AI run's own output; there is no path form)",
             (Lang::En, Usage::Language) => "[en|zh]   (no code shows the current language)",
+            (Lang::En, Usage::Columns) => {
+                "[name,size,modified,created,kind,permissions,owner]   (no list opens the picker)"
+            }
+            (Lang::En, Usage::Header) => "on|off   (the column header row above the listing)",
+            (Lang::En, Usage::Set) => "columns=<list> | header=on|off",
             (Lang::ZhTw, Usage::Cd) => "[路徑]   (路徑含空白請加引號)",
             (Lang::ZhTw, Usage::Move) => "[目標]   (不給路徑會開啟目錄選擇器；含空白請加引號)",
             (Lang::ZhTw, Usage::Rename) => "<新名稱>   (重新命名選取的項目；含空白請加引號)",
@@ -948,6 +1111,11 @@ impl Lang {
             (Lang::ZhTw, Usage::Summarize) => "  (開啟檔案選擇器；Space 選取檔案，Enter 確認)",
             (Lang::ZhTw, Usage::Log) => "  (開啟 AI 執行的即時輸出；沒有路徑形式)",
             (Lang::ZhTw, Usage::Language) => "[en|zh]   (不給代碼會顯示目前語言)",
+            (Lang::ZhTw, Usage::Columns) => {
+                "[name,size,modified,created,kind,permissions,owner]   (不給清單會開啟選擇器)"
+            }
+            (Lang::ZhTw, Usage::Header) => "on|off   (列表上方的欄位標題列)",
+            (Lang::ZhTw, Usage::Set) => "columns=<清單> | header=on|off",
         };
         match self {
             Lang::En => format!("usage: {command} {tail}"),
@@ -1631,6 +1799,16 @@ impl Lang {
                 "  Enter, m             choose the focused folder (then y/n)",
                 "  q, Esc               cancel, back to the listing",
                 "",
+                "KEYS (column picker - :columns with no list)",
+                "  j / k, Down / Up     move focus",
+                "  PgUp / PgDn          move focus a page",
+                "  g / G                first / last row",
+                "  Space                turn the focused column on or off",
+                "  Enter, c             apply, and remember the choice",
+                "  q, Esc               cancel, the listing is unchanged",
+                "  (the name column is always shown; the last row is the",
+                "   column header switch itself)",
+                "",
                 "COMMANDS (at the : prompt)",
                 "  cd [path]            change directory (~ ok; quote spaces)",
                 "  move [destination]   folder picker, or a path (asks y/n first)",
@@ -1643,8 +1821,17 @@ impl Lang {
                 "  log, job             the AI run's own output (same as L)",
                 "  agent [...]          future AI seam - disabled in v0",
                 "  lang [en|zh]         screen language (saved for next time)",
+                "  columns, cols [list] listing columns; no list opens the picker",
+                "  header on|off        the column header row above the listing",
+                "  set <key>=<value>    columns=<list> or header=on|off",
                 "  help                 this help",
                 "  quit                 leave filecraft",
+                "",
+                "COLUMNS  name size modified created kind permissions owner",
+                "  - name is always shown and takes whatever width is left",
+                "  - a narrow terminal drops columns from the bottom of that",
+                "    list up; name and size are never dropped",
+                "  - saved under [columns] in ~/.config/filecraft/config.toml",
                 "",
                 "SAFETY",
                 "  - the reader is read-only: no key in it can change a file",
@@ -1751,6 +1938,15 @@ impl Lang {
                 "  Enter, m             選定游標所在的目錄 (接著會問 y/n)",
                 "  q, Esc               取消，回到列表",
                 "",
+                "按鍵 (欄位選擇器 - :columns 不帶清單)",
+                "  j / k, Down / Up     移動游標",
+                "  PgUp / PgDn          上下翻頁",
+                "  g / G                第一列 / 最後一列",
+                "  Space                切換游標所在欄位的顯示與否",
+                "  Enter, c             套用，並記住這個選擇",
+                "  q, Esc               取消，列表維持原狀",
+                "  (名稱欄位一律顯示；最後一列是欄位標題列的開關)",
+                "",
                 "指令 (在 : 提示列輸入)",
                 "  cd [路徑]            切換目錄 (可用 ~；含空白請加引號)",
                 "  move [目標]          目錄選擇器，或直接給路徑 (會先問 y/n)",
@@ -1763,8 +1959,17 @@ impl Lang {
                 "  log, job             AI 執行的即時輸出 (同 L)",
                 "  agent [...]          未來的 AI 介面 - v0 尚未啟用",
                 "  lang [en|zh]         畫面語言 (會記住下次使用)",
+                "  columns, cols [清單] 列表欄位；不給清單會開啟選擇器",
+                "  header on|off        列表上方的欄位標題列",
+                "  set <鍵>=<值>        columns=<清單> 或 header=on|off",
                 "  help                 這份說明",
                 "  quit                 離開 filecraft",
+                "",
+                "欄位   name size modified created kind permissions owner",
+                "  - name 一律顯示，並取用剩下的所有寬度",
+                "  - 終端機太窄時，會由這份清單的尾端往前捨棄欄位；",
+                "    name 與 size 永遠不會被捨棄",
+                "  - 儲存在 ~/.config/filecraft/config.toml 的 [columns] 之下",
                 "",
                 "安全性",
                 "  - 閱讀模式是唯讀的：其中任何按鍵都不會改動檔案",
@@ -1817,6 +2022,7 @@ pub enum Op {
     Log,
     Summarize,
     Language,
+    Columns,
     Agent,
 }
 
@@ -1835,6 +2041,7 @@ impl Lang {
             (Lang::En, Op::Log) => "log",
             (Lang::En, Op::Summarize) => "summarize",
             (Lang::En, Op::Language) => "lang",
+            (Lang::En, Op::Columns) => "columns",
             (Lang::En, Op::Agent) => "agent",
             (Lang::ZhTw, Op::Cd) => "切換目錄",
             (Lang::ZhTw, Op::Move) => "移動",
@@ -1847,6 +2054,7 @@ impl Lang {
             (Lang::ZhTw, Op::Log) => "日誌",
             (Lang::ZhTw, Op::Summarize) => "摘要",
             (Lang::ZhTw, Op::Language) => "語言",
+            (Lang::ZhTw, Op::Columns) => "欄位",
             // The disabled AI seam is a name, not a word.
             (Lang::ZhTw, Op::Agent) => "agent",
         }
@@ -2285,9 +2493,25 @@ mod tests {
     /// a key name rather than a word.
     #[test]
     fn every_phrase_is_actually_translated() {
-        // `<DIR>` is a marker like `/`, `@`, and `@!`: the same four
-        // letters in every language, by design.
-        const SHARED: [&str; 1] = ["dir_marker"];
+        // Markers and proper names, not words. `<DIR>` is the same four
+        // letters in every language, exactly as `/`, `@`, and `@!` are;
+        // and a file format's own name - `Markdown`, `PDF`, `TOML` - is
+        // spelled the way its authors spell it, in any language.
+        const SHARED: [&str; 13] = [
+            "dir_marker",
+            "filekind_markdown",
+            "filekind_pdf",
+            "filekind_rust",
+            "filekind_toml",
+            "filekind_json",
+            "filekind_yaml",
+            "filekind_html",
+            "filekind_css",
+            "filekind_javascript",
+            "filekind_typescript",
+            "filekind_python",
+            "filekind_shell",
+        ];
         let english = Lang::En.phrases();
         let chinese = Lang::ZhTw.phrases();
         assert_eq!(english.len(), chinese.len());

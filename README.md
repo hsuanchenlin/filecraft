@@ -183,8 +183,10 @@ Change it from inside Filecraft at the `:` prompt:
 The switch takes effect on the next frame and is written to
 `~/.config/filecraft/config.toml` (or
 `$XDG_CONFIG_HOME/filecraft/config.toml`) so
-the next session starts in it. Only the `language` key is touched -
-comments, blank lines, and any other key in the file are preserved. If
+the next session starts in it - the same file the
+[`[columns]` table](#remembering-them) lives in. Only the `language` key
+is touched - comments, blank lines, the `[columns]` table, and any other
+key in the file are preserved. If
 the preference could not be written down, Filecraft says so: the session
 still switches, and you know the next one will not.
 
@@ -204,9 +206,9 @@ a run fails - stays stable, because that file outlives the session and is
 read by whoever the summary is shared with.
 
 Traditional Chinese is measured, not counted: a Han character owns two
-terminal cells, so the listing's age column, the preview's label column,
-every padded status segment, and every hint row are fitted in display
-columns. `NO_COLOR` and `FILECRAFT_ASCII` work exactly as they do in
+terminal cells, so every listing column and its header, the preview's
+label column, every padded status segment, and every hint row are fitted
+in display columns. `NO_COLOR` and `FILECRAFT_ASCII` work exactly as they do in
 English - `FILECRAFT_ASCII` governs the characters Filecraft *draws*
 (borders, rails, bullets), not the language it writes in.
 
@@ -259,6 +261,122 @@ in. Nothing about it can change a file.
 instead of going to the parent, matching vim, ranger, lf, and nnn. Esc
 **backs out one level** - it clears an active filter, or closes a pager -
 instead of quitting. Quitting is `q` or Ctrl-C.
+
+## Columns
+
+The listing is a table, and which columns it holds is yours to choose.
+Seven are available:
+
+| Column | Header | What it says |
+| --- | --- | --- |
+| `name` | `NAME` / `名稱` | the entry's name, with the `/ @ @!` kind markers |
+| `size` | `SIZE` / `大小` | `973B`, `4.2K`, `1.1G`, or `<DIR>` |
+| `modified` | `MODIFIED` / `修改時間` | how long ago it was last written - `11m`, `2d` |
+| `created` | `CREATED` / `建立時間` | how long ago it was created (macOS birth time) |
+| `kind` | `KIND` / `種類` | `Directory`, `Markdown`, `Rust`, `PDF`, `Image`, … |
+| `permissions` | `PERMISSIONS` / `權限` | the `ls -l` mode string, `-rw-r--r--` |
+| `owner` | `OWNER` / `擁有者` | `user:group`, by name where the system knows one |
+
+The default is `name`, `size`, `modified` with the header row on - the
+listing Filecraft has always drawn, now with its columns named.
+
+A **BBS column header** sits directly above the rows: the column names,
+and a rule under them in the same character set the rest of the frame
+uses. It is chrome, like the ladder above it - it cannot be focused, and
+nothing in it can be operated on. It costs the listing two rows, and
+paging and the scroll margin count the rows that actually hold entries,
+so what `PgDn` moves by is what you can see.
+
+```
+║   NAME                                    SIZE MODIFIED CREATED KIND      ║
+║───────────────────────────────────────────────────────────────────────────║
+║│> ../                                    <DIR>                  Directory ║
+║│  projects/                              <DIR> 1h       3d      Directory ║
+║│  Cargo.toml                                9B 1h       3d      TOML      ║
+║│  一份很長的中文檔案名稱.md                 1B 1h       3d      Markdown  ║
+```
+
+**The name column is the one that stretches.** Every other column has a
+width its language declares, and the name takes what is left. When the
+terminal is too narrow to hold them all, whole columns are dropped
+rather than the name being squeezed into nothing - `owner` first, then
+`permissions`, `created`, `kind`, and `modified` last. `name` and `size`
+are never dropped, so even an absurdly narrow terminal is still a file
+listing.
+
+Every width is in **display cells, never characters**. `修改時間` is the
+same eight columns `MODIFIED` is, and `種類` is four where `KIND` is
+four, because a Han character owns two cells - so a translated header
+can never push a row past the border. `NO_COLOR` and `FILECRAFT_ASCII`
+apply here as everywhere: the header is bold rather than colored, and
+its rule is drawn with `-` in ASCII mode.
+
+### Changing them
+
+`:columns` with no list opens a picker over the listing:
+
+```
+┌ listing columns ───────────────────────────────────────────────────────────┐
+│ name is always shown; a narrow terminal drops the rest from the bottom up  │
+│ > [x] NAME (name)                                                          │
+│   [x] SIZE (size)                                                          │
+│   [x] MODIFIED (modified)                                                  │
+│   [ ] CREATED (created)                                                    │
+│   [ ] KIND (kind)                                                          │
+│   [ ] PERMISSIONS (permissions)                                            │
+│   [ ] OWNER (owner)                                                        │
+│   [x] column header row                                                    │
+└──────────────────────── Space toggle · j/k move · Enter/c apply · q cancel ┘
+```
+
+| Key | Action (column picker) |
+| --- | --- |
+| `j` / `k`, Down / Up | move focus |
+| PgUp / PgDn | move focus a page |
+| `g` / `G` | first / last row |
+| `Space` | turn the focused column on or off |
+| Enter, `c` | apply, and remember the choice |
+| `q`, Esc | cancel; the listing is unchanged |
+
+It edits a copy, so cancelling really does leave the listing as it was.
+The name row is listed but never turns off, and the last row is the
+header switch itself, so everything `:columns` governs is in one place.
+
+Or say it outright:
+
+```
+:columns                              open the picker
+:columns name,size,modified,created   set them, in this order
+:cols name size kind                  commas and spaces both separate
+:set columns=name,size,kind,owner     the same thing again
+:header off                           hide the column header row
+:header                               report whether it is drawn
+:set header=on                        the same thing again
+```
+
+A word naming no column is refused and nothing changes. A list that
+leaves `name` out gets it back at the front: a listing of sizes with no
+names is not a file listing.
+
+### Remembering them
+
+The choice is written to `~/.config/filecraft/config.toml` (or
+`$XDG_CONFIG_HOME/filecraft/config.toml`) under a `[columns]` table:
+
+```toml
+language = "zh-TW"
+
+[columns]
+visible = ["name", "size", "modified", "created", "kind"]
+header = true
+```
+
+Only those two keys are touched - comments, blank lines, and any other
+key in the file are preserved, exactly as `:lang` preserves them. A word
+naming a column this version does not have is skipped rather than fatal,
+so a file written by a later version still starts this one. If the
+preference could not be written down, Filecraft says so: the session
+still has the new columns, and you know the next one will not.
 
 ## Folder picker
 
@@ -502,12 +620,18 @@ listing is the single thing commands act on.
 ```
 ╔ ░▒▓ FILECRAFT v0.1.0 ▓▒░ ════════════════════════════════════════════════════╗
 ║ 0·~ ▸ … ▸ 7·final ▸ 8·assets                              depth 8 · 73 items ║
-║│  file_059.txt                                                     0B  1h    ║
-║█  file_060.txt                                                     0B  1h    ║
-║█> file_061.txt                                                     0B  2d    ║
+║   NAME                                                          SIZE MODIFIED║
+║──────────────────────────────────────────────────────────────────────────────║
+║│  file_059.txt                                                     0B 1h     ║
+║█  file_060.txt                                                     0B 1h     ║
+║█> file_061.txt                                                     0B 2d     ║
 ║ row 61 of 74 · rows 47-61 of 74 · file_061.txt · file · 0B · 2d ago          ║
 ```
 
+- **Column header** - the names of the columns the listing is drawing,
+  and a rule under them. Read-only chrome, like the ladder; which
+  columns it names is yours to choose ([Columns](#columns)), and
+  `:header off` takes the two rows back.
 - **Ladder** - the ancestor chain, replacing the raw path line. Digits
   jump to the ancestor they label; `0` is `~` under your home directory
   and `/` elsewhere. Deep paths elide in the middle, so the anchor and
@@ -530,7 +654,9 @@ The same row in Traditional Chinese:
 
 ```
 ║ 0·~ ▸ … ▸ 4·docs ▸ 5·notes                                  階層 5 · 74 個項目 ║
-║█> file_061.txt                                                    0B  2天前   ║
+║   名稱                                                          大小 修改時間 ║
+║───────────────────────────────────────────────────────────────────────────────║
+║█> file_061.txt                                                    0B 2天前    ║
 ║ 第 61 列，共 74 列 · 第 47-61 列，共 74 列 · file_061.txt · 檔案 · 0B · 2天前  ║
 ```
 
@@ -552,6 +678,9 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `log`, `job` | the AI run's own output and session (same as `L`) |
 | `agent [...]` | future AI seam; disabled in v0 (see [docs/agent-seam.md](docs/agent-seam.md)) |
 | `lang [en\|zh]`, `language` | screen language; no code reports the current one. The choice is saved for next time |
+| `columns [list]`, `cols` | [listing columns](#columns); no list opens the picker. The choice is saved for next time |
+| `header on\|off` | the column header row above the listing; no word reports whether it is drawn |
+| `set <key>=<value>` | `columns=<list>` or `header=on\|off` - a second spelling of the two above |
 | `help` | help screen |
 | `quit` | leave Filecraft |
 

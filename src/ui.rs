@@ -32,6 +32,7 @@ use crate::app::{App, Level, Mode};
 use crate::bearings::{
     self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
 };
+use crate::columns::{self, ColumnPicker, PickerRow};
 use crate::fsops::FsError;
 use crate::i18n::{self, Lang};
 use crate::joblog::{LogPane, HEADER_ROWS};
@@ -58,16 +59,13 @@ const MESSAGE_ROWS: usize = 3;
 /// selection to the bottom edge.
 const SCROLL_MARGIN: usize = 3;
 
-/// Columns the listing spends on everything that is not the name: the
-/// rail, the cursor marker, the size field, and the relative time.
+/// Columns the listing spends before the first column of data: the
+/// position rail, and the cursor marker every row carries.
 ///
-/// The age field is the one part that is not the same width in every
-/// language - a Han character owns two cells, so `59分鐘前` needs eight
-/// columns where `59m` needs three - so the furniture is measured
-/// against [`Lang::age_width`] rather than pinned to English.
-fn listing_furniture(lang: Lang) -> usize {
-    1 + 2 + 8 + 1 + lang.age_width()
-}
+/// Everything past this is [`crate::columns`]' arithmetic, which is
+/// where a translated header's width and a narrow terminal's dropped
+/// columns are decided.
+const LISTING_GUTTER: usize = 1 + columns::MARKER_COLS;
 
 /// Styling switchboard. With `use_color: false` (the `NO_COLOR`
 /// convention) every style falls back to bold/reverse on the terminal's
@@ -153,6 +151,17 @@ impl Theme {
     /// reads in the directory style - but it is never focusable.
     pub fn bearing(&self) -> Style {
         self.dir()
+    }
+
+    /// The listing's column header. Bold as well as colored, so it
+    /// still reads as a heading on a `NO_COLOR` terminal - which is
+    /// where [`Theme::color`] drops the color and keeps the weight.
+    pub fn column_header(&self) -> Style {
+        self.color(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     }
 
     pub fn banner(&self) -> Style {
@@ -306,7 +315,11 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
         .areas(inner);
 
     draw_ladder(frame, app, theme, ladder_row);
-    let rows = list_area.height as usize;
+    // Rows of *entries*: the column header sits inside the listing area
+    // and is never scrolled, so it is not one of them. `App::listing_rows`
+    // subtracts the same two, which is what keeps PageDown and the
+    // scroll margin agreeing with what is drawn.
+    let rows = (list_area.height as usize).saturating_sub(app.listing_header_rows());
     let visible = app.nav.visible();
     let offset = bearings::viewport_offset(app.nav.cursor, visible.len(), rows, SCROLL_MARGIN);
     // One reading of the locus, shared by the listing and the words that
@@ -317,6 +330,7 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
         Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager, lang),
         Mode::JobLog(pane) => draw_job_log(frame, theme, list_area, pane, lang),
         Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker, lang),
+        Mode::ColumnPicker(picker) => draw_column_picker(frame, theme, list_area, picker, lang),
         Mode::FileSelector(selector) => draw_selector(frame, theme, list_area, selector, lang),
         Mode::ProviderMenu { files } => {
             draw_provider_menu(frame, theme, list_area, files.len(), lang)
@@ -375,16 +389,18 @@ fn draw_listing(
     bearings: &Bearings,
     now: SystemTime,
 ) {
-    let rows = area.height as usize;
-    if rows == 0 {
+    let total_rows = area.height as usize;
+    if total_rows == 0 {
         return;
     }
     let glyphs = theme.glyphs();
     let lang = app.lang;
     let width = area.width as usize;
-    let name_width = width.saturating_sub(listing_furniture(lang));
     // Every listing row is the rail plus this much content.
     let body_width = width.saturating_sub(1);
+    let placed = columns::layout(&app.columns, width.saturating_sub(LISTING_GUTTER), lang);
+    let header_rows = app.listing_header_rows().min(total_rows);
+    let rows = total_rows - header_rows;
     let rail = bearings::rail(visible.len(), offset, rows);
     // A filter that matched nothing must say so: the `..` row always
     // passes, so a bare `../` would otherwise look like a real result.
@@ -396,7 +412,28 @@ fn draw_listing(
         None
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    let mut lines: Vec<Line> = Vec::with_capacity(total_rows);
+    if header_rows > 0 {
+        // Chrome, like the ladder above it: it names the columns and
+        // nothing in it can be focused or operated on.
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                pad_to_width_with(
+                    &columns::header_row(&placed, lang, &glyphs),
+                    body_width,
+                    glyphs.ellipsis,
+                ),
+                theme.column_header(),
+            ),
+        ]));
+        if header_rows > 1 {
+            lines.push(Line::from(Span::styled(
+                columns::rule(width, &glyphs),
+                theme.bearing(),
+            )));
+        }
+    }
     for row in 0..rows {
         let rail_span = Span::styled(
             rail.get(row)
@@ -419,31 +456,6 @@ fn draw_listing(
         };
         let entry = &app.nav.entries[entry_index];
         let selected = index == app.nav.cursor;
-        let marker = if selected { "> " } else { "  " };
-
-        let size = if entry.is_parent || entry.is_enterable() {
-            lang.dir_marker().to_string()
-        } else {
-            format_size(entry.size)
-        };
-        // Relative time needs no timezone, and costs a handful of
-        // columns instead of twenty - which is what pays for the rail.
-        // Padded by display width, not by character count, so a CJK age
-        // does not push the row past the border.
-        let age = pad_to_width_with(
-            &entry
-                .modified
-                .map(|m| bearings::relative_time(now, m, lang))
-                .unwrap_or_default(),
-            lang.age_width(),
-            glyphs.ellipsis,
-        );
-        let name = pad_to_width_with(
-            &sanitize(&entry.display_name()),
-            name_width,
-            glyphs.ellipsis,
-        );
-
         let base_style = match entry.kind {
             _ if selected => theme.selected(),
             EntryKind::Dir => theme.dir(),
@@ -451,15 +463,100 @@ fn draw_listing(
             EntryKind::SymlinkBroken => theme.broken(),
             _ => Style::default(),
         };
-        lines.push(Line::from(vec![
-            rail_span,
-            Span::styled(marker.to_string(), base_style),
-            Span::styled(name, base_style),
-            Span::styled(format!(" {size:>6} "), base_style),
-            Span::styled(format!(" {age}"), base_style),
-        ]));
+        // One span for the whole row: every cell in it carries the same
+        // style, and the widths are already exact.
+        let text = pad_to_width_with(
+            &columns::row(&placed, entry, selected, now, lang, &glyphs),
+            body_width,
+            glyphs.ellipsis,
+        );
+        lines.push(Line::from(vec![rail_span, Span::styled(text, base_style)]));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The `:columns` picker: every column, whether it is on, and the header
+/// switch, over the listing it is about to change.
+///
+/// Same popup frame the folder picker has, and the same contract: it
+/// edits a copy, so cancelling leaves the listing exactly as it was.
+fn draw_column_picker(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    picker: &ColumnPicker,
+    lang: Lang,
+) {
+    let glyphs = theme.glyphs();
+    let frame_only = Block::default()
+        .borders(Borders::ALL)
+        .border_set(theme.pager_border_set())
+        .padding(Padding::horizontal(1));
+    let inner = frame_only.inner(area);
+    let block = frame_only
+        .border_style(theme.banner())
+        .title(Span::styled(lang.columns_title(), theme.prompt()))
+        .title_bottom(
+            Line::from(Span::styled(
+                i18n::keys_row(lang.columns_keys(), glyphs.dot),
+                theme.bearing(),
+            ))
+            .right_aligned(),
+        );
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let [note_row, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let note = pad_to_width_with(
+        lang.columns_picker_note(),
+        note_row.width as usize,
+        glyphs.ellipsis,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(note, theme.meta()))),
+        note_row,
+    );
+
+    let rows = list_area.height as usize;
+    if rows == 0 {
+        return;
+    }
+    let all = ColumnPicker::rows();
+    let label_width = (list_area.width as usize).saturating_sub(6);
+    let offset = bearings::viewport_offset(picker.cursor, all.len(), rows, 1);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let index = offset + row;
+        let Some(&entry) = all.get(index) else {
+            lines.push(Line::from(""));
+            continue;
+        };
+        let selected = index == picker.cursor;
+        let marker = if selected { "> " } else { "  " };
+        // `[x]` / `[ ]`, so what is on is text and never color alone.
+        let box_mark = if picker.is_on(entry) { "[x] " } else { "[ ] " };
+        let label = pad_to_width_with(
+            &sanitize(&picker.label(entry, lang)),
+            label_width,
+            glyphs.ellipsis,
+        );
+        let style = if selected {
+            theme.selected()
+        } else if matches!(entry, PickerRow::Header) {
+            theme.meta()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker}{box_mark}{label}"),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), list_area);
 }
 
 /// The full-screen reader. The frame names what is being read at the
@@ -941,6 +1038,10 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             Span::styled(lang.prompt_yes_no(), theme.prompt()),
             Span::raw(lang.quit_question()),
         ]),
+        Mode::ColumnPicker(picker) => Line::from(vec![
+            Span::styled(lang.prompt_pick(), theme.prompt()),
+            Span::raw(lang.columns_prompt(&picker.set.spec())),
+        ]),
         Mode::FileSelector(selector) => Line::from(vec![
             Span::styled(lang.prompt_pick(), theme.prompt()),
             Span::raw(lang.selector_prompt(selector.count())),
@@ -970,6 +1071,7 @@ fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
         Mode::FileSelector(_) => lang.hints_file_selector(),
         Mode::ProviderMenu { .. } => lang.hints_provider_menu(),
         Mode::FolderPicker(_) => lang.hints_folder_picker(),
+        Mode::ColumnPicker(_) => lang.hints_column_picker(),
         Mode::Pager(pager) if pager.find.is_some() => lang.hints_pager_find(),
         Mode::Pager(_) => lang.hints_pager(),
         Mode::JobLog(pane) if pane.pager.find.is_some() => lang.hints_joblog_find(),
@@ -996,6 +1098,7 @@ mod tests {
     use super::*;
     use crate::app::{App, Effect, KeyInput};
     use crate::bearings::display_width;
+    use crate::columns::{Column, ColumnSet};
     use crate::nav::NavState;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1095,6 +1198,12 @@ mod tests {
 
     fn row(screen: &str, index: usize) -> String {
         screen.lines().nth(index).unwrap().to_string()
+    }
+
+    /// Frame row the first listing *entry* lands on: the banner border,
+    /// the ladder, and then the column header when one is drawn.
+    fn first_entry_row(app: &App) -> usize {
+        2 + app.listing_header_rows()
     }
 
     const SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (132, 40), (60, 20)];
@@ -1641,17 +1750,19 @@ mod tests {
         // At the top of a long listing the thumb is at the top.
         let screen = render_themed(&mut app, 80, 24, &theme);
         let status = status_row(24);
-        assert!(row(&screen, 2).starts_with("║█"), "{}", row(&screen, 2));
-        assert!(row(&screen, 16).starts_with("║│"), "{}", row(&screen, 16));
-        assert!(row(&screen, status).contains("rows 1-15 of 75"), "{screen}");
+        let first = first_entry_row(&app);
+        let last = status - 1;
+        assert!(row(&screen, first).starts_with("║█"), "{screen}");
+        assert!(row(&screen, last).starts_with("║│"), "{screen}");
+        assert!(row(&screen, status).contains("rows 1-13 of 75"), "{screen}");
 
         // At the bottom it is at the bottom, and the words agree.
         app.nav.cursor_to_end();
         let screen = render_themed(&mut app, 80, 24, &theme);
-        assert!(row(&screen, 2).starts_with("║│"), "{}", row(&screen, 2));
-        assert!(row(&screen, 16).starts_with("║█"), "{}", row(&screen, 16));
+        assert!(row(&screen, first).starts_with("║│"), "{screen}");
+        assert!(row(&screen, last).starts_with("║█"), "{screen}");
         assert!(
-            row(&screen, status).contains("rows 61-75 of 75"),
+            row(&screen, status).contains("rows 63-75 of 75"),
             "{screen}"
         );
         assert!(row(&screen, status).contains("row 75 of 75"), "{screen}");
@@ -1684,7 +1795,7 @@ mod tests {
         let screen = render_themed(&mut app, 80, 24, &theme);
         let status = row(&screen, status_row(24));
         assert!(screen.contains('█'), "{screen}");
-        assert!(status.contains("rows 27-41 of 41"), "{status}");
+        assert!(status.contains("rows 29-41 of 41"), "{status}");
         assert_eq!(display_width(&status), 80, "{status}");
     }
 
@@ -1734,10 +1845,13 @@ mod tests {
         // The fixture was written after the injected clock, so it reads
         // as brand new rather than as an error.
         assert!(screen.contains("note.txt"));
-        assert!(row(&screen, 3).contains(" 1h"), "{}", row(&screen, 3));
+        // Two rows of column header now sit above the listing, so the
+        // first entry row is one lower than it used to be.
+        assert!(row(&screen, 5).contains(" 1h"), "{}", row(&screen, 5));
         // The reclaimed columns went to the name, not away: today's
         // 46-column name field is the floor.
-        let name_width = 78 - listing_furniture(Lang::En);
+        let placed = columns::layout(&app.columns, 78 - LISTING_GUTTER, Lang::En);
+        let name_width = placed[0].width;
         assert!(name_width >= 46, "name field shrank to {name_width}");
     }
 
@@ -1984,6 +2098,265 @@ mod tests {
         );
     }
 
+    /// Display column a needle starts at, measured in cells so a CJK
+    /// prefix counts twice per character - the only honest way to ask
+    /// whether two rows line up.
+    fn cell_of(line: &str, needle: &str) -> usize {
+        let at = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on {line:?}"));
+        display_width(&line[..at])
+    }
+
+    /// The listing rows of a rendered 80x24 screen, header excluded.
+    fn entry_rows(app: &App, screen: &str, height: u16) -> Vec<String> {
+        (first_entry_row(app)..status_row(height))
+            .map(|i| row(screen, i))
+            .collect()
+    }
+
+    #[test]
+    fn the_column_header_sits_exactly_over_the_cells_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("projects")).unwrap();
+        fs::write(tmp.path().join("readme.md"), "hi").unwrap();
+        fs::write(tmp.path().join("中文檔案名稱範例.md"), "hi").unwrap();
+        for lang in Lang::ALL {
+            let mut app = app_at_in(tmp.path(), lang);
+            app.columns = ColumnSet::new(
+                [Column::Name, Column::Size, Column::Modified, Column::Kind],
+                true,
+            );
+            let theme = Theme::from_no_color_env(None);
+            let screen = render_themed(&mut app, 100, 30, &theme);
+            let header = row(&screen, 2);
+            let dir = entry_rows(&app, &screen, 30)
+                .into_iter()
+                .find(|l| l.contains("projects/"))
+                .expect("the directory row");
+            let cjk = entry_rows(&app, &screen, 30)
+                .into_iter()
+                .find(|l| l.contains("中文檔案名稱範例"))
+                .expect("the CJK row");
+
+            // The name header starts where a name starts, whatever the
+            // name is made of.
+            assert_eq!(
+                cell_of(&header, Column::Name.header(lang)),
+                cell_of(&dir, "projects/"),
+                "{screen}"
+            );
+            assert_eq!(
+                cell_of(&dir, "projects/"),
+                cell_of(&cjk, "中文檔案名稱範例"),
+                "a wide name moved the name column: {screen}"
+            );
+            // Sizes are flush right, so the header and the cell end
+            // together rather than starting together.
+            let size_header = Column::Size.header(lang);
+            assert_eq!(
+                cell_of(&header, size_header) + display_width(size_header),
+                cell_of(&dir, "<DIR>") + display_width("<DIR>"),
+                "{screen}"
+            );
+            // And a translated kind word lands under its own header.
+            let kind = crate::columns::FileKind::Directory.word(lang);
+            assert_eq!(
+                cell_of(&header, Column::Kind.header(lang)),
+                cell_of(&dir, kind),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_column_set_keeps_its_frame_at_every_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main(){}").unwrap();
+        fs::write(tmp.path().join("一份非常長的中文檔案名稱範例.md"), "hi").unwrap();
+        let shapes = [
+            ColumnSet::default(),
+            ColumnSet::new(Column::ALL, true),
+            ColumnSet::new(Column::ALL, false),
+            ColumnSet::new([Column::Name], true),
+            ColumnSet::new([Column::Name, Column::Owner, Column::Permissions], true),
+        ];
+        for lang in Lang::ALL {
+            for shape in &shapes {
+                let mut app = app_at_in(tmp.path(), lang);
+                app.columns = shape.clone();
+                for (width, height) in SIZES {
+                    for theme in [
+                        Theme::from_no_color_env(None),
+                        Theme::from_no_color_env(Some("1")),
+                        Theme::from_env(None, Some("1")),
+                    ] {
+                        let screen = render_themed(&mut app, width, height, &theme);
+                        for (index, line) in screen.lines().enumerate() {
+                            assert_eq!(
+                                display_width(line),
+                                width as usize,
+                                "{} {} at {width}x{height} row {index}: {line:?}",
+                                lang.code(),
+                                shape.spec()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_column_shape_stays_inside_printable_ascii() {
+        // `FILECRAFT_ASCII` governs what Filecraft *draws* - the
+        // headers, the rule under them, and the mark a truncated cell
+        // ends with - not the names it is handed, so the tree here is
+        // deliberately all-ASCII.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("a-name-long-enough-to-be-cut-off.md"), "hi").unwrap();
+        fs::write(tmp.path().join("main.rs"), "fn main(){}").unwrap();
+        let shapes = [
+            ColumnSet::default(),
+            ColumnSet::new(Column::ALL, true),
+            ColumnSet::new(Column::ALL, false),
+        ];
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        for shape in &shapes {
+            let mut app = app_at(tmp.path());
+            app.columns = shape.clone();
+            for (width, height) in SIZES {
+                let screen = render_themed(&mut app, width, height, &theme);
+                for c in screen.chars().filter(|c| *c != '\n') {
+                    assert!(
+                        (' '..='~').contains(&c),
+                        "non-ascii {c:?} with {} at {width}x{height}:\n{screen}",
+                        shape.spec()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_columns_rather_than_the_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("readme.md"), "hi").unwrap();
+        let theme = Theme::from_no_color_env(None);
+        for lang in Lang::ALL {
+            let mut app = app_at_in(tmp.path(), lang);
+            app.columns = ColumnSet::new(Column::ALL, true);
+            let wide = render_themed(&mut app, 132, 40, &theme);
+            let narrow = render_themed(&mut app, 60, 20, &theme);
+            // The widest screen shows everything.
+            for column in Column::ALL {
+                assert!(
+                    wide.contains(column.header(lang)),
+                    "{} lost {} at 132 columns:\n{wide}",
+                    lang.code(),
+                    column.code()
+                );
+            }
+            // The narrowest keeps the name and the size, and the name is
+            // still wide enough to read a file name in.
+            for column in [Column::Name, Column::Size] {
+                assert!(
+                    narrow.contains(column.header(lang)),
+                    "{} dropped {} at 60 columns:\n{narrow}",
+                    lang.code(),
+                    column.code()
+                );
+            }
+            assert!(narrow.contains("readme.md"), "{narrow}");
+            assert!(
+                !narrow.contains(Column::Owner.header(lang)),
+                "{} kept the owner column on a 60-cell screen:\n{narrow}",
+                lang.code()
+            );
+        }
+    }
+
+    #[test]
+    fn turning_the_header_off_gives_its_rows_back_to_the_listing() {
+        let tmp = listing_fixture(40);
+        let mut app = app_at(tmp.path());
+        let theme = Theme::from_no_color_env(None);
+
+        let with = render_themed(&mut app, 80, 24, &theme);
+        assert!(with.contains("NAME"), "{with}");
+        let with_rows = entry_rows(&app, &with, 24)
+            .iter()
+            .filter(|l| l.contains(".txt"))
+            .count();
+
+        app.execute_line("header off");
+        let without = render_themed(&mut app, 80, 24, &theme);
+        assert!(!without.contains("NAME"), "{without}");
+        let without_rows = entry_rows(&app, &without, 24)
+            .iter()
+            .filter(|l| l.contains(".txt"))
+            .count();
+        assert_eq!(without_rows, with_rows + columns::HEADER_ROWS);
+        // And the status row agrees with what is drawn.
+        assert!(
+            row(&without, status_row(24)).contains("rows 1-15 of 42"),
+            "{without}"
+        );
+        assert!(
+            row(&with, status_row(24)).contains("rows 1-13 of 42"),
+            "{with}"
+        );
+    }
+
+    #[test]
+    fn the_column_picker_draws_a_box_per_row_in_either_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        for lang in Lang::ALL {
+            let mut app = app_at_in(tmp.path(), lang);
+            app.execute_line("columns");
+            let theme = Theme::from_no_color_env(None);
+            let screen = render_themed(&mut app, 80, 24, &theme);
+            assert!(screen.contains(lang.columns_title().trim()), "{screen}");
+            for column in Column::ALL {
+                // Every column is offered, named in the language on
+                // screen and paired with the word to type.
+                assert!(
+                    screen.contains(&format!("{} ({})", column.header(lang), column.code())),
+                    "{} is missing {}:\n{screen}",
+                    lang.code(),
+                    column.code()
+                );
+            }
+            assert!(screen.contains(lang.column_header_row()), "{screen}");
+            // What is on is text, never color alone.
+            assert!(screen.contains("[x] "), "{screen}");
+            assert!(screen.contains("[ ] "), "{screen}");
+            // Space, Enter and cancel are all named on the row of keys.
+            assert!(screen.contains("Space"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn the_column_picker_survives_without_color_or_unicode() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        let mut app = app_at(tmp.path());
+        app.execute_line("columns");
+        let theme = Theme::from_env(Some("1"), Some("1"));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        for c in screen.chars().filter(|c| *c != '\n') {
+            assert!(
+                (' '..='~').contains(&c),
+                "non-ascii {c:?} on an ascii column picker:\n{screen}"
+            );
+        }
+        assert!(screen.contains("[x] NAME (name)"), "{screen}");
+    }
+
     #[test]
     fn no_color_keeps_every_new_signal_in_text() {
         let tmp = listing_fixture(73);
@@ -1994,13 +2367,18 @@ mod tests {
         // Kind is still a marker, not a color.
         assert!(top.contains("nested/"), "{top}");
         assert!(top.contains("../"), "{top}");
-        assert!(top.contains("rows 1-15 of 75"), "{top}");
+        assert!(top.contains("rows 1-13 of 75"), "{top}");
+        // The column header names the three columns in text, and the
+        // rule under it is a shape rather than a color.
+        assert!(top.contains("NAME"), "{top}");
+        assert!(top.contains("SIZE"), "{top}");
+        assert!(top.contains("MODIFIED"), "{top}");
 
         app.nav.cursor_to_end();
         let screen = render_themed(&mut app, 80, 24, &theme);
         assert!(screen.contains("depth "), "{screen}");
         assert!(screen.contains("row 75 of 75"), "{screen}");
-        assert!(screen.contains("rows 61-75 of 75"), "{screen}");
+        assert!(screen.contains("rows 63-75 of 75"), "{screen}");
         assert!(screen.contains('█'), "the rail is still drawn");
     }
 
@@ -2019,8 +2397,11 @@ mod tests {
         }
         // The bearings are still all there, in words and in ASCII shapes.
         assert!(screen.contains("depth 1"), "{screen}");
-        assert!(screen.contains("rows 61-75 of 75"), "{screen}");
+        assert!(screen.contains("rows 63-75 of 75"), "{screen}");
         assert!(screen.contains('#'), "the rail still draws");
+        // The column header and its rule are ASCII too.
+        assert!(screen.contains("NAME"), "{screen}");
+        assert!(screen.contains("----"), "{screen}");
         assert!(screen.contains("0:~"), "{screen}");
 
         // The message-history pager is drawn from app-built lines, so it

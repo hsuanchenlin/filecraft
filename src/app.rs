@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime};
 
 use crate::agent::{self, Agent, AgentRequest};
 use crate::bearings::{self, Glyphs, Ladder};
+use crate::columns::{self, ColumnPicker, ColumnSet};
 use crate::command::{self, Command};
 use crate::config;
 use crate::editor;
@@ -79,6 +80,10 @@ pub enum Mode {
     /// `q` / Ctrl-C with a summary still running. Only `y` leaves.
     ConfirmQuit,
     FolderPicker(FolderPicker),
+    /// Choosing which columns the listing shows. Read-only like every
+    /// other overlay: it edits a copy, and nothing on screen changes
+    /// until it is confirmed.
+    ColumnPicker(ColumnPicker),
     /// Picking the files an AI summary will cover.
     FileSelector(FileSelector),
     /// Picking which AI CLI runs it, over the files already chosen.
@@ -197,6 +202,11 @@ pub struct App {
     /// resolving it again, so `:lang` changes the whole screen at the
     /// next frame and nothing can be left speaking the old language.
     pub lang: Lang,
+    /// Which columns the listing draws, and whether it draws their
+    /// header. One source of truth, like [`App::lang`]: the renderer
+    /// reads it off the app, so `:columns` changes the whole listing at
+    /// the next frame.
+    pub columns: ColumnSet,
     /// Where a language change is remembered, when there is anywhere to
     /// remember it. `None` means this session only, and `:lang` says so
     /// rather than silently forgetting.
@@ -283,6 +293,7 @@ impl App {
             nvim_on_path,
             home,
             lang,
+            columns: ColumnSet::default(),
             config_path: None,
             viewport_rows: 20,
             viewport_cols: 80,
@@ -324,6 +335,7 @@ impl App {
             Mode::ConfirmOp => self.handle_confirm_key(key),
             Mode::ConfirmQuit => self.handle_confirm_quit_key(key),
             Mode::FolderPicker(_) => self.handle_picker_key(key),
+            Mode::ColumnPicker(_) => self.handle_column_picker_key(key),
             Mode::FileSelector(_) => self.handle_selector_key(key),
             Mode::ProviderMenu { .. } => self.handle_provider_key(key),
             Mode::Pager(_) | Mode::JobLog(_) => self.handle_pager_key(key),
@@ -341,11 +353,11 @@ impl App {
                 Effect::None
             }
             KeyInput::PageDown => {
-                self.nav.move_cursor(self.viewport_rows as isize);
+                self.nav.move_cursor(self.listing_rows() as isize);
                 Effect::None
             }
             KeyInput::PageUp => {
-                self.nav.move_cursor(-(self.viewport_rows as isize));
+                self.nav.move_cursor(-(self.listing_rows() as isize));
                 Effect::None
             }
             KeyInput::Char('g') | KeyInput::Home => {
@@ -901,6 +913,36 @@ impl App {
         Effect::None
     }
 
+    /// Rows of *entries* the listing has: the whole listing area, less
+    /// the column header when one is drawn.
+    ///
+    /// The same coupling the reader, the folder picker, and the log
+    /// viewer have. `ui` reserves [`columns::HEADER_ROWS`] out of the
+    /// same area, so PageUp/PageDown and the scroll margin count the
+    /// rows that actually hold entries rather than the two above them.
+    pub fn listing_rows(&self) -> usize {
+        self.viewport_rows
+            .saturating_sub(self.listing_header_rows())
+            .max(1)
+    }
+
+    /// Rows the column header costs, which is none when it is off.
+    pub fn listing_header_rows(&self) -> usize {
+        if self.columns.header {
+            columns::HEADER_ROWS
+        } else {
+            0
+        }
+    }
+
+    /// Rows the column picker has, mirrored the same way the folder
+    /// picker's are.
+    pub fn column_picker_rows(&self) -> usize {
+        self.viewport_rows
+            .saturating_sub(ColumnPicker::FRAME_ROWS)
+            .max(1)
+    }
+
     /// Columns of text the reader has, mirrored from the terminal the
     /// same way the ladder's width is: the frame it draws sits inside the
     /// listing area, so scrolling and drawing agree on what a row is.
@@ -1249,6 +1291,8 @@ impl App {
             Command::Summarize => self.cmd_summarize(),
             Command::Log => self.cmd_log(),
             Command::Language { code } => self.cmd_language(code.as_deref()),
+            Command::Columns { spec } => self.cmd_columns(spec.as_deref()),
+            Command::Header { on } => self.cmd_header(on),
             Command::Help => self.show_help(),
             Command::Quit => self.quit_or_confirm(),
             Command::Agent { args } => self.cmd_agent(args),
@@ -1683,6 +1727,129 @@ impl App {
         }
         Effect::None
     }
+
+    /// `:columns` / `:cols` - which columns the listing shows.
+    ///
+    /// With no list it opens the picker, which is the discoverable
+    /// half: every column, whether it is on, and the header switch, all
+    /// in one place. With a list it sets them straight away, which is
+    /// the scriptable half and the one `:set columns=...` reaches.
+    fn cmd_columns(&mut self, spec: Option<&str>) -> Effect {
+        let Some(spec) = spec else {
+            self.mode = Mode::ColumnPicker(ColumnPicker::open(self.columns.clone()));
+            return Effect::None;
+        };
+        let chosen = match ColumnSet::parse_spec(spec) {
+            Ok(chosen) => chosen,
+            Err(e) => return self.err(e.message(self.lang)),
+        };
+        let set = ColumnSet::new(chosen, self.columns.header);
+        self.apply_columns(set)
+    }
+
+    /// `:header [on|off]` - the column header row above the listing.
+    /// With no word it reports whether it is drawn, so a user who cannot
+    /// see it still has a way to find out.
+    fn cmd_header(&mut self, on: Option<bool>) -> Effect {
+        let Some(on) = on else {
+            let line = self.lang.header_is(self.columns.header);
+            self.push_msg(Level::Info, line);
+            return Effect::None;
+        };
+        let mut set = self.columns.clone();
+        set.header = on;
+        self.apply_columns(set)
+    }
+
+    /// Put a new listing shape in force and write it down.
+    ///
+    /// The confirmation names what actually changed - a `:header off`
+    /// says so about the header and not about a column list nobody
+    /// touched - and a command that changed nothing still confirms,
+    /// because one that says nothing reads as broken. A preference that
+    /// could not be saved is said out loud rather than swallowed, the
+    /// same contract `:lang` has.
+    fn apply_columns(&mut self, set: ColumnSet) -> Effect {
+        let columns_changed = set.visible() != self.columns.visible();
+        let header_changed = set.header != self.columns.header;
+        self.columns = set;
+        let lang = self.lang;
+        if columns_changed || !header_changed {
+            let spec = self.columns.spec();
+            self.push_msg(Level::Ok, lang.columns_set(&spec));
+        }
+        if header_changed {
+            self.push_msg(Level::Ok, lang.header_is(self.columns.header));
+        }
+        match &self.config_path {
+            Some(path) => {
+                let path = path.clone();
+                match config::save_columns(&path, &self.columns) {
+                    Ok(()) => {
+                        let saved = lang.columns_saved(&path.display().to_string());
+                        self.push_msg(Level::Info, saved);
+                    }
+                    Err(e) => {
+                        let note = lang.columns_not_saved(&e.to_string());
+                        self.push_msg(Level::Error, note);
+                    }
+                }
+            }
+            None => {
+                let note = lang.columns_not_saved(lang.fs_home_not_found());
+                self.push_msg(Level::Error, note);
+            }
+        }
+        Effect::None
+    }
+
+    /// The column picker's keys. Space toggles, Enter/`c` applies, and
+    /// `q`/Esc leaves the listing exactly as it was - the picker has
+    /// been editing a copy the whole time.
+    fn handle_column_picker_key(&mut self, key: KeyInput) -> Effect {
+        let rows = self.column_picker_rows();
+        let lang = self.lang;
+        let mut apply = false;
+        let mut cancel = false;
+        let mut refused = false;
+        {
+            let Mode::ColumnPicker(picker) = &mut self.mode else {
+                return Effect::None;
+            };
+            match key {
+                KeyInput::Char('j') | KeyInput::Down => picker.move_cursor(1),
+                KeyInput::Char('k') | KeyInput::Up => picker.move_cursor(-1),
+                KeyInput::PageDown => picker.move_cursor(rows as isize),
+                KeyInput::PageUp => picker.move_cursor(-(rows as isize)),
+                KeyInput::Char('g') | KeyInput::Home => picker.cursor_to_start(),
+                KeyInput::Char('G') | KeyInput::End => picker.cursor_to_end(),
+                KeyInput::Char(' ') => refused = !picker.toggle(),
+                KeyInput::Enter | KeyInput::Char('c') => apply = true,
+                KeyInput::Esc | KeyInput::Char('q') => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.mode = Mode::Browse;
+            self.push_msg(Level::Info, lang.columns_picker_cancelled().to_string());
+            return Effect::None;
+        }
+        if apply {
+            let Mode::ColumnPicker(picker) = &self.mode else {
+                return Effect::None;
+            };
+            let set = picker.set.clone();
+            self.mode = Mode::Browse;
+            return self.apply_columns(set);
+        }
+        if refused {
+            // The name row is the one row Space does nothing to, and
+            // saying so is better than a key that seems not to work.
+            let note = lang.name_column_is_always_shown().to_string();
+            self.push_msg(Level::Info, note);
+        }
+        Effect::None
+    }
 }
 
 /// The full help text, shared by the `?` key and the `help` command.
@@ -1696,6 +1863,7 @@ pub fn help_lines(lang: Lang) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::columns::Column;
     use crate::i18n::Lang;
     use crate::summarize::Failure;
     use std::fs;
@@ -4532,6 +4700,303 @@ mod tests {
         }
         assert_eq!(app.messages.len(), MAX_MESSAGES);
         assert_eq!(last_msg(&app).text, "msg 299");
+    }
+
+    // ---- `:columns`, `:header`, and the column picker ---------------------
+
+    /// An app whose settings file is a real one under a fixture, so the
+    /// persistence half of a column change runs without touching the
+    /// user's own `~/.config`.
+    fn app_with_config(tmp: &tempfile::TempDir) -> (tempfile::TempDir, App) {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = app_in(tmp);
+        app.config_path = Some(home.path().join("filecraft").join("config.toml"));
+        (home, app)
+    }
+
+    fn saved_columns(app: &App) -> ColumnSet {
+        let path = app.config_path.clone().expect("a config path");
+        let text = config::load(&path).expect("a config file");
+        config::read_columns(&text, &ColumnSet::default())
+    }
+
+    #[test]
+    fn a_new_app_lists_the_columns_filecraft_always_drew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = app_in(&tmp);
+        assert_eq!(app.columns.spec(), "name,size,modified");
+        assert!(app.columns.header);
+    }
+
+    #[test]
+    fn columns_with_a_list_sets_them_and_writes_them_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        assert_eq!(
+            app.execute_line("columns name,size,kind,owner"),
+            Effect::None
+        );
+        assert_eq!(app.columns.spec(), "name,size,kind,owner");
+        assert_eq!(saved_columns(&app).spec(), "name,size,kind,owner");
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.text.contains("columns set to name,size,kind,owner")));
+    }
+
+    #[test]
+    fn set_columns_is_the_same_command_written_differently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("set columns=name,size,modified,created");
+        assert_eq!(app.columns.spec(), "name,size,modified,created");
+        app.execute_line("cols name kind");
+        assert_eq!(app.columns.spec(), "name,kind");
+    }
+
+    #[test]
+    fn a_list_that_leaves_the_name_out_still_gets_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns size,modified");
+        assert_eq!(app.columns.spec(), "name,size,modified");
+    }
+
+    #[test]
+    fn a_list_naming_no_column_is_refused_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        let before = app.columns.clone();
+        app.execute_line("columns name,colour");
+        assert_eq!(app.columns, before);
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(
+            last_msg(&app).text.contains("colour"),
+            "{:?}",
+            last_msg(&app)
+        );
+        // And nothing was written: a refused command saves nothing.
+        assert!(config::load(&app.config_path.clone().unwrap()).is_none());
+    }
+
+    #[test]
+    fn an_unknown_setting_is_refused_by_the_parser() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("set theme=dark");
+        assert_eq!(last_msg(&app).level, Level::Error);
+        assert!(
+            last_msg(&app).text.contains("theme"),
+            "{:?}",
+            last_msg(&app)
+        );
+    }
+
+    #[test]
+    fn a_change_names_what_it_changed_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns name,kind");
+        let said: Vec<&str> = app.messages.iter().map(|m| m.text.as_str()).collect();
+        assert!(said.iter().any(|t| t.contains("columns set to name,kind")));
+        assert!(
+            !said.iter().any(|t| t.contains("column header row:")),
+            "a column list reported a header nobody touched: {said:?}"
+        );
+
+        let before = app.messages.len();
+        app.execute_line("header off");
+        let said: Vec<&str> = app.messages[before..]
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(said.iter().any(|t| t.contains("column header row: off")));
+        assert!(
+            !said.iter().any(|t| t.contains("columns set to")),
+            "a header switch reported a column list nobody touched: {said:?}"
+        );
+
+        // A command that changes nothing still confirms: one that says
+        // nothing reads as broken.
+        let before = app.messages.len();
+        app.execute_line("columns name,kind");
+        assert!(app.messages[before..]
+            .iter()
+            .any(|m| m.text.contains("columns set to name,kind")));
+    }
+
+    #[test]
+    fn header_reports_with_no_word_and_switches_with_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("header");
+        assert!(last_msg(&app).text.contains("on"), "{:?}", last_msg(&app));
+        // Reporting is not a change: nothing was written.
+        assert!(config::load(&app.config_path.clone().unwrap()).is_none());
+
+        app.execute_line("header off");
+        assert!(!app.columns.header);
+        assert!(!saved_columns(&app).header);
+        app.execute_line("set header=on");
+        assert!(app.columns.header);
+        assert!(saved_columns(&app).header);
+    }
+
+    #[test]
+    fn a_column_change_with_nowhere_to_save_says_so_and_still_takes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        assert_eq!(app.config_path, None);
+        app.execute_line("columns name,kind");
+        assert_eq!(app.columns.spec(), "name,kind");
+        assert_eq!(last_msg(&app).level, Level::Error);
+    }
+
+    #[test]
+    fn columns_with_no_list_opens_the_picker_over_the_current_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns");
+        let Mode::ColumnPicker(picker) = &app.mode else {
+            panic!("expected the column picker, got {:?}", app.mode);
+        };
+        assert_eq!(picker.set, app.columns);
+    }
+
+    #[test]
+    fn the_picker_applies_on_enter_and_remembers_the_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns");
+        // Down to `kind`, Space, then Enter.
+        for _ in 0..4 {
+            app.handle_key(KeyInput::Char('j'));
+        }
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Enter);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.columns.spec(), "name,size,modified,kind");
+        assert_eq!(saved_columns(&app).spec(), "name,size,modified,kind");
+    }
+
+    #[test]
+    fn the_picker_leaves_the_listing_alone_when_it_is_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        let before = app.columns.clone();
+        app.execute_line("columns");
+        for _ in 0..4 {
+            app.handle_key(KeyInput::Char('j'));
+        }
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.columns, before);
+        assert!(config::load(&app.config_path.clone().unwrap()).is_none());
+    }
+
+    #[test]
+    fn the_picker_says_why_space_did_nothing_on_the_name_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns");
+        app.handle_key(KeyInput::Char(' '));
+        assert!(
+            last_msg(&app).text.contains("always shown"),
+            "{:?}",
+            last_msg(&app)
+        );
+        let Mode::ColumnPicker(picker) = &app.mode else {
+            panic!("the picker closed");
+        };
+        assert!(picker.set.contains(Column::Name));
+    }
+
+    #[test]
+    fn the_pickers_last_row_is_the_header_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_home, mut app) = app_with_config(&tmp);
+        app.execute_line("columns");
+        app.handle_key(KeyInput::Char('G'));
+        app.handle_key(KeyInput::Char(' '));
+        app.handle_key(KeyInput::Char('c'));
+        assert!(!app.columns.header);
+        assert!(!saved_columns(&app).header);
+    }
+
+    #[test]
+    fn no_key_in_the_column_picker_ever_mutates_the_filesystem() {
+        // The picker's twin of the browse-key rule: it is a chooser, and
+        // the only thing it can change is which columns are drawn.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        let can = tempfile::tempdir().unwrap();
+        let before = snapshot(tmp.path());
+        let runner = FakeRunner::default();
+        let mut keys: Vec<KeyInput> = (0x20u8..0x7f).map(|c| KeyInput::Char(c as char)).collect();
+        keys.extend([
+            KeyInput::Enter,
+            KeyInput::Esc,
+            KeyInput::Backspace,
+            KeyInput::Up,
+            KeyInput::Down,
+            KeyInput::Left,
+            KeyInput::Right,
+            KeyInput::PageUp,
+            KeyInput::PageDown,
+            KeyInput::Home,
+            KeyInput::End,
+        ]);
+        for key in keys {
+            let mut app = app_with_can(&tmp, &can);
+            app.runner = Box::new(runner.clone());
+            app.execute_line("columns");
+            let effect = app.handle_key(key);
+            assert!(
+                !matches!(effect, Effect::SpawnDetached { .. }),
+                "{key:?} spawned a process from the column picker"
+            );
+            assert!(app.pending.is_none(), "{key:?} armed an operation");
+            assert!(!app.job_active(), "{key:?} started a summary");
+            assert_eq!(snapshot(tmp.path()), before, "{key:?} changed the tree");
+            assert!(can_contents(&can).is_empty(), "{key:?} trashed something");
+            assert!(
+                runner.started.lock().unwrap().is_empty(),
+                "{key:?} ran an AI provider"
+            );
+        }
+    }
+
+    #[test]
+    fn the_listing_gives_up_its_rows_to_the_header_it_draws() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_in(&tmp);
+        app.set_viewport(15, 80);
+        assert!(app.columns.header);
+        assert_eq!(app.listing_rows(), 15 - columns::HEADER_ROWS);
+        app.columns.header = false;
+        assert_eq!(app.listing_rows(), 15);
+        // A terminal too short for the header still has a row to page by.
+        app.columns.header = true;
+        app.set_viewport(1, 80);
+        assert_eq!(app.listing_rows(), 1);
+    }
+
+    #[test]
+    fn paging_moves_by_the_rows_that_actually_hold_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..60 {
+            fs::write(tmp.path().join(format!("f{i:03}.txt")), "").unwrap();
+        }
+        let mut app = app_in(&tmp);
+        app.set_viewport(15, 80);
+        app.handle_key(KeyInput::PageDown);
+        assert_eq!(app.nav.cursor, 15 - columns::HEADER_ROWS);
+        app.columns.header = false;
+        app.nav.cursor_to_start();
+        app.handle_key(KeyInput::PageDown);
+        assert_eq!(app.nav.cursor, 15);
     }
 
     #[test]

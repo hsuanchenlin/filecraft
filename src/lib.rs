@@ -16,6 +16,10 @@
 //! - [`trash`] is the only removal Filecraft has: a recoverable move into
 //!   the system Trash, behind a seam so the flow is testable.
 //! - [`nav`] models directory listings and cursor/filter state.
+//! - [`owner`] resolves a uid/gid to the name the system knows it by.
+//! - [`columns`] is the listing's shape: which columns are shown, how
+//!   wide each is in the language on screen, and what each says about an
+//!   entry.
 //! - [`editor`] constructs editor/preview invocations (`$EDITOR`, `nvim`).
 //! - [`preview`] builds the built-in metadata/text preview and reads
 //!   files for the reader.
@@ -56,6 +60,7 @@ pub mod agent;
 pub mod app;
 pub mod bearings;
 pub mod cli;
+pub mod columns;
 pub mod command;
 pub mod config;
 pub mod editor;
@@ -65,6 +70,7 @@ pub mod joblog;
 pub mod markdown;
 pub mod multiselect;
 pub mod nav;
+pub mod owner;
 pub mod pager;
 pub mod pathcheck;
 pub mod picker;

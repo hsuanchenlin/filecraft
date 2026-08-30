@@ -12,28 +12,37 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use filecraft::app::{App, Effect, KeyInput, Level};
 use filecraft::cli::{self, CliAction};
+use filecraft::columns::ColumnSet;
 use filecraft::config;
 use filecraft::editor;
 use filecraft::i18n::{self, Lang};
 use filecraft::nav::NavState;
 use filecraft::ui::{self, Theme};
 
-/// Read the language the user asked for, and where they asked for it.
+/// Everything the user's own settings decide, read once at startup.
+struct Settings {
+    lang: Lang,
+    columns: ColumnSet,
+    /// Where a change is written back, when there is anywhere to write.
+    /// `None` is a session that can change a setting but not remember
+    /// it, and the commands say so rather than pretending they saved.
+    path: Option<PathBuf>,
+}
+
+/// Read the language and the listing shape the user asked for.
 ///
 /// The one place the environment and the config file are touched:
-/// [`i18n::resolve`] decides, and it is handed strings so the decision
-/// itself stays testable. The config path comes back too, because it is
-/// also where `:lang` writes a change - a path Filecraft could not work
-/// out is a session that can switch language but not remember it, and
-/// [`App::cmd_language`] says so rather than pretending it saved.
-fn resolve_language(home: Option<&PathBuf>) -> (Lang, Option<PathBuf>) {
-    let config_path = config::path(
+/// [`i18n::resolve`] decides the language and [`config::read_columns`]
+/// the listing, and both are handed strings so the decisions themselves
+/// stay testable without a home directory.
+fn resolve_settings(home: Option<&PathBuf>) -> Settings {
+    let path = config::path(
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .as_deref(),
         home.map(PathBuf::as_path),
     );
-    let configured = config_path.as_deref().and_then(config::load);
+    let configured = path.as_deref().and_then(config::load);
     let env = std::env::var("FILECRAFT_LANG").ok();
     let lc_all = std::env::var("LC_ALL").ok();
     let lc_messages = std::env::var("LC_MESSAGES").ok();
@@ -45,7 +54,15 @@ fn resolve_language(home: Option<&PathBuf>) -> (Lang, Option<PathBuf>) {
         lc_messages: lc_messages.as_deref(),
         lang: lang_env.as_deref(),
     });
-    (lang, config_path)
+    let columns = configured
+        .as_deref()
+        .map(|text| config::read_columns(text, &ColumnSet::default()))
+        .unwrap_or_default();
+    Settings {
+        lang,
+        columns,
+        path,
+    }
 }
 
 fn main() -> ExitCode {
@@ -53,7 +70,8 @@ fn main() -> ExitCode {
     // Resolved before argv is even interpreted, because `--help` and a
     // usage error are the first things filecraft can say.
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let (lang, config_path) = resolve_language(home.as_ref());
+    let settings = resolve_settings(home.as_ref());
+    let lang = settings.lang;
     let cli = match cli::parse_args(&args) {
         Ok(CliAction::Help) => {
             print!("{}", lang.cli_usage());
@@ -108,7 +126,7 @@ fn main() -> ExitCode {
         };
     }
 
-    match run_tui(cli.directory, home, lang, config_path) {
+    match run_tui(cli.directory, home, settings) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("filecraft: {error}");
@@ -117,18 +135,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_tui(
-    directory: PathBuf,
-    home: Option<PathBuf>,
-    lang: Lang,
-    config_path: Option<PathBuf>,
-) -> io::Result<()> {
+fn run_tui(directory: PathBuf, home: Option<PathBuf>, settings: Settings) -> io::Result<()> {
+    let lang = settings.lang;
     let nav = NavState::new(&directory).map_err(|e| io::Error::other(e.message(lang)))?;
     let editor_env = std::env::var("EDITOR").ok();
     let path_env = std::env::var("PATH").ok();
     let nvim_on_path = editor::find_in_path("nvim", path_env.as_deref()).is_some();
     let mut app = App::new(nav, editor_env, nvim_on_path, home, lang);
-    app.config_path = config_path;
+    app.columns = settings.columns;
+    app.config_path = settings.path;
     let no_color = std::env::var("NO_COLOR").ok();
     let ascii = std::env::var("FILECRAFT_ASCII").ok();
     let theme = Theme::from_env(no_color.as_deref(), ascii.as_deref());

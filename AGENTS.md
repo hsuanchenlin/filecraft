@@ -10,10 +10,11 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 
 - `cargo test` is the full local test command (module tests plus `tests/cli.rs`).
 - `cargo run -- --list [DIR]` is the non-TTY listing path.
-- `src/bearings.rs` owns every pure display computation (ladder, rail,
-  scroll margin, relative time, speakable status, width padding,
-  sanitizing, hanging-indent wrapping). Put new rendering arithmetic
-  there, not in `ui.rs`, so it stays testable without a TTY.
+- `src/bearings.rs` owns the shared pure display primitives (ladder,
+  rail, scroll margin, relative time, speakable status, width padding,
+  sanitizing, hanging-indent wrapping). Pane-specific modules build on
+  them; keep rendering arithmetic out of `ui.rs` so it stays testable
+  without a TTY.
 - The reader (`l` on a text/Markdown file) splits the same way:
   `src/markdown.rs` classifies lines and wraps them to a column budget,
   `src/pager.rs` owns scroll/search/position, `ui.rs` only turns a
@@ -31,6 +32,32 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   Enter/`m` select into the existing confirm flow; `q`/Esc cancel.
   `:move <path>` still skips the picker. The picker does not change
   `NavState::cwd` - cancelling lands on the same listing row.
+- The listing is a table and `src/columns.rs` owns its shape: which
+  columns are visible (`ColumnSet`, always containing `Column::Name`),
+  how wide each is *in the language on screen*
+  (`Column::width` = `max(content, header)`, so `:header` never reflows
+  the rows), what each cell says (`Column::cell`), the extension-driven
+  `FileKind` table, and the width budget (`layout`) that hands the name
+  whatever the fixed columns leave and drops columns by
+  `Column::drop_rank` when that is not enough - never `Name` or `Size`.
+  `ui.rs` only draws it. `columns::HEADER_ROWS` must match what
+  `ui::draw_listing` reserves and what `App::listing_rows` subtracts,
+  the same coupling `pager::FRAME_ROWS` and `picker::FRAME_ROWS` have -
+  browse paging and the scroll margin count entry rows, not the header
+  above them. Everything a column can say is read once in
+  `nav::read_directory` (`created`, `mode`, `owner`, `group` on
+  `nav::Entry`), so drawing a row never touches the filesystem; the
+  birth-time fallback to `modified` is decided in `columns` for the same
+  reason. `src/owner.rs` is the only FFI in the crate - `getpwuid_r` /
+  `getgrgid_r` behind a process-wide memo, because macOS keeps users in
+  Directory Services and `/etc/passwd` would be a wrong answer here.
+- `:columns` / `:cols` / `:header` / `:set` all land on
+  `Command::Columns` / `Command::Header`: `set` is normalized in
+  `command::parse`, so nothing downstream knows the word. `:columns`
+  with no list opens `columns::ColumnPicker`, which edits a *copy* -
+  cancelling leaves the listing untouched, like the folder picker.
+  Adding or changing a column still means `?` help, `help_lines`, the
+  README tables, and both languages in the same change.
 - Screens are asserted as golden frames in `src/ui.rs` tests via ratatui's
   `TestBackend` at 80x24, 100x30, 132x40, and 60x20. A wide character owns
   two cells and only the first carries the symbol; dump a buffer with the
@@ -222,12 +249,19 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - `src/config.rs` is `~/.config/filecraft/config.toml` (or
   `$XDG_CONFIG_HOME`). Deliberately not a TOML library: a line-oriented
   reader and rewriter whose one job is that **anything Filecraft does not
-  understand survives a `:lang`**. A top-level key added to a file that
-  already has a `[table]` must go in *ahead* of the first header or
-  `read_language` will never see it again - that is what `with_language`
-  is careful about, and it has a test.
-- `:lang <code>` / `:language` is the only command that writes outside
-  the browsed tree, and it writes one key. `App::config_path` is `None`
+  understand survives a `:lang` or a `:columns`**. A top-level key added
+  to a file that already has a `[table]` must go in *ahead* of the first
+  header or `read_language` will never see it again - that is what
+  `with_language` is careful about, and it has a test. Its mirror image
+  is `with_columns`: a `[columns]` table it has to add goes at the *end*,
+  the only place a new header cannot capture a key that was already
+  top-level, and the two keys it writes must land before the next header
+  or they belong to that table instead. A word naming a column this
+  version does not have is skipped, not fatal - a settings file from a
+  later version still has to start this one.
+- `:lang <code>` / `:language` and `:columns` / `:header` are the only
+  commands that write outside the browsed tree, and they write their own
+  keys and nothing else. `App::config_path` is `None`
   when there is nowhere to write; the session still switches and says so
   rather than pretending it saved. Adding or changing a key or command
   still means `?` help, `help_lines`, the README table, and both
@@ -235,7 +269,9 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
 - `tests/cli.rs` pins `FILECRAFT_LANG` on every invocation (`bin()` is
   English, `bin_in`/`bin_with_locale` choose deliberately). Without it a
   machine whose `LANG` is `zh_TW.UTF-8` fails every English assertion for
-  a reason that has nothing to do with the code.
+  a reason that has nothing to do with the code. `bin_with_config` also
+  clears `HOME` and points `XDG_CONFIG_HOME` at a fixture, so a settings
+  test can never read - or be decided by - the developer's own file.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping

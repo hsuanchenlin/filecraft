@@ -38,6 +38,14 @@ pub enum Command {
     /// argument reports the current one; a code switches to it and
     /// remembers the choice.
     Language { code: Option<String> },
+    /// `columns [list]` / `cols [list]` - which columns the listing
+    /// shows. No list opens the picker; a list sets them and remembers
+    /// the choice. `:set columns=...` arrives here too.
+    Columns { spec: Option<String> },
+    /// `header [on|off]` - the column header row above the listing. No
+    /// argument reports whether it is drawn. `:set header=...` arrives
+    /// here too.
+    Header { on: Option<bool> },
     /// `help` - show the help screen.
     Help,
     /// `quit` - leave Filecraft.
@@ -53,6 +61,8 @@ pub enum ParseError {
     Empty,
     /// The first word is not a known command.
     Unknown(String),
+    /// `set` was given a key that names no setting.
+    UnknownSetting(String),
     /// A known command was given the wrong arguments.
     Usage { command: &'static str, usage: Usage },
     /// A quote was opened but never closed.
@@ -69,6 +79,7 @@ impl ParseError {
         match self {
             ParseError::Empty => lang.empty_command().to_string(),
             ParseError::Unknown(word) => lang.unknown_command(word),
+            ParseError::UnknownSetting(word) => lang.unknown_setting(word, SETTINGS),
             ParseError::Usage { command, usage } => lang.usage_line(command, *usage),
             ParseError::UnterminatedQuote => lang.unterminated_quote().to_string(),
             ParseError::TrailingEscape => lang.trailing_escape().to_string(),
@@ -81,6 +92,9 @@ impl std::fmt::Display for ParseError {
         f.write_str(&self.message(Lang::En))
     }
 }
+
+/// The settings `:set` can name, as an error line lists them.
+const SETTINGS: &str = "columns, header";
 
 /// Split a command line into words.
 ///
@@ -242,6 +256,55 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
                 usage: Usage::Language,
             }),
         },
+        // The listing's own shape. A list is read as one value however
+        // it is written - `:columns name,size` and `:columns name size`
+        // are the same request - so the argument count is not a trap.
+        "columns" | "cols" => Ok(Command::Columns {
+            spec: if args.is_empty() {
+                None
+            } else {
+                Some(args.join(","))
+            },
+        }),
+        "header" => match args {
+            [] => Ok(Command::Header { on: None }),
+            [word] => switch(word)
+                .map(|on| Command::Header { on: Some(on) })
+                .ok_or(ParseError::Usage {
+                    command: "header",
+                    usage: Usage::Header,
+                }),
+            _ => Err(ParseError::Usage {
+                command: "header",
+                usage: Usage::Header,
+            }),
+        },
+        // `set key=value`, the spelling the brief asks for. It is a
+        // second way to say `:columns` and `:header` rather than a third
+        // setting surface: an unknown key is refused here, so nothing
+        // downstream has to know the word `set` at all.
+        "set" => {
+            let joined = args.join(" ");
+            let Some((key, value)) = joined.split_once('=') else {
+                return Err(ParseError::Usage {
+                    command: "set",
+                    usage: Usage::Set,
+                });
+            };
+            let value = value.trim();
+            match key.trim().to_lowercase().as_str() {
+                "columns" | "cols" => Ok(Command::Columns {
+                    spec: Some(value.to_string()),
+                }),
+                "header" => switch(value)
+                    .map(|on| Command::Header { on: Some(on) })
+                    .ok_or(ParseError::Usage {
+                        command: "set",
+                        usage: Usage::Header,
+                    }),
+                other => Err(ParseError::UnknownSetting(other.to_string())),
+            }
+        }
         "help" | "?" => no_args(
             args,
             Command::Help,
@@ -270,6 +333,17 @@ fn typed(head: &str, aliases: &[&'static str]) -> &'static str {
         .copied()
         .find(|alias| *alias == head)
         .unwrap_or(aliases[0])
+}
+
+/// An on/off word, in the spellings a person writes. Anything else is
+/// not a switch, and the caller says so with a usage line rather than
+/// guessing which one was meant.
+fn switch(word: &str) -> Option<bool> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "show" => Some(true),
+        "off" | "false" | "no" | "0" | "hide" => Some(false),
+        _ => None,
+    }
 }
 
 fn no_args(
@@ -474,6 +548,95 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parse_columns_with_no_list_opens_the_picker() {
+        assert_eq!(parse("columns").unwrap(), Command::Columns { spec: None });
+        assert_eq!(parse("cols").unwrap(), Command::Columns { spec: None });
+    }
+
+    #[test]
+    fn parse_columns_reads_a_list_however_it_is_written() {
+        let expected = Command::Columns {
+            spec: Some("name,size,modified".to_string()),
+        };
+        assert_eq!(parse("columns name,size,modified").unwrap(), expected);
+        assert_eq!(parse("columns name size modified").unwrap(), expected);
+        assert_eq!(parse("cols name,size modified").unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_header_takes_an_on_off_word_or_nothing() {
+        assert_eq!(parse("header").unwrap(), Command::Header { on: None });
+        for word in ["on", "ON", "true", "yes", "1", "show"] {
+            assert_eq!(
+                parse(&format!("header {word}")).unwrap(),
+                Command::Header { on: Some(true) },
+                "header {word}"
+            );
+        }
+        for word in ["off", "false", "no", "0", "hide"] {
+            assert_eq!(
+                parse(&format!("header {word}")).unwrap(),
+                Command::Header { on: Some(false) },
+                "header {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_header_refuses_a_word_that_is_not_a_switch() {
+        assert_eq!(
+            parse("header maybe"),
+            Err(ParseError::Usage {
+                command: "header",
+                usage: Usage::Header,
+            })
+        );
+        assert_eq!(
+            parse("header on off"),
+            Err(ParseError::Usage {
+                command: "header",
+                usage: Usage::Header,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_set_is_a_second_spelling_of_the_same_two_commands() {
+        assert_eq!(
+            parse("set columns=name,size,modified,created").unwrap(),
+            Command::Columns {
+                spec: Some("name,size,modified,created".to_string()),
+            }
+        );
+        // Spaces around the `=` are how people type it.
+        assert_eq!(
+            parse("set columns = name, size").unwrap(),
+            Command::Columns {
+                spec: Some("name, size".to_string()),
+            }
+        );
+        assert_eq!(
+            parse("set header=off").unwrap(),
+            Command::Header { on: Some(false) }
+        );
+    }
+
+    #[test]
+    fn parse_set_refuses_a_key_that_names_no_setting() {
+        assert_eq!(
+            parse("set theme=dark"),
+            Err(ParseError::UnknownSetting("theme".to_string()))
+        );
+        assert_eq!(
+            parse("set columns"),
+            Err(ParseError::Usage {
+                command: "set",
+                usage: Usage::Set,
+            })
+        );
     }
 
     #[test]

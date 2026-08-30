@@ -344,3 +344,72 @@ fn a_usage_error_is_reported_in_the_screens_language() {
     assert!(stderr.contains("未知的選項 '--not-a-flag'"), "{stderr}");
     assert!(stderr.contains("filecraft --help"), "{stderr}");
 }
+
+/// A settings file under a fixture config root, as the binary reads it.
+fn write_config(root: &std::path::Path, text: &str) {
+    let dir = root.join("filecraft");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), text).unwrap();
+}
+
+/// The binary, reading a settings file the test wrote. `HOME` is cleared
+/// so the person running the suite can never have their own
+/// `~/.config/filecraft/config.toml` decide the answer.
+fn bin_with_config(root: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
+    cmd.env_remove("FILECRAFT_LANG")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .env_remove("LANG")
+        .env_remove("HOME")
+        .env("XDG_CONFIG_HOME", root);
+    cmd
+}
+
+#[test]
+fn a_columns_table_in_the_settings_file_does_not_disturb_the_language() {
+    // The sharp edge of a line-oriented settings file: a top-level key
+    // written *after* a `[table]` header belongs to that table. The
+    // binary has to read `language` past a `[columns]` block, so this
+    // asserts the whole file end to end rather than the reader alone.
+    let config = tempfile::tempdir().unwrap();
+    write_config(
+        config.path(),
+        "language = \"zh-TW\"\n\n[columns]\nvisible = [\"name\", \"size\", \"kind\"]\nheader = false\n",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+
+    let output =
+        output_with_piped_stdio(bin_with_config(config.path()).arg("--list").arg(tmp.path()));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The language still resolved from the file, past the table.
+    assert!(stdout.contains("靜態列表 (沒有 TTY)"), "{stdout}");
+    assert!(stdout.contains("notes.md"), "{stdout}");
+}
+
+#[test]
+fn a_settings_file_naming_a_column_filecraft_does_not_have_still_starts() {
+    // A file written by a later version must not stop this one.
+    let config = tempfile::tempdir().unwrap();
+    write_config(
+        config.path(),
+        "[columns]\nvisible = [\"name\", \"tags\"]\nheader = maybe\n",
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+
+    let output =
+        output_with_piped_stdio(bin_with_config(config.path()).arg("--list").arg(tmp.path()));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("notes.md"));
+}
