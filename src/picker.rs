@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::fsops::{self, FsError};
+use crate::i18n::Lang;
 use crate::nav::{self, EntryKind};
 
 /// Rows the picker's own frame costs inside the listing area: two
@@ -102,8 +103,8 @@ impl FolderPicker {
     }
 
     /// Header line naming the destination currently under the cursor.
-    pub fn dest_line(&self) -> String {
-        format!("dest: {}", self.destination().display())
+    pub fn dest_line(&self, lang: Lang) -> String {
+        lang.destination_line(&self.destination().display().to_string())
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
@@ -242,6 +243,7 @@ impl FolderPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::Lang;
     use std::fs;
 
     fn fixture() -> (tempfile::TempDir, FolderPicker) {
@@ -338,15 +340,17 @@ mod tests {
     #[test]
     fn dest_line_names_the_focused_folder() {
         let (_tmp, mut picker) = fixture();
-        assert!(picker.dest_line().starts_with("dest: "));
-        assert!(picker.dest_line().contains(picker.cwd.to_str().unwrap()));
+        assert!(picker.dest_line(Lang::En).starts_with("dest: "));
+        assert!(picker
+            .dest_line(Lang::En)
+            .contains(picker.cwd.to_str().unwrap()));
         picker.cursor = picker
             .entries
             .iter()
             .position(|e| e.name == "docs")
             .unwrap();
         assert!(picker.destination().ends_with("docs"));
-        assert!(picker.dest_line().contains("docs"));
+        assert!(picker.dest_line(Lang::En).contains("docs"));
     }
 
     #[test]

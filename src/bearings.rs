@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::i18n::Lang;
 use crate::nav::{EntryKind, NavState};
 use crate::preview::format_size;
 
@@ -594,45 +595,29 @@ pub fn viewport_range(total: usize, offset: usize, rows: usize) -> Option<(usize
     Some((first + 1, last + 1))
 }
 
-/// Compact age of a timestamp: at most four columns, no timezone needed.
-pub fn relative_time(now: SystemTime, then: SystemTime) -> String {
+/// Compact age of a timestamp, in the screen's language and no wider
+/// than [`Lang::age_width`] columns. No timezone needed.
+pub fn relative_time(now: SystemTime, then: SystemTime, lang: Lang) -> String {
     let seconds = now
         .duration_since(then)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    const WEEK: u64 = 7 * DAY;
-    const YEAR: u64 = 365 * DAY;
-    if seconds < MINUTE {
-        format!("{seconds}s")
-    } else if seconds < HOUR {
-        format!("{}m", seconds / MINUTE)
-    } else if seconds < DAY {
-        format!("{}h", seconds / HOUR)
-    } else if seconds < WEEK {
-        format!("{}d", seconds / DAY)
-    } else if seconds < YEAR {
-        format!("{}w", seconds / WEEK)
-    } else {
-        format!("{}y", seconds / YEAR)
-    }
+    lang.age(seconds)
 }
 
 /// The word for an entry's kind. Spoken, not drawn - the `/ @ @!`
 /// markers stay the compact form in the listing itself.
-pub fn kind_word(kind: &EntryKind, is_parent: bool) -> &'static str {
+pub fn kind_word(kind: &EntryKind, is_parent: bool, lang: Lang) -> &'static str {
     if is_parent {
-        return "parent directory";
+        return lang.kind_parent();
     }
     match kind {
-        EntryKind::Dir => "directory",
-        EntryKind::File => "file",
-        EntryKind::SymlinkDir => "symlink to directory",
-        EntryKind::SymlinkFile => "symlink to file",
-        EntryKind::SymlinkBroken => "broken symlink",
-        EntryKind::Other => "special file",
+        EntryKind::Dir => lang.kind_dir(),
+        EntryKind::File => lang.kind_file(),
+        EntryKind::SymlinkDir => lang.kind_symlink_dir(),
+        EntryKind::SymlinkFile => lang.kind_symlink_file(),
+        EntryKind::SymlinkBroken => lang.kind_symlink_broken(),
+        EntryKind::Other => lang.kind_other(),
     }
 }
 
@@ -662,7 +647,7 @@ pub struct Bearings {
 impl Bearings {
     /// Read the current locus off a [`NavState`]. No filesystem access:
     /// every field comes from the listing snapshot already in memory.
-    pub fn from_nav(nav: &NavState, offset: usize, rows: usize) -> Bearings {
+    pub fn from_nav(nav: &NavState, offset: usize, rows: usize, lang: Lang) -> Bearings {
         let visible = nav.visible();
         let selected = visible.get(nav.cursor).map(|&i| &nav.entries[i]);
         let entries_total = nav.entries.iter().filter(|e| !e.is_parent).count();
@@ -678,7 +663,7 @@ impl Bearings {
             },
             rows_total: visible.len(),
             name: selected.map(|e| sanitize(&e.display_name())),
-            kind: selected.map(|e| kind_word(&e.kind, e.is_parent)),
+            kind: selected.map(|e| kind_word(&e.kind, e.is_parent, lang)),
             size: selected
                 .filter(|e| !e.is_parent && !e.is_enterable())
                 .map(|e| e.size),
@@ -728,21 +713,22 @@ pub fn bound_speakable_filter(speakable: &mut Speakable, sep: &str, width: usize
 /// is `rows A-B of N`, the ladder's shape is `depth N`, and the cursor's
 /// highlight is `row R of T`. Read aloud it is a sentence about exactly
 /// one locus.
-pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
+pub fn speakable(bearings: &Bearings, now: SystemTime, lang: Lang) -> Speakable {
     let mut parts = Vec::new();
     let mut pinned = None;
     let mut filter = None;
     match bearings.row {
-        Some(row) => parts.push(format!("row {row} of {}", bearings.rows_total)),
-        None => parts.push("no rows".to_string()),
+        Some(row) => parts.push(lang.row_of(row, bearings.rows_total)),
+        None => parts.push(lang.no_rows().to_string()),
     }
     // Directly after the row count, because a filter is what makes that
     // count mean something other than the size of the directory.
     if !bearings.filter.is_empty() {
         filter = Some(parts.len());
-        parts.push(format!(
-            "filter '{}': {} of {} match",
-            bearings.filter, bearings.filter_matches, bearings.entries_total
+        parts.push(lang.filter_summary(
+            &bearings.filter,
+            bearings.filter_matches,
+            bearings.entries_total,
         ));
     }
     // Ahead of the selected name so the row reads in a sensible order,
@@ -752,11 +738,11 @@ pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
     match bearings.viewport {
         Some((first, last)) if first == 1 && last == bearings.rows_total => {
             pinned = Some(parts.len());
-            parts.push("all rows shown".to_string())
+            parts.push(lang.all_rows_shown().to_string())
         }
         Some((first, last)) => {
             pinned = Some(parts.len());
-            parts.push(format!("rows {first}-{last} of {}", bearings.rows_total))
+            parts.push(lang.rows_range(first, last, bearings.rows_total))
         }
         None => {}
     }
@@ -770,10 +756,10 @@ pub fn speakable(bearings: &Bearings, now: SystemTime) -> Speakable {
         parts.push(format_size(size));
     }
     if let Some(modified) = bearings.modified {
-        parts.push(format!("{} ago", relative_time(now, modified)));
+        parts.push(lang.age_phrase(&relative_time(now, modified, lang)));
     }
     if bearings.show_hidden {
-        parts.push("dotfiles shown".to_string());
+        parts.push(lang.dotfiles_shown().to_string());
     }
     Speakable {
         parts,
@@ -1078,18 +1064,18 @@ mod tests {
     #[test]
     fn relative_time_is_compact_and_needs_no_timezone() {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        assert_eq!(relative_time(base, base), "0s");
-        assert_eq!(relative_time(at(base, 45), base), "45s");
-        assert_eq!(relative_time(at(base, 60), base), "1m");
-        assert_eq!(relative_time(at(base, 23 * 60), base), "23m");
-        assert_eq!(relative_time(at(base, 3600), base), "1h");
-        assert_eq!(relative_time(at(base, 2 * 86400), base), "2d");
-        assert_eq!(relative_time(at(base, 8 * 86400), base), "1w");
-        assert_eq!(relative_time(at(base, 400 * 86400), base), "1y");
+        assert_eq!(relative_time(base, base, Lang::En), "0s");
+        assert_eq!(relative_time(at(base, 45), base, Lang::En), "45s");
+        assert_eq!(relative_time(at(base, 60), base, Lang::En), "1m");
+        assert_eq!(relative_time(at(base, 23 * 60), base, Lang::En), "23m");
+        assert_eq!(relative_time(at(base, 3600), base, Lang::En), "1h");
+        assert_eq!(relative_time(at(base, 2 * 86400), base, Lang::En), "2d");
+        assert_eq!(relative_time(at(base, 8 * 86400), base, Lang::En), "1w");
+        assert_eq!(relative_time(at(base, 400 * 86400), base, Lang::En), "1y");
         // A file dated in the future reads as brand new, never as an error.
-        assert_eq!(relative_time(base, at(base, 500)), "0s");
+        assert_eq!(relative_time(base, at(base, 500), Lang::En), "0s");
         for seconds in [0, 59, 61, 3599, 90_000, 700_000, 40_000_000, 4_000_000_000] {
-            assert!(relative_time(at(base, seconds), base).len() <= 7);
+            assert!(relative_time(at(base, seconds), base, Lang::En).len() <= 7);
         }
     }
 
@@ -1171,19 +1157,28 @@ mod tests {
 
     #[test]
     fn kind_words_cover_every_kind() {
-        assert_eq!(kind_word(&EntryKind::Dir, true), "parent directory");
-        assert_eq!(kind_word(&EntryKind::Dir, false), "directory");
-        assert_eq!(kind_word(&EntryKind::File, false), "file");
         assert_eq!(
-            kind_word(&EntryKind::SymlinkDir, false),
+            kind_word(&EntryKind::Dir, true, Lang::En),
+            "parent directory"
+        );
+        assert_eq!(kind_word(&EntryKind::Dir, false, Lang::En), "directory");
+        assert_eq!(kind_word(&EntryKind::File, false, Lang::En), "file");
+        assert_eq!(
+            kind_word(&EntryKind::SymlinkDir, false, Lang::En),
             "symlink to directory"
         );
-        assert_eq!(kind_word(&EntryKind::SymlinkFile, false), "symlink to file");
         assert_eq!(
-            kind_word(&EntryKind::SymlinkBroken, false),
+            kind_word(&EntryKind::SymlinkFile, false, Lang::En),
+            "symlink to file"
+        );
+        assert_eq!(
+            kind_word(&EntryKind::SymlinkBroken, false, Lang::En),
             "broken symlink"
         );
-        assert_eq!(kind_word(&EntryKind::Other, false), "special file");
+        assert_eq!(
+            kind_word(&EntryKind::Other, false, Lang::En),
+            "special file"
+        );
     }
 
     fn bearings_fixture() -> Bearings {
@@ -1207,7 +1202,9 @@ mod tests {
         let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let mut bearings = bearings_fixture();
         bearings.modified = Some(base);
-        let line = speakable(&bearings, at(base, 3600)).parts.join(" · ");
+        let line = speakable(&bearings, at(base, 3600), Lang::En)
+            .parts
+            .join(" · ");
         assert_eq!(
             line,
             "row 73 of 73 · rows 59-73 of 73 · file_060.txt · file · 0B · 1h ago"
@@ -1227,7 +1224,7 @@ mod tests {
             viewport: Some((1, 12)),
             ..bearings_fixture()
         };
-        let parts = speakable(&bearings, now).parts;
+        let parts = speakable(&bearings, now, Lang::En).parts;
         assert_eq!(
             parts.join(" · "),
             "row 4 of 12 · all rows shown · src/ · directory"
@@ -1248,7 +1245,7 @@ mod tests {
         };
         // The status row's own budget at the documented 80x24 minimum:
         // two border columns and one leading space off eighty.
-        let line = fit_joined(&speakable(&bearings, now).parts, " · ", 77, "…");
+        let line = fit_joined(&speakable(&bearings, now, Lang::En).parts, " · ", 77, "…");
         assert!(line.contains("rows 29-43 of 74"), "{line}");
         assert!(display_width(&line) <= 77, "{line}");
     }
@@ -1291,7 +1288,7 @@ mod tests {
             show_hidden: false,
         };
         assert!(filter_matched_nothing(&bearings));
-        assert!(speakable(&bearings, now)
+        assert!(speakable(&bearings, now, Lang::En)
             .parts
             .join(" · ")
             .contains("filter 'zzz': 0 of 12 match"));
@@ -1302,7 +1299,7 @@ mod tests {
             ..bearings
         };
         assert!(!filter_matched_nothing(&matching));
-        assert!(speakable(&matching, now)
+        assert!(speakable(&matching, now, Lang::En)
             .parts
             .join(" · ")
             .contains("filter 'app': 2 of 12 match"));
@@ -1320,7 +1317,7 @@ mod tests {
             entries_total: 74,
             ..bearings_fixture()
         };
-        let mut speakable = speakable(&bearings, now);
+        let mut speakable = speakable(&bearings, now, Lang::En);
         bound_speakable_filter(&mut speakable, " · ", 77, "…");
         let line = fit_joined_pinned(&speakable.parts, " · ", 77, "…", speakable.pinned);
 
@@ -1347,7 +1344,7 @@ mod tests {
             show_hidden: true,
         };
         assert_eq!(
-            speakable(&bearings, now).parts.join(" · "),
+            speakable(&bearings, now, Lang::En).parts.join(" · "),
             "no rows · dotfiles shown"
         );
     }
@@ -1361,7 +1358,7 @@ mod tests {
         nav.set_filter("note".to_string());
         nav.move_cursor(1);
 
-        let bearings = Bearings::from_nav(&nav, 0, 10);
+        let bearings = Bearings::from_nav(&nav, 0, 10, Lang::En);
         assert_eq!(bearings.row, Some(2));
         assert_eq!(bearings.rows_total, 2); // ".." plus the match
         assert_eq!(bearings.name.as_deref(), Some("note.txt"));
@@ -1372,7 +1369,7 @@ mod tests {
         assert_eq!(bearings.viewport, Some((1, 2)));
 
         nav.set_filter("nothing-here".to_string());
-        let bearings = Bearings::from_nav(&nav, 0, 10);
+        let bearings = Bearings::from_nav(&nav, 0, 10, Lang::En);
         assert!(filter_matched_nothing(&bearings));
         assert_eq!(bearings.rows_total, 1); // the ".." row still passes
     }
@@ -1382,13 +1379,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let bearings = Bearings::from_nav(&nav, 0, 10);
+        let bearings = Bearings::from_nav(&nav, 0, 10, Lang::En);
         assert_eq!(bearings.kind, Some("parent directory"));
         assert_eq!(bearings.size, None);
 
         let mut nav = nav;
         nav.move_cursor(1);
-        let bearings = Bearings::from_nav(&nav, 0, 10);
+        let bearings = Bearings::from_nav(&nav, 0, 10, Lang::En);
         assert_eq!(bearings.kind, Some("directory"));
         assert_eq!(bearings.size, None);
     }

@@ -15,7 +15,14 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-/// Errors from path validation and file operations, with user-facing text.
+use crate::i18n::{Lang, Reason};
+
+/// Errors from path validation and file operations.
+///
+/// A value, never a sentence: the variant says what went wrong and about
+/// which path, and [`FsError::message`] says it in whichever language the
+/// screen is in. `Display` is the English rendering, which is what
+/// `std::error::Error` callers and test failures get.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsError {
     NotFound(PathBuf),
@@ -26,16 +33,16 @@ pub enum FsError {
     CrossDevice,
     InvalidName {
         name: String,
-        reason: &'static str,
+        reason: Reason,
     },
     /// The operation is refused on this path as a matter of policy, not
     /// because the filesystem said no.
     Refused {
         path: PathBuf,
-        reason: &'static str,
+        reason: Reason,
     },
     /// The operation has no implementation on this platform.
-    Unsupported(&'static str),
+    Unsupported(Reason),
     HomeNotFound,
     Io {
         path: PathBuf,
@@ -43,41 +50,35 @@ pub enum FsError {
     },
 }
 
-impl std::fmt::Display for FsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl FsError {
+    /// The error in `lang`. Every path is interpolated as it is: a name
+    /// on disk is not translated, only the words around it.
+    pub fn message(&self, lang: Lang) -> String {
         match self {
-            FsError::NotFound(p) => write!(f, "not found: {}", p.display()),
-            FsError::NotADirectory(p) => {
-                write!(f, "not a directory: {}", p.display())
-            }
-            FsError::NotAFile(p) => {
-                write!(f, "not a regular file: {}", p.display())
-            }
-            FsError::PermissionDenied(p) => {
-                write!(f, "permission denied: {}", p.display())
-            }
-            FsError::AlreadyExists(p) => {
-                write!(f, "destination already exists: {}", p.display())
-            }
-            FsError::CrossDevice => write!(
-                f,
-                "cross-volume move is not supported in v0; \
-                 destination must be on the same volume"
-            ),
+            FsError::NotFound(p) => lang.fs_not_found(&p.display().to_string()),
+            FsError::NotADirectory(p) => lang.fs_not_a_directory(&p.display().to_string()),
+            FsError::NotAFile(p) => lang.fs_not_a_file(&p.display().to_string()),
+            FsError::PermissionDenied(p) => lang.fs_permission_denied(&p.display().to_string()),
+            FsError::AlreadyExists(p) => lang.fs_already_exists(&p.display().to_string()),
+            FsError::CrossDevice => lang.fs_cross_device().to_string(),
             FsError::InvalidName { name, reason } => {
-                write!(f, "invalid name '{name}': {reason}")
+                lang.fs_invalid_name(name, lang.reason(*reason))
             }
             FsError::Refused { path, reason } => {
-                write!(f, "refused {}: {reason}", path.display())
+                lang.fs_refused(&path.display().to_string(), lang.reason(*reason))
             }
-            FsError::Unsupported(what) => write!(f, "{what}"),
-            FsError::HomeNotFound => {
-                write!(f, "cannot expand '~': home directory unknown")
-            }
-            FsError::Io { path, message } => {
-                write!(f, "{message}: {}", path.display())
-            }
+            FsError::Unsupported(what) => lang.reason(*what).to_string(),
+            FsError::HomeNotFound => lang.fs_home_not_found().to_string(),
+            // The operating system's own words for what it refused; they
+            // are the evidence, so they are passed through untranslated.
+            FsError::Io { path, message } => lang.fs_io(message, &path.display().to_string()),
         }
+    }
+}
+
+impl std::fmt::Display for FsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message(Lang::En))
     }
 }
 
@@ -113,7 +114,7 @@ pub fn expand_tilde(input: &str, home: Option<&Path>) -> Result<PathBuf, FsError
     if input.starts_with('~') {
         return Err(FsError::InvalidName {
             name: input.to_string(),
-            reason: "'~user' expansion is not supported",
+            reason: Reason::TildeUser,
         });
     }
     Ok(PathBuf::from(input))
@@ -151,7 +152,7 @@ pub fn absolutize(base: &Path, input: &str, home: Option<&Path>) -> Result<PathB
     if input.is_empty() {
         return Err(FsError::InvalidName {
             name: String::new(),
-            reason: "empty path",
+            reason: Reason::EmptyPath,
         });
     }
     let expanded = expand_tilde(input, home)?;
@@ -193,15 +194,15 @@ pub fn canonical_move_target(
             return Ok(canonical.join(src_name));
         }
     }
-    let parent = target.parent().ok_or_else(|| FsError::Io {
+    let parent = target.parent().ok_or_else(|| FsError::Refused {
         path: target.clone(),
-        message: "destination has no parent directory".to_string(),
+        reason: Reason::NoParentDirectory,
     })?;
     let file_name = target
         .file_name()
         .ok_or_else(|| FsError::InvalidName {
             name: input.to_string(),
-            reason: "destination has no file name",
+            reason: Reason::NoFileName,
         })?
         .to_os_string();
     let canonical_parent = std::fs::canonicalize(parent).map_err(|e| io_error(parent, &e))?;
@@ -222,16 +223,16 @@ pub fn validate_new_name(name: &str) -> Result<(), FsError> {
         })
     };
     if name.is_empty() {
-        return invalid("empty name");
+        return invalid(Reason::EmptyName);
     }
     if name == "." || name == ".." {
-        return invalid("'.' and '..' are reserved");
+        return invalid(Reason::DotReserved);
     }
     if name.contains('/') {
-        return invalid("must not contain '/' (rename stays in the same directory)");
+        return invalid(Reason::NameHasSlash);
     }
     if name.contains('\0') {
-        return invalid("must not contain NUL");
+        return invalid(Reason::NameHasNul);
     }
     Ok(())
 }

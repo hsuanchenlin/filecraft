@@ -28,18 +28,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Level, Mode, QUIT_QUESTION};
+use crate::app::{App, Level, Mode};
 use crate::bearings::{
     self, display_width, pad_to_width, pad_to_width_with, sanitize, Bearings, Glyphs, RailCell,
 };
 use crate::fsops::FsError;
+use crate::i18n::{self, Lang};
 use crate::joblog::{LogPane, HEADER_ROWS};
 use crate::markdown::{self, Ink, Kind, Row};
 use crate::multiselect::FileSelector;
 use crate::nav::{EntryKind, NavState};
 use crate::pager::Pager;
 use crate::picker::FolderPicker;
-use crate::preview::{format_size, format_timestamp};
+use crate::preview::{format_size, format_timestamp_in};
 use crate::summarize;
 
 /// Rows used by everything except the file list (borders, path, status,
@@ -59,7 +60,14 @@ const SCROLL_MARGIN: usize = 3;
 
 /// Columns the listing spends on everything that is not the name: the
 /// rail, the cursor marker, the size field, and the relative time.
-const LISTING_FURNITURE: usize = 1 + 2 + 8 + 7;
+///
+/// The age field is the one part that is not the same width in every
+/// language - a Han character owns two cells, so `59分鐘前` needs eight
+/// columns where `59m` needs three - so the furniture is measured
+/// against [`Lang::age_width`] rather than pinned to English.
+fn listing_furniture(lang: Lang) -> usize {
+    1 + 2 + 8 + 1 + lang.age_width()
+}
 
 /// Styling switchboard. With `use_color: false` (the `NO_COLOR`
 /// convention) every style falls back to bold/reverse on the terminal's
@@ -230,7 +238,7 @@ impl Theme {
 /// Static, TTY-free listing used when stdin/stdout are not a terminal
 /// (or when `--list` is passed). Mirrors the interactive list: current
 /// directory, textual kind markers, sizes, and a compact key hint.
-pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
+pub fn render_static_listing(dir: &Path, lang: Lang) -> Result<String, FsError> {
     let nav = NavState::new(dir)?;
     let mut out = String::new();
     let _ = writeln!(
@@ -239,33 +247,30 @@ pub fn render_static_listing(dir: &Path) -> Result<String, FsError> {
         env!("CARGO_PKG_VERSION"),
         sanitize(&nav.cwd.display().to_string())
     );
-    let _ = writeln!(
-        out,
-        "static listing (no TTY). run in a real terminal for the interactive BBS screen."
-    );
+    let _ = writeln!(out, "{}", lang.static_listing_note());
     let _ = writeln!(out);
 
     let visible = nav.visible();
     if visible.is_empty() {
-        let _ = writeln!(out, "  (empty directory)");
+        let _ = writeln!(out, "  {}", lang.empty_directory());
     } else {
         for &i in &visible {
             let entry = &nav.entries[i];
             let size = if entry.is_parent || entry.is_enterable() {
-                "<DIR>".to_string()
+                lang.dir_marker().to_string()
             } else {
                 format_size(entry.size)
             };
-            let date = entry.modified.map(format_timestamp).unwrap_or_default();
+            let date = entry
+                .modified
+                .map(|m| format_timestamp_in(m, lang))
+                .unwrap_or_default();
             let name = pad_to_width(&sanitize(&entry.display_name()), 40);
             let _ = writeln!(out, "  {name} {size:>8}  {date}");
         }
     }
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "keys: j/k move  Enter/l open  Backspace/h up  / filter  : cmd  ? help  q quit"
-    );
+    let _ = writeln!(out, "{}", lang.static_listing_keys());
     Ok(out)
 }
 
@@ -306,18 +311,29 @@ pub fn draw_at(frame: &mut Frame<'_>, app: &App, theme: &Theme, now: SystemTime)
     let offset = bearings::viewport_offset(app.nav.cursor, visible.len(), rows, SCROLL_MARGIN);
     // One reading of the locus, shared by the listing and the words that
     // describe it, so the two can never disagree.
-    let bearings = Bearings::from_nav(&app.nav, offset, rows);
+    let lang = app.lang;
+    let bearings = Bearings::from_nav(&app.nav, offset, rows, lang);
     match &app.mode {
-        Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager),
-        Mode::JobLog(pane) => draw_job_log(frame, theme, list_area, pane),
-        Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker),
-        Mode::FileSelector(selector) => draw_selector(frame, theme, list_area, selector),
-        Mode::ProviderMenu { files } => draw_provider_menu(frame, theme, list_area, files.len()),
+        Mode::Pager(pager) => draw_pager(frame, theme, list_area, pager, lang),
+        Mode::JobLog(pane) => draw_job_log(frame, theme, list_area, pane, lang),
+        Mode::FolderPicker(picker) => draw_picker(frame, theme, list_area, picker, lang),
+        Mode::FileSelector(selector) => draw_selector(frame, theme, list_area, selector, lang),
+        Mode::ProviderMenu { files } => {
+            draw_provider_menu(frame, theme, list_area, files.len(), lang)
+        }
         _ => draw_listing(
             frame, app, theme, list_area, &visible, offset, &bearings, now,
         ),
     }
-    draw_status(frame, theme, status_row, &bearings, now, app.job_status());
+    draw_status(
+        frame,
+        theme,
+        status_row,
+        &bearings,
+        now,
+        app.job_status(),
+        lang,
+    );
     draw_messages(frame, app, theme, message_area);
     draw_prompt(frame, app, theme, prompt_row);
     draw_hints(frame, app, theme, hint_row);
@@ -364,17 +380,18 @@ fn draw_listing(
         return;
     }
     let glyphs = theme.glyphs();
+    let lang = app.lang;
     let width = area.width as usize;
-    let name_width = width.saturating_sub(LISTING_FURNITURE);
+    let name_width = width.saturating_sub(listing_furniture(lang));
     // Every listing row is the rail plus this much content.
     let body_width = width.saturating_sub(1);
     let rail = bearings::rail(visible.len(), offset, rows);
     // A filter that matched nothing must say so: the `..` row always
     // passes, so a bare `../` would otherwise look like a real result.
     let note = if visible.is_empty() {
-        Some("(no matching entries)".to_string())
+        Some(lang.no_matching_entries().to_string())
     } else if bearings::filter_matched_nothing(bearings) {
-        Some(format!("(no entries match '{}')", bearings.filter))
+        Some(lang.no_entries_match(&bearings.filter))
     } else {
         None
     };
@@ -405,16 +422,22 @@ fn draw_listing(
         let marker = if selected { "> " } else { "  " };
 
         let size = if entry.is_parent || entry.is_enterable() {
-            "<DIR>".to_string()
+            lang.dir_marker().to_string()
         } else {
             format_size(entry.size)
         };
-        // Relative time needs no timezone, and costs seven columns
-        // instead of twenty - which is what pays for the rail.
-        let age = entry
-            .modified
-            .map(|m| bearings::relative_time(now, m))
-            .unwrap_or_default();
+        // Relative time needs no timezone, and costs a handful of
+        // columns instead of twenty - which is what pays for the rail.
+        // Padded by display width, not by character count, so a CJK age
+        // does not push the row past the border.
+        let age = pad_to_width_with(
+            &entry
+                .modified
+                .map(|m| bearings::relative_time(now, m, lang))
+                .unwrap_or_default(),
+            lang.age_width(),
+            glyphs.ellipsis,
+        );
         let name = pad_to_width_with(
             &sanitize(&entry.display_name()),
             name_width,
@@ -433,7 +456,7 @@ fn draw_listing(
             Span::styled(marker.to_string(), base_style),
             Span::styled(name, base_style),
             Span::styled(format!(" {size:>6} "), base_style),
-            Span::styled(format!(" {age:<6}"), base_style),
+            Span::styled(format!(" {age}"), base_style),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -443,7 +466,7 @@ fn draw_listing(
 /// top and says where in it the view sits at the bottom, in words - the
 /// same rule the status row follows, so the position is never carried by
 /// the scroll thumb alone.
-fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
+fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager, lang: Lang) {
     let glyphs = theme.glyphs();
     let frame_only = Block::default()
         .borders(Borders::ALL)
@@ -461,7 +484,7 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
         ))
         .title_bottom(
             Line::from(Span::styled(
-                format!(" {} ", pager.position(width, view, &glyphs)),
+                format!(" {} ", pager.position(width, view, &glyphs, lang)),
                 theme.bearing(),
             ))
             .right_aligned(),
@@ -486,7 +509,7 @@ fn draw_pager(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pager: &Pager) {
 /// The rows it reserves are [`crate::joblog::FRAME_ROWS`], which is what
 /// [`crate::app::App::log_rows`] subtracts. If the two ever disagree the
 /// log scrolls past rows the screen never drew.
-fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane) {
+fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane, lang: Lang) {
     let glyphs = theme.glyphs();
     let frame_only = Block::default()
         .borders(Borders::ALL)
@@ -504,7 +527,7 @@ fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane
         ))
         .title_bottom(
             Line::from(Span::styled(
-                format!(" {} ", pane.pager.position(width, view, &glyphs)),
+                format!(" {} ", pane.pager.position(width, view, &glyphs, lang)),
                 theme.bearing(),
             ))
             .right_aligned(),
@@ -517,7 +540,7 @@ fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane
 
     // The header is chrome: it is never scrolled and never operated on.
     let header: Vec<Line> = pane
-        .header(&glyphs)
+        .header(&glyphs, lang)
         .iter()
         .map(|row| {
             Line::from(Span::styled(
@@ -543,7 +566,13 @@ fn draw_job_log(frame: &mut Frame<'_>, theme: &Theme, area: Rect, pane: &LogPane
 /// the listing underneath is unchanged and cancelling lands on the same
 /// row. The dest header is the dual of the focused folder: color never
 /// carries the target by itself.
-fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &FolderPicker) {
+fn draw_picker(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    picker: &FolderPicker,
+    lang: Lang,
+) {
     let glyphs = theme.glyphs();
     let frame_only = Block::default()
         .borders(Borders::ALL)
@@ -552,13 +581,10 @@ fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &Folder
     let inner = frame_only.inner(area);
     let block = frame_only
         .border_style(theme.banner())
-        .title(Span::styled(" folder picker ", theme.prompt()))
+        .title(Span::styled(lang.picker_title(), theme.prompt()))
         .title_bottom(
             Line::from(Span::styled(
-                format!(
-                    " j/k {dot} l in {dot} h up {dot} Enter/m select {dot} q cancel ",
-                    dot = glyphs.dot
-                ),
+                i18n::keys_row(lang.picker_keys(), glyphs.dot),
                 theme.bearing(),
             ))
             .right_aligned(),
@@ -572,7 +598,7 @@ fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &Folder
     let [dest_row, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     let dest = pad_to_width_with(
-        &sanitize(&picker.dest_line()),
+        &sanitize(&picker.dest_line(lang)),
         dest_row.width as usize,
         glyphs.ellipsis,
     );
@@ -615,7 +641,13 @@ fn draw_picker(frame: &mut Frame<'_>, theme: &Theme, area: Rect, picker: &Folder
 /// picker, so the listing underneath is unchanged and cancelling lands on
 /// the same row. Selection is drawn as a `[x]` box, never as color alone,
 /// and the header counts what is selected in words.
-fn draw_selector(frame: &mut Frame<'_>, theme: &Theme, area: Rect, selector: &FileSelector) {
+fn draw_selector(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    selector: &FileSelector,
+    lang: Lang,
+) {
     let glyphs = theme.glyphs();
     let frame_only = Block::default()
         .borders(Borders::ALL)
@@ -624,13 +656,10 @@ fn draw_selector(frame: &mut Frame<'_>, theme: &Theme, area: Rect, selector: &Fi
     let inner = frame_only.inner(area);
     let block = frame_only
         .border_style(theme.banner())
-        .title(Span::styled(" summarize: pick files ", theme.prompt()))
+        .title(Span::styled(lang.selector_title(), theme.prompt()))
         .title_bottom(
             Line::from(Span::styled(
-                format!(
-                    " Space pick {dot} l in {dot} h up {dot} Enter/c confirm {dot} q cancel ",
-                    dot = glyphs.dot
-                ),
+                i18n::keys_row(lang.selector_keys(), glyphs.dot),
                 theme.bearing(),
             ))
             .right_aligned(),
@@ -644,7 +673,7 @@ fn draw_selector(frame: &mut Frame<'_>, theme: &Theme, area: Rect, selector: &Fi
     let [header_row, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     let header = pad_to_width_with(
-        &sanitize(&selector.header_line()),
+        &sanitize(&selector.header_line(lang)),
         header_row.width as usize,
         glyphs.ellipsis,
     );
@@ -691,7 +720,7 @@ fn draw_selector(frame: &mut Frame<'_>, theme: &Theme, area: Rect, selector: &Fi
 /// The provider dialog. Every row names its digit and its exact command
 /// line, and the default is marked in words, so nothing about the choice
 /// is carried by position or color.
-fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: usize) {
+fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: usize, lang: Lang) {
     let glyphs = theme.glyphs();
     let frame_only = Block::default()
         .borders(Borders::ALL)
@@ -700,13 +729,10 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
     let inner = frame_only.inner(area);
     let block = frame_only
         .border_style(theme.banner())
-        .title(Span::styled(" summarize: pick a provider ", theme.prompt()))
+        .title(Span::styled(lang.provider_title(), theme.prompt()))
         .title_bottom(
             Line::from(Span::styled(
-                format!(
-                    " 1-5 choose {dot} Enter default {dot} q cancel ",
-                    dot = glyphs.dot
-                ),
+                i18n::keys_row(lang.provider_keys(), glyphs.dot),
                 theme.bearing(),
             ))
             .right_aligned(),
@@ -717,14 +743,13 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    let unit = if files == 1 { "file" } else { "files" };
     // No blank under the count: at 60x20 this dialog has exactly nine
     // rows, and the widest command line needs two of them.
     let mut lines = vec![Line::from(Span::styled(
-        sanitize(&format!("{files} {unit} selected")),
+        sanitize(&lang.files_selected(files)),
         theme.prompt(),
     ))];
-    for line in summarize::menu_lines() {
+    for line in summarize::menu_lines(lang) {
         for row in bearings::wrap_hanging(
             &sanitize(&line),
             inner.width as usize,
@@ -734,11 +759,7 @@ fn draw_provider_menu(frame: &mut Frame<'_>, theme: &Theme, area: Rect, files: u
         }
     }
     lines.push(Line::from(""));
-    for row in bearings::wrap_hanging(
-        "the provider runs locally and reads only these files",
-        inner.width as usize,
-        0,
-    ) {
+    for row in bearings::wrap_hanging(lang.provider_scope_note(), inner.width as usize, 0) {
         lines.push(Line::from(Span::styled(row, theme.meta())));
     }
     // No `Paragraph::wrap` on top: `wrap_hanging` is the only thing that
@@ -798,9 +819,10 @@ fn draw_status(
     bearings: &Bearings,
     now: SystemTime,
     job: Option<String>,
+    lang: Lang,
 ) {
     let glyphs = theme.glyphs();
-    let mut speakable = bearings::speakable(bearings, now);
+    let mut speakable = bearings::speakable(bearings, now, lang);
     let separator = format!(" {} ", glyphs.dot);
     // A running summary claims the head of the row and keeps it: it is
     // the one thing on screen that is happening rather than being shown,
@@ -852,15 +874,16 @@ fn draw_messages(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 
 fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
     let glyphs = theme.glyphs();
+    let lang = app.lang;
     let caret = glyphs.caret;
     let line = match &app.mode {
         Mode::Command { input } => Line::from(vec![
-            Span::styled(" cmd> ", theme.prompt()),
+            Span::styled(lang.prompt_command(), theme.prompt()),
             Span::raw(sanitize(input)),
             Span::styled(caret, theme.prompt()),
         ]),
         Mode::Filter { input } => Line::from(vec![
-            Span::styled(" filter> ", theme.prompt()),
+            Span::styled(lang.prompt_filter(), theme.prompt()),
             Span::raw(sanitize(input)),
             Span::styled(caret, theme.prompt()),
         ]),
@@ -868,80 +891,67 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
             let description = app
                 .pending
                 .as_ref()
-                .map(|op| op.describe())
+                .map(|op| op.describe(lang))
                 .unwrap_or_default();
             Line::from(vec![
-                Span::styled(" confirm ", theme.confirm()),
-                Span::styled("[y]es / [n]o  ", theme.prompt()),
+                Span::styled(lang.prompt_confirm(), theme.confirm()),
+                Span::styled(lang.prompt_yes_no(), theme.prompt()),
                 Span::raw(sanitize(&description)),
             ])
         }
         Mode::Pager(pager) => match &pager.find {
             Some(input) => Line::from(vec![
-                Span::styled(" find> ", theme.prompt()),
+                Span::styled(lang.prompt_find(), theme.prompt()),
                 Span::raw(sanitize(input)),
                 Span::styled(caret, theme.prompt()),
             ]),
             None => Line::from(vec![
-                Span::styled(" read ", theme.prompt()),
-                Span::raw(format!(
-                    " j/k line {dot} d/u half {dot} g/G top/bottom {dot} / find {dot} h/q back",
-                    dot = glyphs.dot
-                )),
+                Span::styled(lang.prompt_read(), theme.prompt()),
+                Span::raw(i18n::keys_row(lang.reader_keys(), glyphs.dot)),
             ]),
         },
         Mode::JobLog(pane) => match &pane.pager.find {
             Some(input) => Line::from(vec![
-                Span::styled(" find> ", theme.prompt()),
+                Span::styled(lang.prompt_find(), theme.prompt()),
                 Span::raw(sanitize(input)),
                 Span::styled(caret, theme.prompt()),
             ]),
             None => Line::from(vec![
-                Span::styled(" watch ", theme.prompt()),
+                Span::styled(lang.prompt_watch(), theme.prompt()),
                 Span::raw(sanitize(&format!(
                     "{} {dot} {}",
-                    pane.activity().label(),
+                    pane.activity().label(lang),
                     match pane.session() {
-                        Some(id) => format!("session {id}"),
-                        None => "no session reported".to_string(),
+                        Some(id) => lang.watch_session(id),
+                        None => lang.no_session_reported().to_string(),
                     },
                     dot = glyphs.dot
                 ))),
             ]),
         },
         Mode::FolderPicker(picker) => Line::from(vec![
-            Span::styled(" pick ", theme.prompt()),
-            Span::raw(sanitize(&format!(
-                "moving '{}' -> '{}'",
-                picker.source_name,
-                picker.destination().display()
+            Span::styled(lang.prompt_pick(), theme.prompt()),
+            Span::raw(sanitize(&lang.moving_to(
+                &picker.source_name,
+                &picker.destination().display().to_string(),
             ))),
         ]),
         Mode::ConfirmQuit => Line::from(vec![
-            Span::styled(" confirm ", theme.confirm()),
-            Span::styled("[y]es / [n]o  ", theme.prompt()),
-            Span::raw(QUIT_QUESTION),
+            Span::styled(lang.prompt_confirm(), theme.confirm()),
+            Span::styled(lang.prompt_yes_no(), theme.prompt()),
+            Span::raw(lang.quit_question()),
         ]),
         Mode::FileSelector(selector) => Line::from(vec![
-            Span::styled(" pick ", theme.prompt()),
-            Span::raw(match selector.count() {
-                0 => "files to summarize - Space marks the focused file".to_string(),
-                1 => "1 file marked - Enter or c to choose a provider".to_string(),
-                n => format!("{n} files marked - Enter or c to choose a provider"),
-            }),
+            Span::styled(lang.prompt_pick(), theme.prompt()),
+            Span::raw(lang.selector_prompt(selector.count())),
         ]),
         Mode::ProviderMenu { files } => Line::from(vec![
-            Span::styled(" pick ", theme.prompt()),
-            Span::raw(format!(
-                "provider for {} file{} - Enter takes {}",
-                files.len(),
-                if files.len() == 1 { "" } else { "s" },
-                summarize::Provider::DEFAULT.code()
-            )),
+            Span::styled(lang.prompt_pick(), theme.prompt()),
+            Span::raw(lang.provider_prompt(files.len(), summarize::Provider::DEFAULT.code())),
         ]),
         Mode::Browse => Line::from(vec![
-            Span::styled(" cmd> ", theme.prompt()),
-            Span::raw("press : to type a command"),
+            Span::styled(lang.prompt_command(), theme.prompt()),
+            Span::raw(lang.prompt_browse_hint()),
         ]),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -950,77 +960,21 @@ fn draw_prompt(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
 /// Mode-appropriate keys, fitted by dropping whole hints. The row never
 /// ends inside a word, including at the documented 80x24 minimum.
 fn draw_hints(frame: &mut Frame<'_>, app: &App, theme: &Theme, area: Rect) {
+    let lang = app.lang;
     let hints: &[&str] = match &app.mode {
-        // Ordered by how often they are needed: what falls off a narrow
-        // terminal is what the user needs least.
-        Mode::Browse => &[
-            "j/k move",
-            "l/Enter in",
-            "h out",
-            "0-9 jump",
-            "/ find",
-            ": cmd",
-            "? help",
-            "q quit",
-            ". dotfiles",
-            "M log",
-        ],
-        Mode::Command { .. } => &[
-            "Enter run",
-            "Esc cancel",
-            "try: help, cd, move, rename, preview",
-        ],
-        Mode::Filter { .. } => &["type to filter", "Enter keep", "Esc clear"],
-        Mode::ConfirmOp => &["y confirm", "n/q/Esc cancel", "nothing happens without y"],
-        Mode::ConfirmQuit => &[
-            "y terminate and quit",
-            "n/Esc keep running",
-            "the summary keeps going without y",
-        ],
-        Mode::FileSelector(_) => &[
-            "Space pick",
-            "j/k move",
-            "l in",
-            "h up",
-            "Enter/c confirm",
-            "q/Esc cancel",
-        ],
-        Mode::ProviderMenu { .. } => &["1-5 choose", "Enter default (ag)", "q/Esc cancel"],
-        Mode::FolderPicker(_) => &[
-            "j/k focus",
-            "l in",
-            "h up",
-            "Enter/m select",
-            "q/Esc cancel",
-        ],
-        Mode::Pager(pager) if pager.find.is_some() => {
-            &["type to find", "Enter search", "Esc keep reading"]
-        }
-        Mode::Pager(_) => &[
-            "j/k line",
-            "h/q/Esc back to files",
-            "d/u half page",
-            "/ find",
-            "n/N next/prev",
-            "PgUp/PgDn page",
-        ],
-        Mode::JobLog(pane) if pane.pager.find.is_some() => {
-            &["type to find", "Enter search", "Esc keep watching"]
-        }
-        Mode::JobLog(pane) if pane.follow => &[
-            "following new output",
-            "h/q/Esc back to files",
-            "j/k line",
-            "d/u half page",
-            "/ find",
-        ],
-        Mode::JobLog(_) => &[
-            "j/k line",
-            "h/q/Esc back to files",
-            "G follow new output",
-            "d/u half page",
-            "/ find",
-        ],
+        Mode::Browse => lang.hints_browse(),
+        Mode::Command { .. } => lang.hints_command(),
+        Mode::Filter { .. } => lang.hints_filter(),
+        Mode::ConfirmOp => lang.hints_confirm_op(),
+        Mode::ConfirmQuit => lang.hints_confirm_quit(),
+        Mode::FileSelector(_) => lang.hints_file_selector(),
+        Mode::ProviderMenu { .. } => lang.hints_provider_menu(),
+        Mode::FolderPicker(_) => lang.hints_folder_picker(),
+        Mode::Pager(pager) if pager.find.is_some() => lang.hints_pager_find(),
+        Mode::Pager(_) => lang.hints_pager(),
+        Mode::JobLog(pane) if pane.pager.find.is_some() => lang.hints_joblog_find(),
+        Mode::JobLog(pane) if pane.follow => lang.hints_joblog_following(),
+        Mode::JobLog(_) => lang.hints_joblog(),
     };
     let hints: Vec<String> = hints.iter().map(|h| (*h).to_string()).collect();
     let glyphs = theme.glyphs();
@@ -1106,7 +1060,7 @@ mod tests {
         fs::create_dir(tmp.path().join("projects")).unwrap();
         fs::write(tmp.path().join("readme.md"), "hi").unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        (tmp, App::new(nav, None, false, None))
+        (tmp, App::new(nav, None, false, None, Lang::En))
     }
 
     fn listing_fixture(entries: usize) -> tempfile::TempDir {
@@ -1119,8 +1073,24 @@ mod tests {
     }
 
     fn app_at(dir: &Path) -> App {
+        app_at_in(dir, Lang::En)
+    }
+
+    /// Put the cursor on a named row.
+    fn select(app: &mut App, name: &str) {
+        let visible = app.nav.visible();
+        let pos = visible
+            .iter()
+            .position(|&i| app.nav.entries[i].name == name)
+            .unwrap_or_else(|| panic!("entry '{name}' not visible"));
+        app.nav.cursor = pos;
+    }
+
+    /// The same app, speaking `lang` from the moment it is built - so
+    /// even the welcome line in the message ring is in it.
+    fn app_at_in(dir: &Path, lang: Lang) -> App {
         let home = dir.canonicalize().unwrap().parent().unwrap().to_path_buf();
-        App::new(NavState::new(dir).unwrap(), None, false, Some(home))
+        App::new(NavState::new(dir).unwrap(), None, false, Some(home), lang)
     }
 
     fn row(screen: &str, index: usize) -> String {
@@ -1283,7 +1253,7 @@ mod tests {
         app.handle_key(KeyInput::Enter);
         let screen = render_size(&app, 40, 30);
 
-        for line in summarize::menu_lines() {
+        for line in summarize::menu_lines(Lang::En) {
             let drawn = dialog_rows(&line, 40);
             for piece in &drawn {
                 assert!(
@@ -1346,12 +1316,14 @@ mod tests {
         let tmp = summary_fixture();
         for stage in 0..5 {
             for (width, height) in SIZES {
-                for theme in [
-                    Theme::from_no_color_env(None),
-                    Theme::from_no_color_env(Some("1")),
-                    Theme::from_env(None, Some("1")),
+                for (lang, theme) in [
+                    (Lang::En, Theme::from_no_color_env(None)),
+                    (Lang::En, Theme::from_no_color_env(Some("1"))),
+                    (Lang::En, Theme::from_env(None, Some("1"))),
+                    (Lang::ZhTw, Theme::from_no_color_env(None)),
+                    (Lang::ZhTw, Theme::from_env(None, Some("1"))),
                 ] {
-                    let mut app = app_at(tmp.path());
+                    let mut app = app_at_in(tmp.path(), lang);
                     match stage {
                         0 => open_selector(&mut app, &["notes.md"]),
                         1 => {
@@ -1393,10 +1365,15 @@ mod tests {
                         assert_eq!(
                             display_width(line),
                             width as usize,
-                            "stage {stage} at {width}x{height} row {index}: {line:?}"
+                            "{} stage {stage} at {width}x{height} row {index}: {line:?}",
+                            lang.code()
                         );
                     }
-                    if theme.ascii {
+                    // `FILECRAFT_ASCII` is about the characters filecraft
+                    // *draws*; a language written in Han characters is
+                    // still written in them, so only the English screen
+                    // can be asserted to be all-ASCII.
+                    if theme.ascii && lang == Lang::En {
                         for c in screen.chars().filter(|c| *c != '\n') {
                             assert!(
                                 (' '..='~').contains(&c),
@@ -1512,7 +1489,7 @@ mod tests {
         let Mode::JobLog(pane) = &app.mode else {
             panic!("expected the log viewer");
         };
-        let position = pane.pager.position(cols, rows, &app.glyphs);
+        let position = pane.pager.position(cols, rows, &app.glyphs, Lang::En);
         let bottom = screen
             .lines()
             .position(|line| line.contains(&position))
@@ -1544,33 +1521,41 @@ mod tests {
     #[test]
     fn every_frame_size_keeps_its_border_and_row_width() {
         let tmp = listing_fixture(73);
-        let mut app = app_at(tmp.path());
-        app.nav.cursor_to_end();
-        for (width, height) in SIZES {
-            for theme in [
-                Theme::from_no_color_env(None),
-                Theme::from_no_color_env(Some("1")),
-                Theme::from_env(None, Some("1")),
-            ] {
-                let screen = render_themed(&mut app, width, height, &theme);
-                let lines: Vec<&str> = screen.lines().collect();
-                assert_eq!(lines.len(), height as usize);
-                for (index, line) in lines.iter().enumerate() {
-                    assert_eq!(
-                        display_width(line),
-                        width as usize,
-                        "{width}x{height} row {index} is the wrong width: {line:?}"
-                    );
-                    let last = line.chars().last().unwrap();
-                    let expected: &[char] = if theme.ascii {
-                        &['|', '+']
-                    } else {
-                        &['║', '╗', '╝']
-                    };
-                    assert!(
-                        expected.contains(&last),
-                        "{width}x{height} row {index} lost its right border: {line:?}"
-                    );
+        // Every language, because a Han character owns two cells: a
+        // phrase measured by character count instead of display width
+        // pushes its row past the border, and this is the assertion that
+        // catches it wherever it is written.
+        for lang in Lang::ALL {
+            let mut app = app_at_in(tmp.path(), lang);
+            app.nav.cursor_to_end();
+            for (width, height) in SIZES {
+                for theme in [
+                    Theme::from_no_color_env(None),
+                    Theme::from_no_color_env(Some("1")),
+                    Theme::from_env(None, Some("1")),
+                ] {
+                    let screen = render_themed(&mut app, width, height, &theme);
+                    let lines: Vec<&str> = screen.lines().collect();
+                    assert_eq!(lines.len(), height as usize);
+                    for (index, line) in lines.iter().enumerate() {
+                        assert_eq!(
+                            display_width(line),
+                            width as usize,
+                            "{} {width}x{height} row {index} is the wrong width: {line:?}",
+                            lang.code()
+                        );
+                        let last = line.chars().last().unwrap();
+                        let expected: &[char] = if theme.ascii {
+                            &['|', '+']
+                        } else {
+                            &['║', '╗', '╝']
+                        };
+                        assert!(
+                            expected.contains(&last),
+                            "{} {width}x{height} row {index} lost its right border: {line:?}",
+                            lang.code()
+                        );
+                    }
                 }
             }
         }
@@ -1622,7 +1607,13 @@ mod tests {
             .join("assets");
         fs::create_dir_all(&deep).unwrap();
         let home = tmp.path().canonicalize().unwrap();
-        let mut app = App::new(NavState::new(&deep).unwrap(), None, false, Some(home));
+        let mut app = App::new(
+            NavState::new(&deep).unwrap(),
+            None,
+            false,
+            Some(home),
+            Lang::En,
+        );
         let theme = Theme::from_no_color_env(None);
         let screen = render_themed(&mut app, 80, 24, &theme);
         let ladder = row(&screen, 1);
@@ -1746,8 +1737,227 @@ mod tests {
         assert!(row(&screen, 3).contains(" 1h"), "{}", row(&screen, 3));
         // The reclaimed columns went to the name, not away: today's
         // 46-column name field is the floor.
-        let name_width = 78 - LISTING_FURNITURE;
+        let name_width = 78 - listing_furniture(Lang::En);
         assert!(name_width >= 46, "name field shrank to {name_width}");
+    }
+
+    /// Text the *user* types is as wide as they make it, and in a CJK
+    /// locale every character of it owns two cells. The prompt row, the
+    /// listing note, and the status row all have to survive that at the
+    /// documented minimum size.
+    #[test]
+    fn a_long_cjk_filter_never_breaks_the_frame() {
+        const TYPED: &str = "這是一段非常長的中文篩選字串用來測試邊界是否會被撐破以及游標位置";
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        for lang in Lang::ALL {
+            for (width, height) in SIZES {
+                for mode in ["filter", "command"] {
+                    let mut app = app_at_in(tmp.path(), lang);
+                    app.handle_key(KeyInput::Char(if mode == "filter" { '/' } else { ':' }));
+                    for c in TYPED.chars() {
+                        app.handle_key(KeyInput::Char(c));
+                    }
+                    let screen =
+                        render_themed(&mut app, width, height, &Theme::from_no_color_env(None));
+                    for (index, line) in screen.lines().enumerate() {
+                        assert_eq!(
+                            display_width(line),
+                            width as usize,
+                            "{} {mode} at {width}x{height} row {index}: {line:?}",
+                            lang.code()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The browse screen a reader of Traditional Chinese sees: the same
+    /// one locus, said in their language. Every element the brief names
+    /// is asserted where it is drawn, not where it is written.
+    #[test]
+    fn the_traditional_chinese_browse_screen_reads_as_one_locus() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("archive")).unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        app.nav.cursor = 2; // notes.md
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+
+        // The ladder row: the chain, then how deep and how big in words.
+        assert!(row(&screen, 1).contains("階層 1 · 2 個項目"), "{screen}");
+        // The listing keeps the language-neutral kind markers.
+        assert!(screen.contains("archive/"), "{screen}");
+        assert!(screen.contains("<DIR>"), "{screen}");
+        // The status row states the whole locus.
+        let status = row(&screen, status_row(24));
+        assert!(status.contains("第 3 列，共 3 列"), "{status}");
+        assert!(status.contains("所有項目已顯示"), "{status}");
+        assert!(status.contains("notes.md"), "{status}");
+        assert!(status.contains("檔案"), "{status}");
+        assert!(
+            status.contains("前"),
+            "an age with no 前 is a duration: {status}"
+        );
+        // The prompt row and the hint row.
+        assert!(row(&screen, 21).contains("指令> 按 : 輸入指令"), "{screen}");
+        assert!(
+            row(&screen, 22).contains("j/k 移動 · l/Enter 進入"),
+            "{screen}"
+        );
+        // The welcome line was written in the language the app was built
+        // with, not translated afterwards.
+        assert!(screen.contains("歡迎使用 filecraft"), "{screen}");
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so_in_traditional_chinese() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "hi").unwrap();
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        app.nav.set_filter("zzz".to_string());
+        let screen = render_themed(&mut app, 80, 24, &Theme::from_no_color_env(None));
+        assert!(screen.contains("沒有項目符合 'zzz'"), "{screen}");
+        assert!(
+            row(&screen, status_row(24)).contains("篩選 'zzz'"),
+            "{screen}"
+        );
+    }
+
+    /// Every overlay, in Traditional Chinese, saying what the brief says
+    /// it should - drawn, not merely defined.
+    #[test]
+    fn every_overlay_speaks_traditional_chinese() {
+        let tmp = summary_fixture();
+        let theme = Theme::from_no_color_env(None);
+
+        // The reader.
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        select(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char('l'));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("第 1 行，共 1 行 · 100%"), "{screen}");
+        assert!(screen.contains("閱讀模式"), "{screen}");
+        app.handle_key(KeyInput::Char('/'));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("搜尋: "), "{screen}");
+
+        // The folder picker.
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        select(&mut app, "notes.md");
+        app.execute_line("move");
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("目錄選擇器"), "{screen}");
+        assert!(screen.contains("目標: "), "{screen}");
+        assert!(
+            screen.contains("j/k 瀏覽 · l 進入 · h 上層 · Enter/m 選取 · q 取消"),
+            "{screen}"
+        );
+
+        // The file selector and the provider dialog.
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        open_selector(&mut app, &["notes.md"]);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("摘要：選擇檔案"), "{screen}");
+        assert!(screen.contains("已選取: 1 個檔案"), "{screen}");
+        app.handle_key(KeyInput::Enter);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("選擇 AI 模型"), "{screen}");
+        assert!(screen.contains("[預設]"), "{screen}");
+        assert!(
+            screen.contains("1-5 選擇 · Enter 使用預設 (ag) · q 取消"),
+            "{screen}"
+        );
+        assert!(screen.contains("已選取 1 個檔案"), "{screen}");
+
+        // The live log viewer, over a run that is still going.
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        with_watched_job(
+            &mut app,
+            &["/docs/a.pdf", "/docs/b.md"],
+            &["session id: 01a04eef-d4a6-7232", "reading"],
+            false,
+        );
+        app.handle_key(KeyInput::Char('L'));
+        let screen = render_themed(&mut app, 100, 30, &theme);
+        assert!(screen.contains("日誌檢視: agy"), "{screen}");
+        assert!(screen.contains("工作階段 01a04eef-d4a6-7232"), "{screen}");
+        assert!(screen.contains("續接: "), "{screen}");
+        assert!(
+            screen.contains("[AI: 正在使用 agy 摘要 2 個檔案]"),
+            "{screen}"
+        );
+        assert!(screen.contains("行"), "{screen}");
+    }
+
+    #[test]
+    fn the_log_header_says_finished_in_traditional_chinese_once_a_run_ends() {
+        let tmp = summary_fixture();
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        with_watched_job(&mut app, &["/docs/a.pdf"], &["done"], true);
+        app.handle_key(KeyInput::Char('L'));
+        let screen = render_themed(&mut app, 100, 30, &Theme::from_no_color_env(None));
+        assert!(screen.contains("完成"), "{screen}");
+        assert!(screen.contains("工作階段：agy 未回報"), "{screen}");
+    }
+
+    /// The two confirmations the brief pins down, on the row that asks
+    /// them.
+    #[test]
+    fn the_confirmations_ask_in_traditional_chinese() {
+        let tmp = summary_fixture();
+        let theme = Theme::from_no_color_env(None);
+
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        select(&mut app, "notes.md");
+        app.handle_key(KeyInput::Char('d'));
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        assert!(screen.contains("確認"), "{screen}");
+        assert!(screen.contains("[y]是 / [n]否"), "{screen}");
+        assert!(screen.contains("將 'notes.md' 移至垃圾桶"), "{screen}");
+        assert!(screen.contains("y 確認"), "{screen}");
+
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        with_running_job(&mut app, &["/docs/a.pdf", "/docs/b.md"]);
+        app.handle_key(KeyInput::Char('q'));
+        let screen = render_themed(&mut app, 100, 30, &theme);
+        assert!(
+            screen.contains("背景任務執行中：確認終止 AI 摘要並離開？(y/n)"),
+            "{screen}"
+        );
+        assert!(screen.contains("y 終止並離開"), "{screen}");
+    }
+
+    /// A CJK name, a CJK age, and a CJK status row on the same screen:
+    /// the columns still line up, because every one of them is measured
+    /// rather than counted.
+    #[test]
+    fn a_chinese_screen_of_chinese_names_keeps_its_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("ascii_name.txt"), "").unwrap();
+        fs::write(tmp.path().join("中文檔案名稱測試用範例.txt"), "").unwrap();
+        let mut app = app_at_in(tmp.path(), Lang::ZhTw);
+        let theme = Theme::from_no_color_env(None);
+        let screen = render_themed(&mut app, 80, 24, &theme);
+        let column_of_size = |needle: &str| {
+            let line = screen
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("row for {needle} missing in\n{screen}"));
+            let cut = line.find(needle).unwrap() + needle.len();
+            let offset = line[cut..].find("0B").expect("size column");
+            display_width(&line[..cut + offset])
+        };
+        assert_eq!(
+            column_of_size("ascii_name.txt"),
+            column_of_size("範例.txt"),
+            "{screen}"
+        );
+        for line in screen.lines() {
+            assert_eq!(display_width(line), 80, "{line:?}");
+        }
     }
 
     #[test]
@@ -2261,12 +2471,12 @@ mod tests {
         fs::write(tmp.path().join("evil\u{1b}[31m.txt"), "x").unwrap();
 
         let nav = NavState::new(tmp.path()).unwrap();
-        let app = App::new(nav, None, false, None);
+        let app = App::new(nav, None, false, None, Lang::En);
         let screen = render(&app);
         assert!(!screen.contains('\u{1b}'));
         assert!(screen.contains("evil\u{FFFD}[31m.txt"));
 
-        let listing = render_static_listing(tmp.path()).unwrap();
+        let listing = render_static_listing(tmp.path(), Lang::En).unwrap();
         assert!(!listing.contains('\u{1b}'));
         assert!(listing.contains("evil\u{FFFD}[31m.txt"));
     }
@@ -2277,7 +2487,7 @@ mod tests {
         fs::create_dir(tmp.path().join("archive")).unwrap();
         fs::write(tmp.path().join("evil\u{1b}]0;pwned\u{7}.txt"), "x").unwrap();
         let nav = NavState::new(tmp.path()).unwrap();
-        let mut app = App::new(nav, None, false, None);
+        let mut app = App::new(nav, None, false, None, Lang::En);
 
         let visible = app.nav.visible();
         let pos = visible
@@ -2315,7 +2525,7 @@ mod tests {
         fs::write(tmp.path().join("readme.md"), "hi").unwrap();
         fs::write(tmp.path().join("ünïcødé 檔.md"), "u").unwrap();
 
-        let listing = render_static_listing(tmp.path()).unwrap();
+        let listing = render_static_listing(tmp.path(), Lang::En).unwrap();
         assert!(listing.contains("filecraft"));
         assert!(listing.contains("no TTY"));
         assert!(listing.contains("projects/"));
@@ -2328,7 +2538,7 @@ mod tests {
     #[test]
     fn static_listing_missing_directory_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = render_static_listing(&tmp.path().join("nope")).unwrap_err();
+        let err = render_static_listing(&tmp.path().join("nope"), Lang::En).unwrap_err();
         assert!(matches!(err, FsError::NotFound(_)));
     }
 }

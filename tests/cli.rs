@@ -4,8 +4,38 @@
 
 use std::process::{Command, Stdio};
 
+/// The binary, speaking English.
+///
+/// Pinned rather than inherited: filecraft resolves its language from
+/// the system locale, so a `LANG` of `zh_TW.UTF-8` on the machine
+/// running the suite would otherwise make every English assertion below
+/// fail for a reason that has nothing to do with the code. [`bin_in`]
+/// is how a language is chosen deliberately.
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_filecraft"))
+    bin_in("en")
+}
+
+/// The binary, speaking `lang` - and only because of `FILECRAFT_LANG`:
+/// every locale variable is cleared, so the test says which language it
+/// is asserting about.
+fn bin_in(lang: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
+    cmd.env("FILECRAFT_LANG", lang)
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .env_remove("LANG");
+    cmd
+}
+
+/// The binary with no language named at all, so the locale decides.
+fn bin_with_locale(variable: &str, value: &str) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
+    cmd.env_remove("FILECRAFT_LANG")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .env_remove("LANG")
+        .env(variable, value);
+    cmd
 }
 
 fn output_with_piped_stdio(cmd: &mut Command) -> std::process::Output {
@@ -217,4 +247,100 @@ fn install_script_and_pathcheck_agree_on_what_is_on_path() {
             "PATH [{path_value}]: pathcheck says {rust}, install.sh says {shell}"
         );
     }
+}
+
+#[test]
+fn filecraft_lang_puts_the_whole_static_listing_into_traditional_chinese() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("sub dir")).unwrap();
+    std::fs::write(tmp.path().join("notes 檔.md"), "hi").unwrap();
+
+    let output = output_with_piped_stdio(bin_in("zh-TW").arg("--list").arg(tmp.path()));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("靜態列表 (沒有 TTY)"), "{stdout}");
+    assert!(stdout.contains("按鍵: j/k 移動"), "{stdout}");
+    // The name and the kind marker are not words, so they do not change.
+    assert!(stdout.contains("sub dir/"), "{stdout}");
+    assert!(stdout.contains("notes 檔.md"), "{stdout}");
+    assert!(stdout.contains("<DIR>"), "{stdout}");
+}
+
+#[test]
+fn a_traditional_chinese_locale_is_enough_with_nothing_else_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("only.txt"), "x").unwrap();
+
+    for variable in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        let output = output_with_piped_stdio(
+            bin_with_locale(variable, "zh_TW.UTF-8")
+                .arg("--list")
+                .arg(tmp.path()),
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("靜態列表 (沒有 TTY)"),
+            "{variable} did not select Traditional Chinese:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn a_simplified_chinese_locale_is_answered_in_english_not_in_the_wrong_chinese() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("only.txt"), "x").unwrap();
+    let output = output_with_piped_stdio(
+        bin_with_locale("LANG", "zh_CN.UTF-8")
+            .arg("--list")
+            .arg(tmp.path()),
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("static listing"), "{stdout}");
+}
+
+#[test]
+fn filecraft_lang_overrides_the_system_locale() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("only.txt"), "x").unwrap();
+    let output = output_with_piped_stdio(
+        bin_with_locale("LANG", "zh_TW.UTF-8")
+            .env("FILECRAFT_LANG", "en")
+            .arg("--list")
+            .arg(tmp.path()),
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("static listing"), "{stdout}");
+}
+
+#[test]
+fn the_cli_help_is_written_in_the_screens_language_too() {
+    let output = output_with_piped_stdio(bin_in("zh-TW").arg("--help"));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("鍵盤優先"), "{stdout}");
+    assert!(stdout.contains("FILECRAFT_LANG"), "{stdout}");
+    // Flags are shell tokens, not words: they stay as they are typed.
+    assert!(stdout.contains("-l, --list"), "{stdout}");
+
+    let output = output_with_piped_stdio(bin_in("zh-TW").arg("update").arg("--help"));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("安裝最新版的 filecraft"), "{stdout}");
+    assert!(stdout.contains("cargo install --git"), "{stdout}");
+}
+
+#[test]
+fn a_usage_error_is_reported_in_the_screens_language() {
+    let output = output_with_piped_stdio(bin_in("zh-TW").arg("--not-a-flag"));
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("未知的選項 '--not-a-flag'"), "{stderr}");
+    assert!(stderr.contains("filecraft --help"), "{stderr}");
 }

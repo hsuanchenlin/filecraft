@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use crate::i18n::{CliError, Lang};
+
 /// Parsed runtime options for a normal invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliArgs {
@@ -19,9 +21,9 @@ pub struct CliArgs {
 pub enum CliAction {
     /// Run against a directory (interactive TUI or static listing).
     Run(CliArgs),
-    /// Print [`USAGE`] and exit 0.
+    /// Print [`Lang::cli_usage`] and exit 0.
     Help,
-    /// Print [`UPDATE_USAGE`] and exit 0.
+    /// Print [`Lang::cli_update_usage`] and exit 0.
     HelpUpdate,
     /// Print the version and exit 0.
     Version,
@@ -32,50 +34,19 @@ pub enum CliAction {
     },
 }
 
-pub const USAGE: &str = "\
-filecraft - keyboard-first, BBS-style terminal file navigator
+/// The English usage text, for callers that have no language of their
+/// own. The screen's own copy comes from [`Lang::cli_usage`].
+pub fn usage() -> &'static str {
+    Lang::En.cli_usage()
+}
 
-USAGE:
-  filecraft [OPTIONS] [DIRECTORY]
-  filecraft update [--check]
-
-OPTIONS:
-  -l, --list       print a static listing and exit (no TUI)
-  -h, --help       show this help
-  -V, --version    show version
-
-COMMANDS:
-  update           install the latest filecraft
-  update --check   report whether an update is available
-
-No DIRECTORY opens the current working directory. A folder named
-update is opened as `filecraft ./update`.
-
-Interactive mode needs a real TTY. Without one, filecraft prints a
-static listing of DIRECTORY (default: the current directory) instead.
-Set NO_COLOR to disable colors; selection and markers stay visible.
-Set FILECRAFT_ASCII to draw the screen in printable ASCII only.
-";
-
-pub const UPDATE_USAGE: &str = "\
-filecraft update - install the latest filecraft
-
-USAGE:
-  filecraft update [--check]
-
-  --check    check for an update without installing
-
-A local git clone is pulled with `git pull --ff-only` and reinstalled
-with `cargo install --path <clone> --locked --force`. A global cargo
-install is refreshed with:
-  cargo install --git https://github.com/hsuanchenlin/filecraft.git --locked --force
-
-Requires `cargo` (and `git` for a clone). Network, missing tools, and
-permission errors are reported and do not crash.
-";
+/// [`usage`] for `filecraft update`.
+pub fn update_usage() -> &'static str {
+    Lang::En.cli_update_usage()
+}
 
 /// Parse argv *after* the program name.
-pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
+pub fn parse_args(args: &[String]) -> Result<CliAction, CliError> {
     if args.first().map(String::as_str) == Some("update") {
         return parse_update_args(&args[1..]);
     }
@@ -87,11 +58,11 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "-V" | "--version" => return Ok(CliAction::Version),
             "-l" | "--list" => force_list = true,
             flag if flag.starts_with('-') => {
-                return Err(format!("unknown option '{flag}'"));
+                return Err(CliError::UnknownOption(flag.to_string()));
             }
             path => {
                 if directory.is_some() {
-                    return Err("expected at most one DIRECTORY argument".to_string());
+                    return Err(CliError::TooManyDirectories);
                 }
                 directory = Some(PathBuf::from(path));
             }
@@ -103,7 +74,7 @@ pub fn parse_args(args: &[String]) -> Result<CliAction, String> {
     }))
 }
 
-fn parse_update_args(args: &[String]) -> Result<CliAction, String> {
+fn parse_update_args(args: &[String]) -> Result<CliAction, CliError> {
     let mut check = false;
     for arg in args {
         match arg.as_str() {
@@ -111,10 +82,10 @@ fn parse_update_args(args: &[String]) -> Result<CliAction, String> {
             "-V" | "--version" => return Ok(CliAction::Version),
             "--check" => check = true,
             flag if flag.starts_with('-') => {
-                return Err(format!("unknown option '{flag}'"));
+                return Err(CliError::UnknownOption(flag.to_string()));
             }
             extra => {
-                return Err(format!("unexpected argument '{extra}'"));
+                return Err(CliError::UnexpectedArgument(extra.to_string()));
             }
         }
     }
@@ -209,12 +180,18 @@ mod tests {
 
     #[test]
     fn update_rejects_unknown_flags_and_extra_args() {
-        let err = parse_args(&args(&["update", "--force"])).unwrap_err();
-        assert!(err.contains("unknown option"));
-        let err = parse_args(&args(&["update", "--check", "extra"])).unwrap_err();
-        assert!(err.contains("unexpected argument"));
-        let err = parse_args(&args(&["--check"])).unwrap_err();
-        assert!(err.contains("unknown option"));
+        assert_eq!(
+            parse_args(&args(&["update", "--force"])).unwrap_err(),
+            CliError::UnknownOption("--force".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["update", "--check", "extra"])).unwrap_err(),
+            CliError::UnexpectedArgument("extra".to_string())
+        );
+        assert_eq!(
+            parse_args(&args(&["--check"])).unwrap_err(),
+            CliError::UnknownOption("--check".to_string())
+        );
     }
 
     #[test]
@@ -230,23 +207,27 @@ mod tests {
 
     #[test]
     fn unknown_flag_is_an_error() {
-        let err = parse_args(&args(&["--force"])).unwrap_err();
-        assert!(err.contains("unknown option"));
+        assert_eq!(
+            parse_args(&args(&["--force"])).unwrap_err(),
+            CliError::UnknownOption("--force".to_string())
+        );
     }
 
     #[test]
     fn two_directories_is_an_error() {
-        let err = parse_args(&args(&["a", "b"])).unwrap_err();
-        assert!(err.contains("at most one"));
+        assert_eq!(
+            parse_args(&args(&["a", "b"])).unwrap_err(),
+            CliError::TooManyDirectories
+        );
     }
 
     #[test]
     fn usage_mentions_tty_requirement() {
-        assert!(USAGE.contains("real TTY"));
-        assert!(USAGE.contains("--list"));
-        assert!(USAGE.contains("update [--check]"));
-        assert!(USAGE.contains("current working directory"));
-        assert!(UPDATE_USAGE.contains("--check"));
-        assert!(UPDATE_USAGE.contains("cargo install --git"));
+        assert!(usage().contains("real TTY"));
+        assert!(usage().contains("--list"));
+        assert!(usage().contains("update [--check]"));
+        assert!(usage().contains("current working directory"));
+        assert!(update_usage().contains("--check"));
+        assert!(update_usage().contains("cargo install --git"));
     }
 }

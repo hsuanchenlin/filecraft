@@ -28,6 +28,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::fsops::FsError;
+use crate::i18n::{Lang, Reason};
 
 /// The one capability the state machine needs: put an existing entry in
 /// the trash, recoverably.
@@ -48,7 +49,10 @@ pub trait Trasher {
     fn trash_guarded(&self, path: &Path) -> Result<(), FsError>;
 
     /// Where trashed entries land, in words, for messages and help.
-    fn destination(&self) -> &str;
+    ///
+    /// Takes the language because this is a phrase and not a path: the
+    /// system Trash is called what the screen's language calls it.
+    fn destination(&self, lang: Lang) -> String;
 }
 
 /// The real system Trash.
@@ -72,13 +76,11 @@ impl Trasher for SystemTrasher {
 
     #[cfg(not(target_os = "macos"))]
     fn trash_guarded(&self, _path: &Path) -> Result<(), FsError> {
-        Err(FsError::Unsupported(
-            "moving to the Trash is only supported on macOS",
-        ))
+        Err(FsError::Unsupported(Reason::TrashMacOsOnly))
     }
 
-    fn destination(&self) -> &str {
-        "the Trash"
+    fn destination(&self, lang: Lang) -> String {
+        lang.the_trash().to_string()
     }
 }
 
@@ -98,7 +100,7 @@ fn map_error(path: &Path, err: &::trash::Error) -> FsError {
         Error::CanonicalizePath { original } => FsError::NotFound(original.clone()),
         Error::TargetedRoot => FsError::Refused {
             path: path.to_path_buf(),
-            reason: "the filesystem root cannot be trashed",
+            reason: Reason::RootNotTrashable,
         },
         Error::Os { code, description } => FsError::Io {
             path: path.to_path_buf(),
@@ -128,16 +130,16 @@ pub fn check_trashable(path: &Path) -> Result<(), FsError> {
     match last {
         Some("..") => Err(FsError::Refused {
             path: path.to_path_buf(),
-            reason: "'..' is the parent directory, not an entry - select a real entry",
+            reason: Reason::ParentNotAnEntry,
         }),
         Some(".") => Err(FsError::Refused {
             path: path.to_path_buf(),
-            reason: "'.' is the current directory, not an entry - select a real entry",
+            reason: Reason::CurrentNotAnEntry,
         }),
         // Nothing but separators: the filesystem root, or an empty path.
         None => Err(FsError::Refused {
             path: path.to_path_buf(),
-            reason: "the filesystem root cannot be trashed",
+            reason: Reason::RootNotTrashable,
         }),
         Some(_) => Ok(()),
     }
@@ -178,7 +180,7 @@ impl Trasher for DirTrasher {
     fn trash_guarded(&self, path: &Path) -> Result<(), FsError> {
         let name = path.file_name().ok_or_else(|| FsError::Refused {
             path: path.to_path_buf(),
-            reason: "the filesystem root cannot be trashed",
+            reason: Reason::RootNotTrashable,
         })?;
         std::fs::create_dir_all(&self.root).map_err(|e| crate::fsops::io_error(&self.root, &e))?;
         let mut dst = self.root.join(name);
@@ -192,8 +194,8 @@ impl Trasher for DirTrasher {
         crate::fsops::safe_move(path, &dst)
     }
 
-    fn destination(&self) -> &str {
-        "the Trash"
+    fn destination(&self, lang: Lang) -> String {
+        lang.the_trash().to_string()
     }
 }
 
