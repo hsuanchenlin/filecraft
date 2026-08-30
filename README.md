@@ -112,10 +112,11 @@ reported and do not crash.
 
 - **OS:** macOS first. The interactive navigator, `cd`/`move`/`rename`,
   `edit`, and `preview` are local-filesystem only and also run on other
-  Unix systems. The `open` command uses `/usr/bin/open` and is macOS-only,
-  and so is `delete`, which moves the entry to the macOS Trash through
-  `NSFileManager`. On other platforms `delete` reports that and does
-  nothing.
+  Unix systems. The `open` command - and `l` on a file the reader cannot
+  draw, which is the same operation - uses `/usr/bin/open` and is
+  macOS-only, and so is `delete`, which moves the entry to the macOS
+  Trash through `NSFileManager`. On other platforms both report that and
+  do nothing.
 - **Terminal:** Terminal.app, iTerm2, Ghostty, kitty, WezTerm, or
   Alacritty. Needs a real TTY, UTF-8 locale, and at least 80x24 cells.
   Color uses the terminal's ANSI palette. Set `NO_COLOR` to any non-empty
@@ -222,7 +223,7 @@ In browse mode:
 | PgUp / PgDn | move focus a page |
 | `g` / `G` | first / last entry |
 | Enter | enter a directory, or edit the selected file |
-| `l`, Right | enter the selected directory, or read the selected file |
+| `l`, Right | enter the selected directory, read the selected text file, or hand anything else to the macOS default application |
 | `h`, Left, Backspace | parent directory |
 | `0`-`9` | jump to that ancestor on the ladder |
 | `d` | move the selected entry to the Trash (asks `y/n`) |
@@ -247,15 +248,27 @@ moves anything. Every other filesystem operation goes through select ->
 `:` command -> `y`; opening a file in the configured editor remains the
 explicit path for editing file contents.
 
+`l` on a PDF, an image, or a video starts the macOS default application
+for it, and that is still read-only: Filecraft hands `/usr/bin/open` the
+path and nothing else, never writes to the file, and never changes its
+permissions. The program is spawned detached, so the Filecraft screen
+stays exactly where it was and the event loop keeps answering keys - no
+terminal is handed away, the way `edit` and `preview` hand one away.
+
 `S` is the second browse key that can lead somewhere outside the
 listing, and like `d` it does nothing by itself: it opens a file
 selector. Nothing is read, no program is started, and no file is written
 until files are picked *and* a provider is chosen.
 
-**Changed in this slice:** `l` on a text or Markdown file now opens the
-built-in reader (below) instead of refusing. On a directory it still
-enters, and on `../` it still goes up, so the key means one thing: go
-in. Nothing about it can change a file.
+**Changed in this slice:** `l` on a PDF, image, audio, video, archive, or
+any file whose bytes are not text now opens it in the macOS default
+application instead of refusing it in words. Text and Markdown still
+open in the built-in reader (below), a directory is still entered, and
+`../` still goes up - so the key still means one thing: show me this.
+Nothing about it can change a file.
+
+**Changed in an earlier slice:** `l` on a text or Markdown file opens the
+built-in reader (below) instead of refusing.
 
 **Changed in an earlier slice:** `l` **enters** the selected directory
 instead of going to the parent, matching vim, ranger, lf, and nnn. Esc
@@ -606,9 +619,48 @@ textual marker (`#`, a bullet, a quote bar, backticks), so `NO_COLOR` and
 structure. Lines wrap on real display columns, so wide CJK text reflows
 without jitter and a wrapped bullet stays under its own text.
 
-A binary file is refused in a message rather than painted on the screen;
-so are broken symlinks and special files. Files are shown up to 1 MiB and
-20,000 lines, and a truncated file says so on its last line.
+A file the reader cannot draw is not refused: it is handed to the macOS
+default application instead (see [Opening in the desktop](#opening-in-the-desktop)).
+Broken symlinks and special files are still refused in a message. Files
+are shown up to 1 MiB and 20,000 lines, and a truncated file says so on
+its last line.
+
+## Opening in the desktop
+
+`l` (or Right) on a file the reader cannot draw hands it to
+`/usr/bin/open`, which starts whatever application macOS has registered
+for that format - Preview for a PDF or an image, QuickTime for a video,
+Archive Utility for a `.zip`. `:open` is the same operation typed out,
+on any entry.
+
+Two rules decide, in this order:
+
+1. **The name, for formats that are never text.** `pdf`, images
+   (`png jpg jpeg gif webp heic svg bmp tiff ico`), audio
+   (`mp3 wav flac aac m4a ogg aiff`), video
+   (`mp4 mov mkv avi webm m4v`), archives
+   (`zip tar gz tgz bz2 xz zst 7z rar dmg`), and binaries
+   (`o a so dylib bin exe wasm class pyc`) go straight to the desktop
+   without the file being opened at all. This is the same extension
+   table the [`kind` column](#columns) draws from. Deciding on the name
+   matters: a small PDF can carry no NUL byte in its first 8 KiB, and
+   sniffing alone would have called it text and painted it as mojibake.
+2. **The bytes, for everything else.** Any other file is read, and if
+   what comes back is not text it goes the same way. That is the only
+   answer available for an extension Filecraft does not know.
+
+Everything that is text - Markdown, plain text, source, config, an
+unknown extension holding readable bytes - still opens in the reader.
+
+The application is spawned **detached**: Filecraft does not wait for it,
+does not give up the terminal, and does not redraw around it. The
+message log says `open: opened 'report.pdf' with the macOS default
+application` and the listing stays on the same row. Nothing is written:
+the path is handed over and that is all.
+
+`open` is macOS-only. On other platforms `l` on such a file reports that,
+in the screen language, and does nothing - the same refusal `:open` has
+always given there.
 
 ## Bearings
 
@@ -671,7 +723,7 @@ Typed at the `:` prompt. Parsed directly: no shell, no globbing, no
 | `move [destination]` | move the selected entry (asks `y/n`, never overwrites). No path opens a folder picker; a typed path still goes straight to confirm |
 | `rename <new-name>` | rename the selected entry (asks `y/n`, never overwrites) |
 | `delete`, `trash` | move the selected entry to the macOS Trash (asks `y/n`; recoverable) |
-| `open` | hand the selected entry to macOS `open` |
+| `open` | hand the selected entry to macOS `open` - the same thing `l` does on a PDF or an image |
 | `edit` | edit the selected regular file in `$EDITOR` or `nvim` |
 | `preview` | read-only preview (Neovim if available, else built-in) |
 | `summarize`, `summary` | AI summary of files you pick (same as `S`) |
@@ -742,6 +794,9 @@ answering them with a deletion.
 - A summary never overwrites a file: it writes a new `.md`, falling back
   to a stamped name when the preferred one is taken.
 - The Filecraft screen is restored after the editor exits.
+- `l` on a PDF, image, or video starts the macOS default application for
+  it and nothing more: `/usr/bin/open` is given the path, the file is
+  never written, and its permissions are never changed.
 
 ## Developer setup
 

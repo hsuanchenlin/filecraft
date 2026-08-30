@@ -8,13 +8,28 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in `src/lib.rs` has no terminal event loop; `src/main.rs` owns TTY detection and the interactive screen.
 
-- `cargo test` is the full local test command (module tests plus `tests/cli.rs`).
+- `cargo test` is the full local test command (module tests plus the
+  `tests/` integration suites).
 - `cargo run -- --list [DIR]` is the non-TTY listing path.
 - `src/bearings.rs` owns the shared pure display primitives (ladder,
   rail, scroll margin, relative time, speakable status, width padding,
   sanitizing, hanging-indent wrapping). Pane-specific modules build on
   them; keep rendering arithmetic out of `ui.rs` so it stays testable
   without a TTY.
+- `l` / Right means "show me this", and `App::open_pager_for_file` is
+  where that fans out: a directory is entered, text goes to the reader,
+  and anything the reader cannot draw is handed to the desktop through
+  `App::open_with_desktop` - the one place `/usr/bin/open` is named, and
+  what `:open` calls too, so the two are literally one operation with
+  one message. Two rules decide, in this order and for a reason: the
+  *name* first (`columns::FileKind::belongs_to_the_desktop`), because a
+  small PDF can carry no NUL byte in its first 8 KiB and the text sniff
+  would call it readable; then the *bytes*
+  (`preview::ViewSource::Binary`), which is the only answer an extension
+  Filecraft does not know can get. `tests/open_external.rs` covers the
+  whole path from a real file on disk to the argv the event loop
+  spawns - everything but the `posix_spawn`, because a test suite may
+  not launch Preview on the machine running it.
 - The reader (`l` on a text/Markdown file) splits the same way:
   `src/markdown.rs` classifies lines and wraps them to a column budget,
   `src/pager.rs` owns scroll/search/position, `ui.rs` only turns a
@@ -37,8 +52,10 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   how wide each is *in the language on screen*
   (`Column::width` = `max(content, header)`, so `:header` never reflows
   the rows), what each cell says (`Column::cell`), the extension-driven
-  `FileKind` table, and the width budget (`layout`) that hands the name
-  whatever the fixed columns leave and drops columns by
+  `FileKind` table (which is also what decides, through
+  `belongs_to_the_desktop`, that `l` hands a format to the desktop
+  rather than to the reader), and the width budget (`layout`) that hands
+  the name whatever the fixed columns leave and drops columns by
   `Column::drop_rank` when that is not enough - never `Name` or `Size`.
   `ui.rs` only draws it. `columns::HEADER_ROWS` must match what
   `ui::draw_listing` reserves and what `App::listing_rows` subtracts,
@@ -96,10 +113,15 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   allowed to *arm* an operation without performing it;
   `no_browse_key_ever_mutates_the_filesystem` in `src/app.rs` enforces
   both halves mechanically - the tree is unchanged after every key, the
-  fixture Trash stays empty, and only `d` may leave `pending` set. `?`
-  help, the README keyboard table, and `help_lines()` ship in the same
-  change as any key change - the reader's, folder picker's, and
-  confirmation prompt's keys included.
+  fixture Trash stays empty, and only `d` may leave `pending` set. Its
+  fixture holds a PDF and a blob because `l` / Right are the only browse
+  keys allowed to return `Effect::SpawnDetached`; every other key must
+  still start no process at all. Handing a path to `/usr/bin/open` is
+  read-only - the file is never written and its mode never changes -
+  but it *is* a process, so widening that list needs the same
+  deliberation as widening removal. `?` help, the README keyboard table,
+  and `help_lines()` ship in the same change as any key change - the
+  reader's, folder picker's, and confirmation prompt's keys included.
 - `agent` is a disabled seam (`src/agent.rs`, contract in
   `docs/agent-seam.md`). It stays disabled: do not enable autonomous
   changes or let anything scan a tree "for context".

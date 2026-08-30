@@ -362,6 +362,27 @@ impl FileKind {
         }
     }
 
+    /// Whether the desktop owns this format rather than Filecraft's
+    /// reader.
+    ///
+    /// Extension-driven like the rest of the table, so `l` on a PDF
+    /// never has to open the file to learn it is not text, and
+    /// deliberately conservative: only kinds that are *never* text say
+    /// yes. [`FileKind::Data`] - an extension Filecraft does not know -
+    /// says no and is decided by its own bytes instead, which is the
+    /// only answer a name cannot give.
+    pub fn belongs_to_the_desktop(self) -> bool {
+        matches!(
+            self,
+            FileKind::Pdf
+                | FileKind::Image
+                | FileKind::Audio
+                | FileKind::Video
+                | FileKind::Archive
+                | FileKind::Binary
+        )
+    }
+
     /// The kind's word in `lang`. Format and language names stay
     /// themselves in both - `Markdown` is a name, not a word.
     pub fn word(self, lang: Lang) -> &'static str {
@@ -1077,6 +1098,35 @@ mod tests {
         // A dotfile's name is not an extension.
         assert_eq!(FileKind::of_name(".zshrc"), FileKind::Data);
         assert_eq!(FileKind::of_name(".config.toml"), FileKind::Toml);
+    }
+
+    #[test]
+    fn only_formats_that_are_never_text_belong_to_the_desktop() {
+        // The split `l` acts on. Everything a person reads stays with
+        // the reader; the formats the reader could only paint as
+        // mojibake go to the default application. `Data` - an extension
+        // Filecraft does not know - is deliberately on the reader's
+        // side, because only the file's own bytes can settle it.
+        let desktop = [
+            FileKind::Pdf,
+            FileKind::Image,
+            FileKind::Audio,
+            FileKind::Video,
+            FileKind::Archive,
+            FileKind::Binary,
+        ];
+        for kind in FileKind::ALL {
+            assert_eq!(
+                kind.belongs_to_the_desktop(),
+                desktop.contains(&kind),
+                "{kind:?}"
+            );
+        }
+        assert!(FileKind::of_name("report.pdf").belongs_to_the_desktop());
+        assert!(FileKind::of_name("shot.PNG").belongs_to_the_desktop());
+        assert!(!FileKind::of_name("notes.md").belongs_to_the_desktop());
+        assert!(!FileKind::of_name("main.rs").belongs_to_the_desktop());
+        assert!(!FileKind::of_name("README").belongs_to_the_desktop());
     }
 
     #[test]

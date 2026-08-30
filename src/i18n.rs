@@ -848,16 +848,6 @@ impl Lang {
         }
     }
 
-    /// `l` on a file whose bytes are not text.
-    pub fn not_text(self, name: &str) -> String {
-        match self {
-            Lang::En => format!("cannot read '{name}' as text - it is binary; try ':' then open"),
-            Lang::ZhTw => {
-                format!("無法以文字讀取 '{name}' - 這是二進位檔案；可改用 ':' 再輸入 open")
-            }
-        }
-    }
-
     /// The reader's note when a file was too long to read whole.
     pub fn truncated(self, lines: usize, kib: u64) -> String {
         match self {
@@ -868,14 +858,16 @@ impl Lang {
 
     // ---- Editors and external programs -------------------------------------
 
-    pub fn opening_with_macos(self, name: &str) -> String {
-        self.op_says(Op::Open, &self.opening_with_macos_detail(name))
+    /// What both `:open` and `l` on a file the reader cannot draw say.
+    /// One phrase, because they are one operation.
+    pub fn opened_with_default_app(self, name: &str) -> String {
+        self.op_says(Op::Open, &self.opened_with_default_app_detail(name))
     }
 
-    fn opening_with_macos_detail(self, name: &str) -> String {
+    fn opened_with_default_app_detail(self, name: &str) -> String {
         match self {
-            Lang::En => format!("handing '{name}' to macOS open"),
-            Lang::ZhTw => format!("交由 macOS open 開啟 '{name}'"),
+            Lang::En => format!("opened '{name}' with the macOS default application"),
+            Lang::ZhTw => format!("已使用預設程式開啟 '{name}'"),
         }
     }
 
@@ -1728,7 +1720,8 @@ impl Lang {
                 "  PgUp / PgDn          move focus a page",
                 "  g / G                first / last entry",
                 "  Enter                enter directory, or edit selected file",
-                "  l, Right             enter directory, or read the selected file",
+                "  l, Right             enter directory, or show the selected file",
+                "                       (text in the reader; a PDF or image in macOS)",
                 "  h, Left, Backspace   go to parent directory",
                 "  0-9                  jump to that ancestor on the ladder",
                 "  d                    move selected entry to the Trash (asks y/n)",
@@ -1814,7 +1807,7 @@ impl Lang {
                 "  move [destination]   folder picker, or a path (asks y/n first)",
                 "  rename <new-name>    rename selected entry (asks y/n first)",
                 "  delete, trash        move selected entry to the Trash (asks y/n)",
-                "  open                 open selected entry with macOS 'open'",
+                "  open                 open selected entry in its default app (same as l)",
                 "  edit                 edit selected file in $EDITOR (or nvim)",
                 "  preview              read-only preview (nvim -R, or built-in)",
                 "  summarize, summary   AI summary of files you pick (same as S)",
@@ -1835,6 +1828,8 @@ impl Lang {
                 "",
                 "SAFETY",
                 "  - the reader is read-only: no key in it can change a file",
+                "  - l on a PDF or image starts the macOS default application;",
+                "    filecraft only names the file and never changes it",
                 "  - moves and renames never overwrite and always ask first",
                 "  - delete is a move to the Trash: recoverable, never an unlink",
                 "  - nothing is ever removed permanently, recursively or otherwise",
@@ -1867,7 +1862,8 @@ impl Lang {
                 "  PgUp / PgDn          上下翻頁",
                 "  g / G                第一個 / 最後一個項目",
                 "  Enter                進入目錄，或編輯選取的檔案",
-                "  l, Right             進入目錄，或閱讀選取的檔案",
+                "  l, Right             進入目錄，或顯示選取的檔案",
+                "                       (文字用閱讀模式；PDF、圖片交給預設程式)",
                 "  h, Left, Backspace   回到上層目錄",
                 "  0-9                  跳到階層上對應的上層目錄",
                 "  d                    將選取的項目移至垃圾桶 (會先問 y/n)",
@@ -1952,7 +1948,7 @@ impl Lang {
                 "  move [目標]          目錄選擇器，或直接給路徑 (會先問 y/n)",
                 "  rename <新名稱>      重新命名選取的項目 (會先問 y/n)",
                 "  delete, trash        將選取的項目移至垃圾桶 (會先問 y/n)",
-                "  open                 用 macOS 的 'open' 開啟選取的項目",
+                "  open                 以 macOS 預設程式開啟選取的項目 (同 l)",
                 "  edit                 以 $EDITOR (或 nvim) 編輯選取的檔案",
                 "  preview              唯讀預覽 (nvim -R，或內建預覽)",
                 "  summarize, summary   對自選的檔案做 AI 摘要 (同 S)",
@@ -1973,6 +1969,8 @@ impl Lang {
                 "",
                 "安全性",
                 "  - 閱讀模式是唯讀的：其中任何按鍵都不會改動檔案",
+                "  - 在 PDF 或圖片上按 l 會啟動 macOS 預設程式；",
+                "    filecraft 只把檔案交出去，絕不會改動它",
                 "  - 移動與重新命名絕不覆蓋既有檔案，而且一定會先詢問",
                 "  - 刪除是移至垃圾桶：可以還原，絕不是 unlink",
                 "  - 任何東西都不會被永久刪除，遞迴刪除也不會",
