@@ -31,3 +31,9 @@ strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 trash = { version = "5", default-features = false }
+
+# Owner and group names come from the system user database, which has no
+# std API. On macOS the answer is in Directory Services rather than in
+# /etc/passwd, so `getpwuid_r`/`getgrgid_r` are the only correct source.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

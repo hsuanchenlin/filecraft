@@ -240,7 +240,9 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 /// `ls -l` style mode string, e.g. `-rw-r--r--` or `drwxr-xr-x`.
-#[cfg(unix)]
+///
+/// Pure arithmetic over the bits `stat` reports, so it is compiled
+/// everywhere even though only a unix listing has a mode to hand it.
 pub fn format_mode(mode: u32) -> String {
     let file_type = match mode & 0o170000 {
         0o040000 => 'd',
