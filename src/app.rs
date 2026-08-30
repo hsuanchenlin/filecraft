@@ -385,7 +385,7 @@ impl App {
             KeyInput::Char('?') => self.show_help(),
             KeyInput::Char('.') => {
                 if let Err(e) = self.nav.toggle_hidden() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
                 let note = if self.nav.show_hidden {
                     self.lang.dotfiles_now_shown()
@@ -397,7 +397,7 @@ impl App {
             }
             KeyInput::Char('r') => {
                 if let Err(e) = self.nav.refresh() {
-                    return self.err(e.to_string());
+                    return self.err(e.message(self.lang));
                 }
                 let refreshed = self.lang.refreshed().to_string();
                 self.push_msg(Level::Info, refreshed);
@@ -2449,6 +2449,23 @@ mod tests {
             app.messages.iter().any(|m| m.text.contains("dotfiles")),
             "the log must keep what it already said"
         );
+    }
+
+    #[test]
+    fn browse_refresh_errors_use_the_screen_language() {
+        for key in [KeyInput::Char('.'), KeyInput::Char('r')] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut app = app_in(&tmp);
+            app.lang = Lang::ZhTw;
+            let file = tmp.path().join("not-a-directory");
+            fs::write(&file, "plain file").unwrap();
+            app.nav.cwd = file;
+
+            app.handle_key(key);
+
+            assert_eq!(last_msg(&app).level, Level::Error);
+            assert!(last_msg(&app).text.contains("不是目錄"), "{:?}", last_msg(&app));
+        }
     }
 
     #[test]
