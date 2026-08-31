@@ -1116,13 +1116,13 @@ impl App {
         }
     }
 
-    /// Open the selected regular file: text in the reader, anything the
-    /// reader cannot draw handed to the desktop.
+    /// Show the selected regular file in the reader or desktop.
     ///
     /// Markdown gets its structure drawn and anything else readable is
-    /// shown as it is. A file the reader cannot draw is not refused in
-    /// words - it goes to [`App::open_with_desktop`], so `l` means one
-    /// thing on every file: show it to me.
+    /// shown as it is. A safe binary document or media file goes to
+    /// [`App::open_with_desktop`]. Archives, known binary kinds, and an
+    /// executable discovered by the bytes fallback are refused rather
+    /// than handed to a handler that may extract files or run code.
     ///
     /// Two rules decide, in this order, and the order is the point. A
     /// [`columns::FileKind`] the desktop owns - a PDF, an image, a video - is
@@ -1139,9 +1139,6 @@ impl App {
         };
         let kind = columns::FileKind::of_name(&name);
         if columns::name_belongs_to_the_desktop(&name) {
-            if Self::desktop_handoff_is_unsafe(kind, &path) {
-                return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
-            }
             return self.open_with_desktop(&name, &path);
         }
         let source = match preview::read_view(&path) {
@@ -1171,6 +1168,11 @@ impl App {
         Effect::None
     }
 
+    /// Refuse a bytes-fallback handoff that could extract files or run code.
+    ///
+    /// Archive and known binary names are categorically unsafe. For an
+    /// unknown name, execute bits can make LaunchServices treat the file
+    /// as a Unix executable, so the target metadata decides.
     fn desktop_handoff_is_unsafe(kind: columns::FileKind, path: &Path) -> bool {
         if matches!(kind, columns::FileKind::Archive | columns::FileKind::Binary) {
             return true;
@@ -3978,6 +3980,23 @@ mod tests {
             fs::write(tmp.path().join(name), "ascii, but not for reading").unwrap();
         }
         for name in names {
+            let mut app = app_in(&tmp);
+            select(&mut app, name);
+            let effect = app.handle_key(KeyInput::Char('l'));
+            assert_handed_to_the_desktop(&app, effect, name);
+        }
+    }
+
+    #[test]
+    fn l_hands_executable_bit_media_to_the_desktop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["report.pdf", "shot.png"] {
+            let path = tmp.path().join(name);
+            fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
             let mut app = app_in(&tmp);
             select(&mut app, name);
             let effect = app.handle_key(KeyInput::Char('l'));

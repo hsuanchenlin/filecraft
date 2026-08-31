@@ -643,7 +643,7 @@ Two rules decide, in this order:
    table the [`kind` column](#columns) draws from. Deciding on the name
    matters: a small PDF can carry no NUL byte in its first 8 KiB, and
    sniffing alone would have called it text and painted it as mojibake.
-2. **The bytes, for everything else.** Any other non-executable file is read, and if
+2. **The bytes, for everything else.** Any other file is read, and if
    what comes back is not text it goes the same way. That is the only
    answer available for an extension Filecraft does not know.
 
