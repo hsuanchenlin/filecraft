@@ -673,7 +673,7 @@ cannot be focused, and no key that starts there changes anything. The
 listing is the single thing commands act on.
 
 ```
-╔ ░▒▓ FILECRAFT v0.1.0 ▓▒░ ════════════════════════════════════════════════════╗
+╔ ░▒▓ FILECRAFT v0.1.1 ▓▒░ ════════════════════════════════════════════════════╗
 ║ 0·~ ▸ … ▸ 7·final ▸ 8·assets                              depth 8 · 73 items ║
 ║   NAME                                                          SIZE MODIFIED║
 ║──────────────────────────────────────────────────────────────────────────────║
