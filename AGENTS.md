@@ -290,12 +290,20 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   rather than pretending it saved. Adding or changing a key or command
   still means `?` help, `help_lines`, the README table, and both
   languages in the same change.
-- `tests/cli.rs` pins `FILECRAFT_LANG` on every invocation (`bin()` is
-  English, `bin_in`/`bin_with_locale` choose deliberately). Without it a
-  machine whose `LANG` is `zh_TW.UTF-8` fails every English assertion for
-  a reason that has nothing to do with the code. `bin_with_config` also
-  clears `HOME` and points `XDG_CONFIG_HOME` at a fixture, so a settings
-  test can never read - or be decided by - the developer's own file.
+- Every invocation in `tests/cli.rs` is built from `bare()`, and that is
+  the whole isolation argument: language resolves through
+  `FILECRAFT_LANG`, then the settings file, then the locale, so a test
+  that leaves *any* of the three inherited is decided by the machine
+  running it. `bare()` clears the locale variables and both `HOME` and
+  `XDG_CONFIG_HOME` - `config::path` needs one of the two to name a file
+  at all, so clearing both is what means "read no settings file". Each
+  helper then adds back exactly the one input it is asserting about:
+  `bin_in`/`bin()` a `FILECRAFT_LANG`, `bin_with_locale` a locale
+  variable, `bin_with_config` an `XDG_CONFIG_HOME` fixture. Building a
+  `Command` any other way lets a developer whose `LANG` is `zh_TW.UTF-8`,
+  or whose own `~/.config/filecraft/config.toml` says
+  `language = "zh-TW"`, fail assertions for a reason that has nothing to
+  do with the code.
 - `filecraft update` lives in `src/update.rs`. `cli.rs` only parses
   `update` / `--check`; `main.rs` prints the report. Tests inject a
   fake `Host` so detection, command construction, and error mapping

@@ -4,37 +4,46 @@
 
 use std::process::{Command, Stdio};
 
-/// The binary, speaking English.
+/// The binary with every input that decides language or columns taken
+/// away, so a test says for itself which of them it is asserting about.
 ///
-/// Pinned rather than inherited: filecraft resolves its language from
-/// the system locale, so a `LANG` of `zh_TW.UTF-8` on the machine
-/// running the suite would otherwise make every English assertion below
-/// fail for a reason that has nothing to do with the code. [`bin_in`]
-/// is how a language is chosen deliberately.
-fn bin() -> Command {
-    bin_in("en")
-}
-
-/// The binary, speaking `lang` - and only because of `FILECRAFT_LANG`:
-/// every locale variable is cleared, so the test says which language it
-/// is asserting about.
-fn bin_in(lang: &str) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
-    cmd.env("FILECRAFT_LANG", lang)
-        .env_remove("LC_ALL")
-        .env_remove("LC_MESSAGES")
-        .env_remove("LANG");
-    cmd
-}
-
-/// The binary with no language named at all, so the locale decides.
-fn bin_with_locale(variable: &str, value: &str) -> Command {
+/// Nothing here is optional. Filecraft resolves its language from
+/// `FILECRAFT_LANG`, then the settings file, then the locale, so a
+/// developer whose `LANG` is `zh_TW.UTF-8` - or whose own
+/// `~/.config/filecraft/config.toml` says `language = "zh-TW"` - would
+/// otherwise fail assertions below for a reason that has nothing to do
+/// with the code. `config::path` needs one of `XDG_CONFIG_HOME` or
+/// `HOME` to name a file at all, so clearing both is what means "read
+/// no settings file"; [`bin_with_config`] is how one is chosen
+/// deliberately.
+fn bare() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
     cmd.env_remove("FILECRAFT_LANG")
         .env_remove("LC_ALL")
         .env_remove("LC_MESSAGES")
         .env_remove("LANG")
-        .env(variable, value);
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME");
+    cmd
+}
+
+/// The binary, speaking English. [`bin_in`] is how another language is
+/// chosen deliberately.
+fn bin() -> Command {
+    bin_in("en")
+}
+
+/// The binary, speaking `lang` - and only because of `FILECRAFT_LANG`.
+fn bin_in(lang: &str) -> Command {
+    let mut cmd = bare();
+    cmd.env("FILECRAFT_LANG", lang);
+    cmd
+}
+
+/// The binary with no language named at all, so the locale decides.
+fn bin_with_locale(variable: &str, value: &str) -> Command {
+    let mut cmd = bare();
+    cmd.env(variable, value);
     cmd
 }
 
@@ -352,17 +361,12 @@ fn write_config(root: &std::path::Path, text: &str) {
     std::fs::write(dir.join("config.toml"), text).unwrap();
 }
 
-/// The binary, reading a settings file the test wrote. `HOME` is cleared
-/// so the person running the suite can never have their own
-/// `~/.config/filecraft/config.toml` decide the answer.
+/// The binary, reading a settings file the test wrote - the one helper
+/// that gives [`bare`] a settings file back, and only the one under
+/// `root`.
 fn bin_with_config(root: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_filecraft"));
-    cmd.env_remove("FILECRAFT_LANG")
-        .env_remove("LC_ALL")
-        .env_remove("LC_MESSAGES")
-        .env_remove("LANG")
-        .env_remove("HOME")
-        .env("XDG_CONFIG_HOME", root);
+    let mut cmd = bare();
+    cmd.env("XDG_CONFIG_HOME", root);
     cmd
 }
 
