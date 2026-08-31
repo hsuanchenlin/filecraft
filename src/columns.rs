@@ -362,6 +362,13 @@ impl FileKind {
         }
     }
 
+    fn is_desktop_candidate(self) -> bool {
+        matches!(
+            self,
+            FileKind::Pdf | FileKind::Image | FileKind::Audio | FileKind::Video
+        )
+    }
+
     /// The kind's word in `lang`. Format and language names stay
     /// themselves in both - `Markdown` is a name, not a word.
     pub fn word(self, lang: Lang) -> &'static str {
@@ -391,6 +398,11 @@ impl FileKind {
             FileKind::Data => lang.filekind_data(),
         }
     }
+}
+
+/// Whether a name identifies a safe, non-text desktop format.
+pub fn name_belongs_to_the_desktop(name: &str) -> bool {
+    FileKind::of_name(name).is_desktop_candidate() && !name.to_ascii_lowercase().ends_with(".svg")
 }
 
 /// Why a written column list was refused.
@@ -1077,6 +1089,36 @@ mod tests {
         // A dotfile's name is not an extension.
         assert_eq!(FileKind::of_name(".zshrc"), FileKind::Data);
         assert_eq!(FileKind::of_name(".config.toml"), FileKind::Toml);
+    }
+
+    #[test]
+    fn desktop_candidates_and_safe_names_are_kept_distinct() {
+        // The split `l` acts on. Everything a person reads stays with
+        // the reader; the formats the reader could only paint as
+        // mojibake go to the default application. `Data` - an extension
+        // Filecraft does not know - is deliberately on the reader's
+        // side, because only the file's own bytes can settle it.
+        let desktop = [
+            FileKind::Pdf,
+            FileKind::Image,
+            FileKind::Audio,
+            FileKind::Video,
+        ];
+        for kind in FileKind::ALL {
+            assert_eq!(
+                kind.is_desktop_candidate(),
+                desktop.contains(&kind),
+                "{kind:?}"
+            );
+        }
+        assert!(name_belongs_to_the_desktop("report.pdf"));
+        assert!(name_belongs_to_the_desktop("shot.PNG"));
+        assert!(!name_belongs_to_the_desktop("drawing.svg"));
+        assert!(!name_belongs_to_the_desktop("pack.zip"));
+        assert!(!name_belongs_to_the_desktop("program.bin"));
+        assert!(!name_belongs_to_the_desktop("notes.md"));
+        assert!(!name_belongs_to_the_desktop("main.rs"));
+        assert!(!name_belongs_to_the_desktop("README"));
     }
 
     #[test]

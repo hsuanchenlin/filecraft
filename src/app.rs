@@ -1116,21 +1116,40 @@ impl App {
         }
     }
 
-    /// Open the selected regular file in the reader. Markdown gets its
-    /// structure drawn; anything else readable is shown as it is; a
-    /// binary is refused in words rather than painted on the screen.
+    /// Show the selected regular file in the reader or desktop.
+    ///
+    /// Markdown gets its structure drawn and anything else readable is
+    /// shown as it is. A safe binary document or media file goes to
+    /// [`App::open_with_desktop`]. Archives, known binary kinds, and an
+    /// executable discovered by the bytes fallback are refused rather
+    /// than handed to a handler that may extract files or run code.
+    ///
+    /// Two rules decide, in this order, and the order is the point. A
+    /// [`columns::FileKind`] the desktop owns - a PDF, an image, a video - is
+    /// answered by the *name*, so a PDF whose first 8 KiB happen to
+    /// hold no NUL byte still reaches Preview rather than being painted
+    /// as mojibake. Everything else is read, and bytes that turn out
+    /// not to be text go the same way, which is the only answer an
+    /// extension Filecraft does not know can get.
     fn open_pager_for_file(&mut self) -> Effect {
         let lang = self.lang;
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
             Err(e) => return self.err(self.lang.op_says(Op::Read, &e)),
         };
+        let kind = columns::FileKind::of_name(&name);
+        if columns::name_belongs_to_the_desktop(&name) {
+            return self.open_with_desktop(&name, &path);
+        }
         let source = match preview::read_view(&path) {
             Ok(source) => source,
             Err(e) => return self.err(lang.op_says(Op::Read, &e.message(lang))),
         };
         let ViewSource::Text { text, truncated } = source else {
-            return self.err(lang.not_text(&name));
+            if Self::desktop_handoff_is_unsafe(kind, &path) {
+                return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
+            }
+            return self.open_with_desktop(&name, &path);
         };
         let mut doc = if text.is_empty() {
             vec![DocLine::meta(lang.empty_file())]
@@ -1147,6 +1166,27 @@ impl App {
         }
         self.mode = Mode::Pager(Pager::document(name, doc));
         Effect::None
+    }
+
+    /// Refuse a bytes-fallback handoff that could extract files or run code.
+    ///
+    /// Archive and known binary names are categorically unsafe. For an
+    /// unknown name, execute bits can make LaunchServices treat the file
+    /// as a Unix executable, so the target metadata decides.
+    fn desktop_handoff_is_unsafe(kind: columns::FileKind, path: &Path) -> bool {
+        if matches!(kind, columns::FileKind::Archive | columns::FileKind::Binary) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
     }
 
     fn enter_selected_dir(&mut self) -> Effect {
@@ -1593,11 +1633,23 @@ impl App {
             Ok(v) => v,
             Err(e) => return self.err(self.lang.op_says(Op::Open, &e)),
         };
+        self.open_with_desktop(&name, &path)
+    }
+
+    /// Hand a path to the desktop's default application.
+    ///
+    /// The one place `/usr/bin/open` is named. `:open` and `l` on a file
+    /// the reader cannot draw are the same operation, so they spawn the
+    /// same argv and say the same sentence; the argv is this fixed
+    /// shape and `--` is what keeps a name beginning with `-` an
+    /// operand rather than a flag. Detached on purpose: the TUI is
+    /// never torn down and the event loop never waits.
+    fn open_with_desktop(&mut self, name: &str, path: &Path) -> Effect {
         if !cfg!(target_os = "macos") {
             let text = self.lang.open_macos_only().to_string();
             return self.err(text);
         }
-        let note = self.lang.opening_with_macos(&name);
+        let note = self.lang.opened_with_default_app(name);
         self.push_msg(Level::Ok, note);
         Effect::SpawnDetached {
             argv: vec![
@@ -3879,16 +3931,193 @@ mod tests {
         assert_eq!(pager.text(), "# not a heading\n- not a bullet");
     }
 
+    /// What handing a file to the desktop looks like from the outside.
+    ///
+    /// macOS spawns the detached `open`; every other platform says it
+    /// cannot and does nothing, which is the refusal `:open` has always
+    /// given there. Either way the listing stays on screen: the reader
+    /// never opens and the terminal is never torn down.
+    fn assert_handed_to_the_desktop(app: &App, effect: Effect, name: &str) {
+        if cfg!(target_os = "macos") {
+            let Effect::SpawnDetached { argv } = effect else {
+                panic!("expected SpawnDetached for '{name}', got {effect:?}");
+            };
+            assert_eq!(argv[0], "/usr/bin/open");
+            assert_eq!(
+                argv[1], "--",
+                "a name beginning with '-' must stay an operand"
+            );
+            assert!(argv[2].ends_with(name), "{argv:?} is not '{name}'");
+            assert_eq!(last_msg(app).level, Level::Ok);
+        } else {
+            assert_eq!(effect, Effect::None);
+            assert_eq!(last_msg(app).level, Level::Error);
+        }
+        assert_eq!(app.mode, Mode::Browse, "the listing must stay on screen");
+    }
+
     #[test]
-    fn l_refuses_a_binary_file_in_words() {
+    fn l_hands_a_pdf_to_the_desktop_rather_than_refusing_it() {
+        // The bytes here are pure ASCII, so the text sniff would have
+        // called this file readable. The extension is what decides, and
+        // that is the point: a small PDF can carry no NUL byte at all
+        // and must still reach Preview instead of the reader.
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.7 trailer").unwrap();
+        for key in [KeyInput::Char('l'), KeyInput::Right] {
+            let mut app = app_in(&tmp);
+            select(&mut app, "report.pdf");
+            let effect = app.handle_key(key);
+            assert_handed_to_the_desktop(&app, effect, "report.pdf");
+        }
+    }
+
+    #[test]
+    fn l_hands_safe_desktop_formats_to_the_desktop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = ["shot.png", "song.mp3", "clip.mp4"];
+        for name in names {
+            fs::write(tmp.path().join(name), "ascii, but not for reading").unwrap();
+        }
+        for name in names {
+            let mut app = app_in(&tmp);
+            select(&mut app, name);
+            let effect = app.handle_key(KeyInput::Char('l'));
+            assert_handed_to_the_desktop(&app, effect, name);
+        }
+    }
+
+    #[test]
+    fn l_hands_executable_bit_media_to_the_desktop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["report.pdf", "shot.png"] {
+            let path = tmp.path().join(name);
+            fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+            let mut app = app_in(&tmp);
+            select(&mut app, name);
+            let effect = app.handle_key(KeyInput::Char('l'));
+            assert_handed_to_the_desktop(&app, effect, name);
+        }
+    }
+
+    #[test]
+    fn l_hands_bytes_that_are_not_text_to_the_desktop_whatever_the_name_says() {
+        // No extension Filecraft knows, so only the file's own bytes can
+        // answer - and they say this is not something the reader draws.
+        let tmp = tempfile::tempdir().unwrap();
+        let name = "mystery.qqq";
+        fs::write(tmp.path().join(name), [0u8, 1, 2, 3]).unwrap();
         let mut app = app_in(&tmp);
-        select(&mut app, "blob.bin");
+        select(&mut app, name);
+        let effect = app.handle_key(KeyInput::Char('l'));
+        assert_handed_to_the_desktop(&app, effect, name);
+    }
+
+    #[test]
+    fn l_refuses_archives_binaries_and_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["pack.zip", "prog.bin"] {
+            fs::write(tmp.path().join(name), [0u8, 1, 2, 3]).unwrap();
+        }
+        let executable = tmp.path().join("tool");
+        fs::write(&executable, [0u8, 1, 2, 3]).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for name in ["pack.zip", "prog.bin", "tool"] {
+            let mut app = app_in(&tmp);
+            select(&mut app, name);
+            assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+            assert_eq!(last_msg(&app).level, Level::Error);
+        }
+    }
+
+    #[test]
+    fn l_reads_executable_text_in_the_reader() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("build.sh");
+        fs::write(&script, "#!/bin/sh\necho built\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = app_in(&tmp);
+        select(&mut app, "build.sh");
         assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
-        assert_eq!(app.mode, Mode::Browse);
-        assert_eq!(last_msg(&app).level, Level::Error);
-        assert!(last_msg(&app).text.contains("binary"));
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected executable text in the reader, got {:?}", app.mode);
+        };
+        assert_eq!(pager.text(), "#!/bin/sh\necho built");
+    }
+
+    #[test]
+    fn l_treats_symlinks_like_their_text_and_pdf_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "# Notes\n").unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.7 trailer").unwrap();
+        symlink("notes.md", tmp.path().join("link.md")).unwrap();
+        symlink("report.pdf", tmp.path().join("link.pdf")).unwrap();
+
+        let mut text_app = app_in(&tmp);
+        select(&mut text_app, "link.md");
+        assert_eq!(text_app.handle_key(KeyInput::Char('l')), Effect::None);
+        assert!(matches!(text_app.mode, Mode::Pager(_)));
+
+        let mut pdf_app = app_in(&tmp);
+        select(&mut pdf_app, "link.pdf");
+        let effect = pdf_app.handle_key(KeyInput::Char('l'));
+        assert_handed_to_the_desktop(&pdf_app, effect, "link.pdf");
+    }
+
+    #[test]
+    fn l_still_reads_text_in_the_reader_and_still_enters_a_directory() {
+        // The other half of the same key: nothing that was readable
+        // before now leaves the terminal.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        for name in ["notes.md", "plain.txt", "lib.rs", "Cargo.toml", "app.json"] {
+            fs::write(tmp.path().join(name), "readable\n").unwrap();
+        }
+        for key in [KeyInput::Char('l'), KeyInput::Right] {
+            for name in ["notes.md", "plain.txt", "lib.rs", "Cargo.toml", "app.json"] {
+                let mut app = app_in(&tmp);
+                select(&mut app, name);
+                assert_eq!(app.handle_key(key), Effect::None, "{name}");
+                let Mode::Pager(pager) = &app.mode else {
+                    panic!("expected the reader for '{name}', got {:?}", app.mode);
+                };
+                assert_eq!(pager.text(), "readable", "{name}");
+            }
+            let mut app = app_in(&tmp);
+            select(&mut app, "sub");
+            assert_eq!(app.handle_key(key), Effect::None);
+            assert!(app.nav.cwd.ends_with("sub"));
+            assert_eq!(app.mode, Mode::Browse);
+        }
+    }
+
+    #[test]
+    fn l_and_the_open_command_are_one_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.7").unwrap();
+
+        let mut keyed = app_in(&tmp);
+        select(&mut keyed, "report.pdf");
+        let by_key = keyed.handle_key(KeyInput::Char('l'));
+
+        let mut typed = app_in(&tmp);
+        select(&mut typed, "report.pdf");
+        let by_command = typed.execute_line("open");
+
+        assert_eq!(by_key, by_command);
+        assert_eq!(last_msg(&keyed).text, last_msg(&typed).text);
     }
 
     #[test]
@@ -4010,6 +4239,29 @@ mod tests {
         }
         app.handle_key(KeyInput::Enter);
         assert_eq!(reader(&app).top_line(width, &glyphs), 100 - view);
+    }
+
+    #[test]
+    fn the_help_says_where_l_sends_a_file_the_reader_cannot_draw() {
+        // The key changed meaning, so the two places that teach it -
+        // the help screen and the browse hint row - have to say so in
+        // both languages, and the safety block has to own the fact that
+        // a browse key can now start a program.
+        for lang in Lang::ALL {
+            let help = lang.help_lines().join("\n");
+            assert!(help.contains("l, Right"), "{lang:?}");
+            assert!(
+                help.contains("PDF"),
+                "{lang:?} never says what happens to a PDF:\n{help}"
+            );
+            assert!(
+                help.matches("macOS").count() >= 2,
+                "{lang:?} must name macOS in the key block and in SAFETY"
+            );
+        }
+        let english = Lang::En.help_lines().join("\n");
+        assert!(english.contains("text in the reader"));
+        assert!(english.contains("l on a PDF or image starts the macOS default"));
     }
 
     #[test]
@@ -4415,10 +4667,18 @@ mod tests {
         // select -> arm -> `y`. `d` is the one browse key allowed to
         // arm; arming still changes nothing. This is the mechanical
         // enforcement of both halves.
+        //
+        // The fixture holds a PDF and a blob on purpose: `l` and Right
+        // hand those to `/usr/bin/open`, and that is the only spawn any
+        // browse key is allowed to produce. Every other key must still
+        // start no process at all, and none of them - `l` included -
+        // may touch the tree.
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join("sub")).unwrap();
         fs::write(tmp.path().join("sub/inner.txt"), "inner").unwrap();
         fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.7").unwrap();
+        fs::write(tmp.path().join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
         fs::write(tmp.path().join(".dot"), "d").unwrap();
         let can = tempfile::tempdir().unwrap();
 
@@ -4448,8 +4708,9 @@ mod tests {
                     app.mode = Mode::Browse;
                 }
                 let effect = app.handle_key(key);
+                let hands_to_the_desktop = key == KeyInput::Char('l') || key == KeyInput::Right;
                 assert!(
-                    !matches!(effect, Effect::SpawnDetached { .. }),
+                    !matches!(effect, Effect::SpawnDetached { .. }) || hands_to_the_desktop,
                     "{key:?} spawned a process from browse mode"
                 );
                 assert!(
