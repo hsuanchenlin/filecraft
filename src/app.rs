@@ -1649,7 +1649,7 @@ impl App {
             let text = self.lang.open_macos_only().to_string();
             return self.err(text);
         }
-        let note = self.lang.opening_with_default_app(name);
+        let note = self.lang.opened_with_default_app(name);
         self.push_msg(Level::Ok, note);
         Effect::SpawnDetached {
             argv: vec![
