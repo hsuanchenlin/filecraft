@@ -362,24 +362,10 @@ impl FileKind {
         }
     }
 
-    /// Whether the desktop owns this format rather than Filecraft's
-    /// reader.
-    ///
-    /// Extension-driven like the rest of the table, so `l` on a PDF
-    /// never has to open the file to learn it is not text, and
-    /// deliberately conservative: only kinds that are *never* text say
-    /// yes. [`FileKind::Data`] - an extension Filecraft does not know -
-    /// says no and is decided by its own bytes instead, which is the
-    /// only answer a name cannot give.
-    pub fn belongs_to_the_desktop(self) -> bool {
+    fn is_desktop_candidate(self) -> bool {
         matches!(
             self,
-            FileKind::Pdf
-                | FileKind::Image
-                | FileKind::Audio
-                | FileKind::Video
-                | FileKind::Archive
-                | FileKind::Binary
+            FileKind::Pdf | FileKind::Image | FileKind::Audio | FileKind::Video
         )
     }
 
@@ -412,6 +398,11 @@ impl FileKind {
             FileKind::Data => lang.filekind_data(),
         }
     }
+}
+
+/// Whether a name identifies a safe, non-text desktop format.
+pub fn name_belongs_to_the_desktop(name: &str) -> bool {
+    FileKind::of_name(name).is_desktop_candidate() && !name.to_ascii_lowercase().ends_with(".svg")
 }
 
 /// Why a written column list was refused.
@@ -1101,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn only_formats_that_are_never_text_belong_to_the_desktop() {
+    fn desktop_candidates_and_safe_names_are_kept_distinct() {
         // The split `l` acts on. Everything a person reads stays with
         // the reader; the formats the reader could only paint as
         // mojibake go to the default application. `Data` - an extension
@@ -1112,21 +1103,22 @@ mod tests {
             FileKind::Image,
             FileKind::Audio,
             FileKind::Video,
-            FileKind::Archive,
-            FileKind::Binary,
         ];
         for kind in FileKind::ALL {
             assert_eq!(
-                kind.belongs_to_the_desktop(),
+                kind.is_desktop_candidate(),
                 desktop.contains(&kind),
                 "{kind:?}"
             );
         }
-        assert!(FileKind::of_name("report.pdf").belongs_to_the_desktop());
-        assert!(FileKind::of_name("shot.PNG").belongs_to_the_desktop());
-        assert!(!FileKind::of_name("notes.md").belongs_to_the_desktop());
-        assert!(!FileKind::of_name("main.rs").belongs_to_the_desktop());
-        assert!(!FileKind::of_name("README").belongs_to_the_desktop());
+        assert!(name_belongs_to_the_desktop("report.pdf"));
+        assert!(name_belongs_to_the_desktop("shot.PNG"));
+        assert!(!name_belongs_to_the_desktop("drawing.svg"));
+        assert!(!name_belongs_to_the_desktop("pack.zip"));
+        assert!(!name_belongs_to_the_desktop("program.bin"));
+        assert!(!name_belongs_to_the_desktop("notes.md"));
+        assert!(!name_belongs_to_the_desktop("main.rs"));
+        assert!(!name_belongs_to_the_desktop("README"));
     }
 
     #[test]

@@ -260,8 +260,8 @@ listing, and like `d` it does nothing by itself: it opens a file
 selector. Nothing is read, no program is started, and no file is written
 until files are picked *and* a provider is chosen.
 
-**Changed in this slice:** `l` on a PDF, image, audio, video, archive, or
-any file whose bytes are not text now opens it in the macOS default
+**Changed in this slice:** `l` on a PDF, raster image, audio, video, or
+non-executable file whose bytes are not text now opens it in the macOS default
 application instead of refusing it in words. Text and Markdown still
 open in the built-in reader (below), a directory is still entered, and
 `../` still goes up - so the key still means one thing: show me this.
@@ -629,32 +629,33 @@ its last line.
 
 `l` (or Right) on a file the reader cannot draw hands it to
 `/usr/bin/open`, which starts whatever application macOS has registered
-for that format - Preview for a PDF or an image, QuickTime for a video,
-Archive Utility for a `.zip`. `:open` is the same operation typed out,
+for that format - Preview for a PDF or an image, QuickTime for a video.
+`:open` is the same operation typed out,
 on any entry.
 
 Two rules decide, in this order:
 
-1. **The name, for formats that are never text.** `pdf`, images
-   (`png jpg jpeg gif webp heic svg bmp tiff ico`), audio
+1. **The name, for safe formats that are never text.** `pdf`, raster images
+   (`png jpg jpeg gif webp heic bmp tiff ico`), audio
    (`mp3 wav flac aac m4a ogg aiff`), video
-   (`mp4 mov mkv avi webm m4v`), archives
-   (`zip tar gz tgz bz2 xz zst 7z rar dmg`), and binaries
-   (`o a so dylib bin exe wasm class pyc`) go straight to the desktop
+   (`mp4 mov mkv avi webm m4v`) go straight to the desktop
    without the file being opened at all. This is the same extension
    table the [`kind` column](#columns) draws from. Deciding on the name
    matters: a small PDF can carry no NUL byte in its first 8 KiB, and
    sniffing alone would have called it text and painted it as mojibake.
-2. **The bytes, for everything else.** Any other file is read, and if
+2. **The bytes, for everything else.** Any other non-executable file is read, and if
    what comes back is not text it goes the same way. That is the only
    answer available for an extension Filecraft does not know.
 
 Everything that is text - Markdown, plain text, source, config, an
 unknown extension holding readable bytes - still opens in the reader.
+SVG stays in the reader because it is text. Archives, known binary kinds,
+and executable files are refused because their default handlers can extract
+files, mount volumes, or run code.
 
 The application is spawned **detached**: Filecraft does not wait for it,
 does not give up the terminal, and does not redraw around it. The
-message log says `open: opened 'report.pdf' with the macOS default
+message log says `open: handing 'report.pdf' to the macOS default
 application` and the listing stays on the same row. Nothing is written:
 the path is handed over and that is all.
 

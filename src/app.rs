@@ -1133,11 +1133,21 @@ impl App {
     /// extension Filecraft does not know can get.
     fn open_pager_for_file(&mut self) -> Effect {
         let lang = self.lang;
+        let (kind, executable) = match self.nav.selected() {
+            Some(entry) => (
+                columns::FileKind::of_name(&entry.name),
+                entry.mode.is_some_and(|mode| mode & 0o111 != 0),
+            ),
+            None => return self.err(self.lang.op_says(Op::Read, self.lang.nothing_selected())),
+        };
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
             Err(e) => return self.err(self.lang.op_says(Op::Read, &e)),
         };
-        if columns::FileKind::of_name(&name).belongs_to_the_desktop() {
+        if executable || matches!(kind, columns::FileKind::Archive | columns::FileKind::Binary) {
+            return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
+        }
+        if columns::name_belongs_to_the_desktop(&name) {
             return self.open_with_desktop(&name, &path);
         }
         let source = match preview::read_view(&path) {
@@ -1624,7 +1634,7 @@ impl App {
             let text = self.lang.open_macos_only().to_string();
             return self.err(text);
         }
-        let note = self.lang.opened_with_default_app(name);
+        let note = self.lang.opening_with_default_app(name);
         self.push_msg(Level::Ok, note);
         Effect::SpawnDetached {
             argv: vec![
@@ -3948,9 +3958,9 @@ mod tests {
     }
 
     #[test]
-    fn l_hands_every_desktop_format_to_the_desktop() {
+    fn l_hands_safe_desktop_formats_to_the_desktop() {
         let tmp = tempfile::tempdir().unwrap();
-        let names = ["shot.png", "song.mp3", "clip.mp4", "pack.zip", "prog.bin"];
+        let names = ["shot.png", "song.mp3", "clip.mp4"];
         for name in names {
             fs::write(tmp.path().join(name), "ascii, but not for reading").unwrap();
         }
@@ -3967,13 +3977,32 @@ mod tests {
         // No extension Filecraft knows, so only the file's own bytes can
         // answer - and they say this is not something the reader draws.
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
         fs::write(tmp.path().join("mystery.qqq"), [0u8, 1, 2, 3]).unwrap();
-        for name in ["blob.bin", "mystery.qqq"] {
+        for name in ["mystery.qqq"] {
             let mut app = app_in(&tmp);
             select(&mut app, name);
             let effect = app.handle_key(KeyInput::Char('l'));
             assert_handed_to_the_desktop(&app, effect, name);
+        }
+    }
+
+    #[test]
+    fn l_refuses_archives_binaries_and_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["pack.zip", "prog.bin"] {
+            fs::write(tmp.path().join(name), [0u8, 1, 2, 3]).unwrap();
+        }
+        let executable = tmp.path().join("tool");
+        fs::write(&executable, [0u8, 1, 2, 3]).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for name in ["pack.zip", "prog.bin", "tool"] {
+            let mut app = app_in(&tmp);
+            select(&mut app, name);
+            assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+            assert_eq!(last_msg(&app).level, Level::Error);
         }
     }
 

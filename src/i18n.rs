@@ -858,16 +858,23 @@ impl Lang {
 
     // ---- Editors and external programs -------------------------------------
 
-    /// What both `:open` and `l` on a file the reader cannot draw say.
-    /// One phrase, because they are one operation.
-    pub fn opened_with_default_app(self, name: &str) -> String {
-        self.op_says(Op::Open, &self.opened_with_default_app_detail(name))
+    pub fn unsafe_desktop_open(self, name: &str) -> String {
+        match self {
+            Lang::En => format!("refusing to launch a handler for '{name}' from browse mode"),
+            Lang::ZhTw => format!("拒絕從瀏覽模式啟動 '{name}' 的處理程式"),
+        }
     }
 
-    fn opened_with_default_app_detail(self, name: &str) -> String {
+    /// What both `:open` and `l` on a file the reader cannot draw say.
+    /// One phrase, because they are one operation.
+    pub fn opening_with_default_app(self, name: &str) -> String {
+        self.op_says(Op::Open, &self.opening_with_default_app_detail(name))
+    }
+
+    fn opening_with_default_app_detail(self, name: &str) -> String {
         match self {
-            Lang::En => format!("opened '{name}' with the macOS default application"),
-            Lang::ZhTw => format!("已使用預設程式開啟 '{name}'"),
+            Lang::En => format!("handing '{name}' to the macOS default application"),
+            Lang::ZhTw => format!("正將 '{name}' 交給預設程式"),
         }
     }
 

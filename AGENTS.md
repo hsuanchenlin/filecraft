@@ -22,7 +22,7 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   `App::open_with_desktop` - the one place `/usr/bin/open` is named, and
   what `:open` calls too, so the two are literally one operation with
   one message. Two rules decide, in this order and for a reason: the
-  *name* first (`columns::FileKind::belongs_to_the_desktop`), because a
+  *name* first (`columns::name_belongs_to_the_desktop`), because a
   small PDF can carry no NUL byte in its first 8 KiB and the text sniff
   would call it readable; then the *bytes*
   (`preview::ViewSource::Binary`), which is the only answer an extension
@@ -53,8 +53,9 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   (`Column::width` = `max(content, header)`, so `:header` never reflows
   the rows), what each cell says (`Column::cell`), the extension-driven
   `FileKind` table (which is also what decides, through
-  `belongs_to_the_desktop`, that `l` hands a format to the desktop
-  rather than to the reader), and the width budget (`layout`) that hands
+  `name_belongs_to_the_desktop`, that `l` hands safe media formats to the desktop
+  rather than to the reader; archives, binary kinds, and executable files
+  are refused because their handlers may extract or execute), and the width budget (`layout`) that hands
   the name whatever the fixed columns leave and drops columns by
   `Column::drop_rank` when that is not enough - never `Name` or `Size`.
   `ui.rs` only draws it. `columns::HEADER_ROWS` must match what

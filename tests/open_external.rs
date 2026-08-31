@@ -69,7 +69,7 @@ fn l_and_right_hand_a_real_pdf_to_the_macos_default_application() {
             assert_eq!(app.messages.last().unwrap().level, Level::Ok);
             assert_eq!(
                 last_text(&app),
-                "open: opened 'report.pdf' with the macOS default application"
+                "open: handing 'report.pdf' to the macOS default application"
             );
         } else {
             assert_eq!(effect, Effect::None);
@@ -146,9 +146,9 @@ fn the_message_is_written_in_the_screen_language() {
     if cfg!(target_os = "macos") {
         assert_eq!(
             last_text(&english),
-            "open: opened 'report.pdf' with the macOS default application"
+            "open: handing 'report.pdf' to the macOS default application"
         );
-        assert_eq!(last_text(&chinese), "開啟: 已使用預設程式開啟 'report.pdf'");
+        assert_eq!(last_text(&chinese), "開啟: 正將 'report.pdf' 交給預設程式");
     } else {
         assert!(last_text(&english).starts_with("open: "));
         assert!(last_text(&chinese).starts_with("開啟: "));
