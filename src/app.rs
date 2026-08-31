@@ -4009,13 +4009,12 @@ mod tests {
         // No extension Filecraft knows, so only the file's own bytes can
         // answer - and they say this is not something the reader draws.
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("mystery.qqq"), [0u8, 1, 2, 3]).unwrap();
-        for name in ["mystery.qqq"] {
-            let mut app = app_in(&tmp);
-            select(&mut app, name);
-            let effect = app.handle_key(KeyInput::Char('l'));
-            assert_handed_to_the_desktop(&app, effect, name);
-        }
+        let name = "mystery.qqq";
+        fs::write(tmp.path().join(name), [0u8, 1, 2, 3]).unwrap();
+        let mut app = app_in(&tmp);
+        select(&mut app, name);
+        let effect = app.handle_key(KeyInput::Char('l'));
+        assert_handed_to_the_desktop(&app, effect, name);
     }
 
     #[test]

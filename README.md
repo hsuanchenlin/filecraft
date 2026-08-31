@@ -223,7 +223,7 @@ In browse mode:
 | PgUp / PgDn | move focus a page |
 | `g` / `G` | first / last entry |
 | Enter | enter a directory, or edit the selected file |
-| `l`, Right | enter the selected directory, read the selected text file, or hand anything else to the macOS default application |
+| `l`, Right | enter the selected directory, read text, or hand a safe binary document or media file to the macOS default application |
 | `h`, Left, Backspace | parent directory |
 | `0`-`9` | jump to that ancestor on the ladder |
 | `d` | move the selected entry to the Trash (asks `y/n`) |
@@ -657,7 +657,7 @@ files, mount volumes, or run code. The refusal points to the explicit
 
 The application is spawned **detached**: Filecraft does not wait for it,
 does not give up the terminal, and does not redraw around it. The
-message log says `open: handing 'report.pdf' to the macOS default
+message log says `open: opened 'report.pdf' with the macOS default
 application` and the listing stays on the same row. Nothing is written:
 the path is handed over and that is all.
 
