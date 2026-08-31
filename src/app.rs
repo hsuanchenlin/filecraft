@@ -1133,21 +1133,15 @@ impl App {
     /// extension Filecraft does not know can get.
     fn open_pager_for_file(&mut self) -> Effect {
         let lang = self.lang;
-        let (kind, executable) = match self.nav.selected() {
-            Some(entry) => (
-                columns::FileKind::of_name(&entry.name),
-                entry.mode.is_some_and(|mode| mode & 0o111 != 0),
-            ),
-            None => return self.err(self.lang.op_says(Op::Read, self.lang.nothing_selected())),
-        };
         let (name, path) = match self.selected_operand() {
             Ok(v) => v,
             Err(e) => return self.err(self.lang.op_says(Op::Read, &e)),
         };
-        if executable || matches!(kind, columns::FileKind::Archive | columns::FileKind::Binary) {
-            return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
-        }
+        let kind = columns::FileKind::of_name(&name);
         if columns::name_belongs_to_the_desktop(&name) {
+            if Self::desktop_handoff_is_unsafe(kind, &path) {
+                return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
+            }
             return self.open_with_desktop(&name, &path);
         }
         let source = match preview::read_view(&path) {
@@ -1155,6 +1149,9 @@ impl App {
             Err(e) => return self.err(lang.op_says(Op::Read, &e.message(lang))),
         };
         let ViewSource::Text { text, truncated } = source else {
+            if Self::desktop_handoff_is_unsafe(kind, &path) {
+                return self.err(lang.op_says(Op::Open, &lang.unsafe_desktop_open(&name)));
+            }
             return self.open_with_desktop(&name, &path);
         };
         let mut doc = if text.is_empty() {
@@ -1172,6 +1169,22 @@ impl App {
         }
         self.mode = Mode::Pager(Pager::document(name, doc));
         Effect::None
+    }
+
+    fn desktop_handoff_is_unsafe(kind: columns::FileKind, path: &Path) -> bool {
+        if matches!(kind, columns::FileKind::Archive | columns::FileKind::Binary) {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
     }
 
     fn enter_selected_dir(&mut self) -> Effect {
@@ -4004,6 +4017,45 @@ mod tests {
             assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
             assert_eq!(last_msg(&app).level, Level::Error);
         }
+    }
+
+    #[test]
+    fn l_reads_executable_text_in_the_reader() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("build.sh");
+        fs::write(&script, "#!/bin/sh\necho built\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = app_in(&tmp);
+        select(&mut app, "build.sh");
+        assert_eq!(app.handle_key(KeyInput::Char('l')), Effect::None);
+        let Mode::Pager(pager) = &app.mode else {
+            panic!("expected executable text in the reader, got {:?}", app.mode);
+        };
+        assert_eq!(pager.text(), "#!/bin/sh\necho built");
+    }
+
+    #[test]
+    fn l_treats_symlinks_like_their_text_and_pdf_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("notes.md"), "# Notes\n").unwrap();
+        fs::write(tmp.path().join("report.pdf"), "%PDF-1.7 trailer").unwrap();
+        symlink("notes.md", tmp.path().join("link.md")).unwrap();
+        symlink("report.pdf", tmp.path().join("link.pdf")).unwrap();
+
+        let mut text_app = app_in(&tmp);
+        select(&mut text_app, "link.md");
+        assert_eq!(text_app.handle_key(KeyInput::Char('l')), Effect::None);
+        assert!(matches!(text_app.mode, Mode::Pager(_)));
+
+        let mut pdf_app = app_in(&tmp);
+        select(&mut pdf_app, "link.pdf");
+        let effect = pdf_app.handle_key(KeyInput::Char('l'));
+        assert_handed_to_the_desktop(&pdf_app, effect, "link.pdf");
     }
 
     #[test]

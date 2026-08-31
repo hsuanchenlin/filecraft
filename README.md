@@ -648,10 +648,12 @@ Two rules decide, in this order:
    answer available for an extension Filecraft does not know.
 
 Everything that is text - Markdown, plain text, source, config, an
-unknown extension holding readable bytes - still opens in the reader.
-SVG stays in the reader because it is text. Archives, known binary kinds,
-and executable files are refused because their default handlers can extract
-files, mount volumes, or run code.
+unknown extension holding readable bytes, or an executable script - still
+opens in the reader. SVG stays in the reader because it is text. Archives,
+known binary kinds, and executable binary files are refused only when they
+would otherwise reach the desktop because their default handlers can extract
+files, mount volumes, or run code. The refusal points to the explicit
+`:open` command when that is what the user intends.
 
 The application is spawned **detached**: Filecraft does not wait for it,
 does not give up the terminal, and does not redraw around it. The

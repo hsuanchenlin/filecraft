@@ -54,8 +54,9 @@ Rust 2021 library plus a `filecraft` binary. TUI is ratatui 0.29. The library in
   the rows), what each cell says (`Column::cell`), the extension-driven
   `FileKind` table (which is also what decides, through
   `name_belongs_to_the_desktop`, that `l` hands safe media formats to the desktop
-  rather than to the reader; archives, binary kinds, and executable files
-  are refused because their handlers may extract or execute), and the width budget (`layout`) that hands
+  rather than to the reader; archives, binary kinds, and executable binary
+  files are refused at the desktop handoff because their handlers may extract
+  or execute, while executable text still reaches the reader), and the width budget (`layout`) that hands
   the name whatever the fixed columns leave and drops columns by
   `Column::drop_rank` when that is not enough - never `Name` or `Size`.
   `ui.rs` only draws it. `columns::HEADER_ROWS` must match what

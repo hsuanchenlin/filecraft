@@ -860,8 +860,12 @@ impl Lang {
 
     pub fn unsafe_desktop_open(self, name: &str) -> String {
         match self {
-            Lang::En => format!("refusing to launch a handler for '{name}' from browse mode"),
-            Lang::ZhTw => format!("拒絕從瀏覽模式啟動 '{name}' 的處理程式"),
+            Lang::En => format!(
+                "refusing to launch a handler for '{name}' from browse mode; try ':' then open"
+            ),
+            Lang::ZhTw => {
+                format!("拒絕從瀏覽模式啟動 '{name}' 的處理程式；可改用 ':' 再輸入 open")
+            }
         }
     }
 
